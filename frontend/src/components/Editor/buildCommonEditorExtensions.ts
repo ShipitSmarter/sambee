@@ -8,21 +8,19 @@ import { buildSelectionLayerExtension } from "./buildEditorSelectionLayer";
 
 interface CommonEditorExtensionsOptions {
   defaultSyntaxHighlighting?: boolean;
-  drawSelection?: boolean;
   highlightSelectionMatches?: boolean;
   lineWrapping?: boolean;
 }
 
 export function buildCommonEditorExtensions({
   defaultSyntaxHighlighting = true,
-  drawSelection: includeDrawSelection = true,
   highlightSelectionMatches: includeSelectionMatches = true,
   lineWrapping = false,
 }: CommonEditorExtensionsOptions = {}): Extension[] {
   return [
     history(),
-    ...(includeDrawSelection ? [drawSelection()] : []),
-    ...(includeDrawSelection ? [buildSelectionLayerExtension()] : []),
+    drawSelection(),
+    buildSelectionLayerExtension(),
     EditorState.allowMultipleSelections.of(true),
     closeBrackets(),
     indentOnInput(),

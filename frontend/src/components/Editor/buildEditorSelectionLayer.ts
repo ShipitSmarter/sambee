@@ -1,9 +1,11 @@
 import { EditorSelection, type Extension, type Text } from "@codemirror/state";
-import { EditorView, layer, RectangleMarker } from "@codemirror/view";
+import { Decoration, EditorView, layer, RectangleMarker } from "@codemirror/view";
+import { blend, decomposeColor } from "@mui/system/colorManipulator";
 import { getCodeMirrorHorizontalInset } from "./getCodeMirrorHorizontalInset";
 
 export const EDITOR_SELECTION_RANGE_CLASS = "sambee-editor-selection-range";
 export const EDITOR_SELECTION_LAYER_CLASS = "sambee-editor-selection-layer";
+export const EDITOR_HAS_SELECTION_CLASS = "sambee-editor-has-selection";
 
 export interface SelectionLineSegment {
   from: number;
@@ -138,51 +140,71 @@ export function buildSelectionLayerExtension({
   layerClass?: string;
   rangeClass?: string;
 } = {}): Extension {
-  return layer({
-    above: false,
-    class: layerClass,
-    update(update) {
-      return update.docChanged || update.selectionSet || update.viewportChanged;
-    },
-    markers(view) {
-      const markers: RectangleMarker[] = [];
+  return [
+    EditorView.editorAttributes.compute(["selection"], (state) => ({
+      class: state.selection.ranges.some((range) => !range.empty) ? EDITOR_HAS_SELECTION_CLASS : "",
+    })),
+    EditorView.decorations.compute(["selection"], (state) => {
+      const decorations = [];
 
-      for (const range of view.state.selection.ranges) {
+      for (const range of state.selection.ranges) {
         if (range.empty) {
           continue;
         }
 
-        for (const segment of getSelectionLineSegments(view.state.doc, range)) {
-          const line = view.state.doc.lineAt(segment.from);
-          const lineBlockBounds =
-            segment.emptyLine || segment.from !== line.from || segment.to !== line.to
-              ? undefined
-              : getLineBlockMarkerBounds(view, segment.from);
-          const segmentMarkers = segment.emptyLine
-            ? buildEmptyLineSelectionMarkers(view, segment.from, rangeClass)
-            : expandSelectionRectangles(
-                view,
-                RectangleMarker.forRange(view, rangeClass, EditorSelection.range(segment.from, segment.to)),
-                rangeClass,
-                lineBlockBounds
-              );
-
-          markers.push(...alignSelectionRectanglesWithContentInset(view, segmentMarkers, rangeClass));
+        for (const segment of getSelectionLineSegments(state.doc, range)) {
+          if (!segment.emptyLine) {
+            decorations.push(Decoration.mark({ class: rangeClass }).range(segment.from, segment.to));
+          }
         }
       }
 
-      return markers;
-    },
-  });
+      return Decoration.set(decorations, true);
+    }),
+    layer({
+      above: false,
+      class: layerClass,
+      update(update) {
+        return update.docChanged || update.selectionSet || update.viewportChanged;
+      },
+      markers(view) {
+        const markers: RectangleMarker[] = [];
+
+        for (const range of view.state.selection.ranges) {
+          if (range.empty) {
+            continue;
+          }
+
+          for (const segment of getSelectionLineSegments(view.state.doc, range)) {
+            if (segment.emptyLine) {
+              markers.push(
+                ...alignSelectionRectanglesWithContentInset(
+                  view,
+                  buildEmptyLineSelectionMarkers(view, segment.from, rangeClass),
+                  rangeClass
+                )
+              );
+            }
+          }
+        }
+
+        return markers;
+      },
+    }),
+  ];
 }
 
 export function buildSelectionLayerTheme({
   rangeClass = EDITOR_SELECTION_RANGE_CLASS,
   selectionBackground,
+  surfaceBackground,
 }: {
   rangeClass?: string;
   selectionBackground: string;
+  surfaceBackground: string;
 }): Extension {
+  const opaqueSelectionBackground = resolveOpaqueSelectionBackground(surfaceBackground, selectionBackground);
+
   return EditorView.theme({
     "& > .cm-scroller > .cm-content ::selection": {
       backgroundColor: "transparent",
@@ -191,7 +213,23 @@ export function buildSelectionLayerTheme({
       backgroundColor: "transparent",
     },
     [`.${rangeClass}`]: {
-      backgroundColor: selectionBackground,
+      backgroundColor: opaqueSelectionBackground,
+      boxDecorationBreak: "clone",
+      WebkitBoxDecorationBreak: "clone",
+      paddingBlock: "calc((1lh - 1em) / 2)",
     },
   });
+}
+
+export function resolveOpaqueSelectionBackground(surfaceBackground: string, selectionBackground: string): string {
+  try {
+    const { type, values } = decomposeColor(selectionBackground);
+    const opacity = type === "rgba" || type === "hsla" || type === "color" ? Number(values[3] ?? 1) : 1;
+
+    return blend(surfaceBackground, selectionBackground, Math.max(0, Math.min(opacity, 1)));
+  } catch {
+    // CSS variables and newer color syntax cannot always be parsed by MUI.
+    // Preserve them instead of risking a second parsing error.
+    return selectionBackground;
+  }
 }
