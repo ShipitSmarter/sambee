@@ -30,6 +30,7 @@ import { STATUS_BAR_HEIGHT } from "../../components/FileBrowser/StatusBar";
 import type { SearchProvider } from "../../components/FileBrowser/search";
 import type { UnifiedSearchBarModeOption } from "../../components/FileBrowser/UnifiedSearchBar";
 import { UnifiedSearchBar } from "../../components/FileBrowser/UnifiedSearchBar";
+import { DRAFT_RECOVERY_CHANGED_EVENT, getUnsavedDraftsForConnection } from "../../services/draftRecovery";
 import { COMPACT_LAYOUT_SIZE } from "../../theme/constants";
 import type { Connection, FileEntry } from "../../types";
 import { FileType } from "../../types";
@@ -194,6 +195,19 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
   } = pane;
 
   const currentConnection = useMemo(() => connections.find((connection) => connection.id === connectionId), [connections, connectionId]);
+  const [unsavedDraftPaths, setUnsavedDraftPaths] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    const refreshDraftPaths = () => {
+      setUnsavedDraftPaths(new Set(getUnsavedDraftsForConnection(connectionId).map((draft) => draft.path)));
+    };
+
+    refreshDraftPaths();
+    window.addEventListener(DRAFT_RECOVERY_CHANGED_EVENT, refreshDraftPaths);
+    return () => {
+      window.removeEventListener(DRAFT_RECOVERY_CHANGED_EVENT, refreshDraftPaths);
+    };
+  }, [connectionId]);
 
   // Connection display name for breadcrumbs
   const connectionName = currentConnection?.name ?? "";
@@ -539,6 +553,7 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
             listContainerRef={listContainerRef}
             fileRowStyles={fileRowStyles}
             viewMode={viewMode}
+            unsavedDraftPaths={unsavedDraftPaths}
             getCompactItemActions={getCompactItemActionsForFile}
           />
         </Box>

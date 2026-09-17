@@ -76,6 +76,8 @@ import {
 } from "./markdownEditorConstants";
 import { areMarkdownSearchStatesEqual } from "./markdownSearchState";
 import { normalizeMarkdownTableCellLineBreaks, remarkRenderMarkdownTableCellLineBreaks } from "./markdownTableCellLineBreaks";
+import { RecoveredDraftDialog } from "./RecoveredDraftDialog";
+import { useEditorChangeSummary } from "./useEditorChangeSummary";
 import { useMarkdownEditSession } from "./useMarkdownEditSession";
 import { VIEWER_SEARCH_INPUT_ATTRIBUTE, ViewerControls, ViewerFilenameBadge } from "./ViewerControls";
 import { downloadViewerBlob } from "./viewerContent";
@@ -173,6 +175,8 @@ type PendingUnsavedChangesAction = "cancel-edit" | "close-viewer" | "stay-edit";
 type MarkdownSearchCloseReason = "escape" | "toggle";
 type EditorModuleLoadState = "idle" | "loading" | "loaded" | "failed";
 
+const DRAFT_SNAPSHOT_DEBOUNCE_MS = 250;
+
 function preserveMarkdownEditorSelection(editorRef: React.RefObject<MarkdownRichEditorHandle | null>): void {
   editorRef.current?.preserveSelection();
 }
@@ -185,6 +189,8 @@ function preserveMarkdownEditorSelection(editorRef: React.RefObject<MarkdownRich
 export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   connectionId,
   path,
+  fileSize,
+  fileModifiedAt,
   onClose,
   isReadOnly: connectionIsReadOnly = false,
   virtualSource,
@@ -200,6 +206,9 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   const [shareError, setShareError] = useState<string | null>(null);
   const [draftStorageWarning, setDraftStorageWarning] = useState<string | null>(null);
   const [recoveryDraft, setRecoveryDraft] = useState<DraftSnapshot | null>(null);
+  const [isResumingRecoveryDraft, setIsResumingRecoveryDraft] = useState(false);
+  const [resumedRecoveryDraft, setResumedRecoveryDraft] = useState(false);
+  const [immediateChangeSummaryToken, setImmediateChangeSummaryToken] = useState(0);
   const [showViewerHelp, setShowViewerHelp] = useState(false);
   const [showEditorHelp, setShowEditorHelp] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -402,7 +411,6 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     clearPendingBaselineSync,
     handleEditorChange,
     handleEditorUserEdit,
-    hasUserEditedInSession,
     markEditSessionPristine,
     requestRestoreEditingFocus,
   } = useMarkdownEditSession({
@@ -444,14 +452,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         setContent(normalizedData);
         if (!isEditingRef.current && !isReadOnly) {
           const recoveredDraft = loadDraft(connectionId, path, "markdown");
-          const nextDraft = recoveredDraft?.baseline === normalizedData ? recoveredDraft.content : normalizedData;
-          setDraftContent(nextDraft);
+          setDraftContent(normalizedData);
           setEditBaselineContent(normalizedData);
-          if (recoveredDraft?.baseline === normalizedData && recoveredDraft.content !== normalizedData) {
-            setIsEditing(true);
-          } else if (recoveredDraft && recoveredDraft.content !== recoveredDraft.baseline) {
-            setRecoveryDraft(recoveredDraft);
-          }
+          setResumedRecoveryDraft(false);
+          setRecoveryDraft(recoveredDraft && recoveredDraft.content !== recoveredDraft.baseline ? recoveredDraft : null);
         }
       } catch (err) {
         if (abortController.signal.aborted) {
@@ -484,22 +488,40 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   }, [connectionId, contentProviders, fetchWithRetry, isReadOnly, path, setEditBaselineContent, virtualSource]);
 
   useEffect(() => {
-    if (!isEditing || draftContent === editBaselineContentRef.current) {
+    if (!isEditing) {
       return;
     }
-    const result = saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, draftContent);
-    if (!result.saved && result.reason !== "no-user") {
-      setDraftStorageWarning(
-        result.reason === "too-large"
-          ? "Draft recovery is unavailable because this edit is too large."
-          : "Draft recovery is unavailable in this browser session."
-      );
+
+    if (draftContent === editBaselineContentRef.current) {
+      clearDraft(connectionId, path, "markdown");
+      setDraftStorageWarning(null);
+      return;
     }
-  }, [connectionId, draftContent, isEditing, path]);
+
+    const timeoutId = window.setTimeout(() => {
+      const result = saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, draftContent);
+      if (result.saved || result.reason === "no-user") {
+        setDraftStorageWarning(null);
+        return;
+      }
+
+      setDraftStorageWarning(
+        result.reason === "too-large" ? t("viewer.edit.recovery.tooLargeWarning") : t("viewer.edit.recovery.storageUnavailableWarning")
+      );
+    }, DRAFT_SNAPSHOT_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [connectionId, draftContent, isEditing, path, t]);
 
   useEffect(() => {
     const snapshot = () => {
-      if (isEditingRef.current && draftContent !== editBaselineContentRef.current) {
+      if (!isEditingRef.current) {
+        return;
+      }
+
+      if (draftContent === editBaselineContentRef.current) {
+        clearDraft(connectionId, path, "markdown");
+      } else {
         saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, draftContent);
       }
     };
@@ -559,7 +581,14 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     }
   }, [isEditing]);
 
-  const hasUnsavedChanges = isEditing && hasUserEditedInSession && draftContent !== editBaselineContent;
+  const hasUnsavedChanges = isEditing && draftContent !== editBaselineContent;
+  const editorChangeSummary = useEditorChangeSummary({
+    baseline: content,
+    current: draftContent,
+    enabled: hasUnsavedChanges,
+    immediateUpdateToken: immediateChangeSummaryToken,
+  });
+  const editorChangeSummaryId = "markdown-editor-change-summary";
   const unsavedChangesIndicator = hasUnsavedChanges ? (
     <Box
       component="span"
@@ -810,58 +839,89 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     onClose();
   }, [clearBaselineSyncWindow, clearPendingBaselineSync, onClose, releaseEditSession]);
 
-  const handleEnterEditMode = useCallback(async () => {
-    if (isReadOnly || loading || error) {
+  const handleEnterEditMode = useCallback(
+    async (initialDraft = content): Promise<boolean> => {
+      if (isReadOnly || loading || error) {
+        return false;
+      }
+
+      setEditError(null);
+      setEditorLoadError(null);
+
+      try {
+        const editResult = await beginViewerTextEdit(connectionId, path, contentProviders);
+        if (editResult.kind !== "acquired") throw new Error(`Editing is ${editResult.kind}`);
+        setEditSession(editResult.session);
+
+        setDraftContent(normalizeMarkdownTableCellLineBreaks(initialDraft));
+        setEditBaselineContent(content);
+        setEditorSearchText(searchPanelOpen ? viewerSearchText : "");
+        setEditorSearchAutoNavigate(true);
+        clearPendingBaselineSync();
+        beginBaselineSyncWindow();
+        markEditSessionPristine();
+        setEditorLoadState((previousState) => {
+          if (EditorComponent) {
+            return "loaded";
+          }
+
+          return previousState === "failed" ? "idle" : previousState;
+        });
+        setEditorFailed(false);
+        setEditorBoundaryKey((previousKey) => previousKey + 1);
+        setIsEditing(true);
+        return true;
+      } catch (err) {
+        const message = getApiErrorMessage(err, t("viewer.edit.lockFailedReason"), { includeOriginalMessage: true });
+        setEditError(t("viewer.edit.lockFailed", { message }));
+        logError("Failed to enter markdown edit mode", { error: err, path, connectionId });
+        return false;
+      }
+    },
+    [
+      beginBaselineSyncWindow,
+      clearPendingBaselineSync,
+      connectionId,
+      contentProviders,
+      content,
+      EditorComponent,
+      error,
+      isReadOnly,
+      loading,
+      markEditSessionPristine,
+      path,
+      searchPanelOpen,
+      setEditBaselineContent,
+      t,
+      viewerSearchText,
+    ]
+  );
+
+  const handleResumeRecoveryDraft = useCallback(() => {
+    const recoveredDraft = recoveryDraft;
+    if (!recoveredDraft || isResumingRecoveryDraft) {
       return;
     }
 
-    setEditError(null);
-    setEditorLoadError(null);
-
-    try {
-      const editResult = await beginViewerTextEdit(connectionId, path, contentProviders);
-      if (editResult.kind !== "acquired") throw new Error(`Editing is ${editResult.kind}`);
-      setEditSession(editResult.session);
-
-      setDraftContent(content);
-      setEditBaselineContent(content);
-      setEditorSearchText(searchPanelOpen ? viewerSearchText : "");
-      setEditorSearchAutoNavigate(true);
-      clearPendingBaselineSync();
-      beginBaselineSyncWindow();
-      markEditSessionPristine();
-      setEditorLoadState((previousState) => {
-        if (EditorComponent) {
-          return "loaded";
+    setIsResumingRecoveryDraft(true);
+    void handleEnterEditMode(recoveredDraft.content)
+      .then((enteredEditMode) => {
+        if (enteredEditMode) {
+          setRecoveryDraft(null);
+          setResumedRecoveryDraft(true);
+          setImmediateChangeSummaryToken((previousToken) => previousToken + 1);
         }
+      })
+      .finally(() => setIsResumingRecoveryDraft(false));
+  }, [handleEnterEditMode, isResumingRecoveryDraft, recoveryDraft]);
 
-        return previousState === "failed" ? "idle" : previousState;
-      });
-      setEditorFailed(false);
-      setEditorBoundaryKey((previousKey) => previousKey + 1);
-      setIsEditing(true);
-    } catch (err) {
-      const message = getApiErrorMessage(err, t("viewer.edit.lockFailedReason"), { includeOriginalMessage: true });
-      setEditError(t("viewer.edit.lockFailed", { message }));
-      logError("Failed to enter markdown edit mode", { error: err, path, connectionId });
-    }
-  }, [
-    beginBaselineSyncWindow,
-    clearPendingBaselineSync,
-    connectionId,
-    contentProviders,
-    content,
-    EditorComponent,
-    error,
-    isReadOnly,
-    loading,
-    markEditSessionPristine,
-    path,
-    searchPanelOpen,
-    setEditBaselineContent,
-    t,
-    viewerSearchText,
-  ]);
+  const handleDiscardRecoveryDraft = useCallback(() => {
+    clearDraft(connectionId, path, "markdown");
+    setDraftContent(content);
+    setEditBaselineContent(content);
+    setEditError(null);
+    setRecoveryDraft(null);
+  }, [connectionId, content, path, setEditBaselineContent]);
 
   const handleCancelEdit = useCallback(async () => {
     if (hasUnsavedChanges) {
@@ -1041,13 +1101,17 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   }, []);
 
   const handleUnsavedChangesDiscard = useCallback(async () => {
+    if (resumedRecoveryDraft) {
+      clearDraft(connectionId, path, "markdown");
+    }
+
     if (pendingUnsavedChangesAction === "close-viewer") {
       await closeViewer();
       return;
     }
 
     await exitEditMode();
-  }, [closeViewer, exitEditMode, pendingUnsavedChangesAction]);
+  }, [closeViewer, connectionId, exitEditMode, path, pendingUnsavedChangesAction, resumedRecoveryDraft]);
 
   const handleUnsavedChangesSave = useCallback(async () => {
     if (!pendingUnsavedChangesAction) {
@@ -1839,97 +1903,107 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
                 <Alert severity="error">{error}</Alert>
               </Box>
             ) : isEditing ? (
-              <Box
-                sx={{
-                  p: 0,
-                  flex: 1,
-                  minHeight: 0,
-                  display: "flex",
-                  overflow: "hidden",
-                  "& .sambee-markdown-editor": {
+              <>
+                {editorChangeSummary ? (
+                  <Box id={editorChangeSummaryId} sx={{ px: 2, py: 0.75, color: "text.secondary", fontSize: "0.875rem" }}>
+                    {t("viewer.edit.changeSummary", editorChangeSummary)}
+                  </Box>
+                ) : null}
+                <Box
+                  sx={{
+                    p: 0,
                     flex: 1,
                     minHeight: 0,
-                    [CODEMIRROR_EDITOR_HORIZONTAL_INSET_CSS_VARIABLE]: muiTheme.spacing(CODEMIRROR_EDITOR_CONTENT_PADDING.xs),
-                    [muiTheme.breakpoints.up("sm")]: {
-                      [CODEMIRROR_EDITOR_HORIZONTAL_INSET_CSS_VARIABLE]: muiTheme.spacing(CODEMIRROR_EDITOR_CONTENT_PADDING.sm),
+                    display: "flex",
+                    overflow: "hidden",
+                    "& .sambee-markdown-editor": {
+                      flex: 1,
+                      minHeight: 0,
+                      [CODEMIRROR_EDITOR_HORIZONTAL_INSET_CSS_VARIABLE]: muiTheme.spacing(CODEMIRROR_EDITOR_CONTENT_PADDING.xs),
+                      [muiTheme.breakpoints.up("sm")]: {
+                        [CODEMIRROR_EDITOR_HORIZONTAL_INSET_CSS_VARIABLE]: muiTheme.spacing(CODEMIRROR_EDITOR_CONTENT_PADDING.sm),
+                      },
                     },
-                  },
-                  "& .sambee-markdown-editor .cm-content": {
-                    pt: CODEMIRROR_EDITOR_CONTENT_PADDING,
-                    pb: VIEWER_SCROLL_END_PADDING,
-                  },
-                }}
-              >
-                {editorLoadState === "loading" ? (
-                  <Box
-                    sx={{
-                      display: "flex",
-                      justifyContent: "center",
-                      alignItems: "center",
-                      height: "100%",
-                    }}
-                  >
-                    <CircularProgress />
-                  </Box>
-                ) : editorLoadError ? (
-                  <Box sx={{ display: "flex", flexDirection: "column", gap: 2, py: 2 }}>
-                    <Alert severity="error">
-                      <Box component="div" sx={{ fontWeight: 600, mb: 0.5 }}>
-                        {t("viewer.edit.editorLoadTitle")}
-                      </Box>
-                      {t("viewer.edit.editorLoadMessage")}
-                    </Alert>
-                    <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                      <Button variant="contained" onClick={handleRetryEditor}>
-                        {t("viewer.edit.retryEditor")}
-                      </Button>
-                      <Button
-                        variant="outlined"
-                        onClick={() => {
-                          void handleCancelEdit();
-                        }}
-                      >
-                        {t("viewer.edit.returnToPreview")}
-                      </Button>
+                    "& .sambee-markdown-editor .cm-content": {
+                      pt: CODEMIRROR_EDITOR_CONTENT_PADDING,
+                      pb: VIEWER_SCROLL_END_PADDING,
+                    },
+                  }}
+                >
+                  {editorLoadState === "loading" ? (
+                    <Box
+                      sx={{
+                        display: "flex",
+                        justifyContent: "center",
+                        alignItems: "center",
+                        height: "100%",
+                      }}
+                    >
+                      <CircularProgress />
                     </Box>
-                  </Box>
-                ) : EditorComponent ? (
-                  <MarkdownEditorErrorBoundary
-                    key={editorBoundaryKey}
-                    title={t("viewer.edit.editorCrashTitle")}
-                    description={t("viewer.edit.editorCrashMessage")}
-                    retryLabel={t("viewer.edit.retryEditor")}
-                    returnToPreviewLabel={t("viewer.edit.returnToPreview")}
-                    onError={handleEditorCrashed}
-                    onRetry={handleRetryEditor}
-                    onReturnToPreview={() => {
-                      void handleCancelEdit();
-                    }}
-                  >
-                    <EditorComponent
-                      ref={editorRef}
-                      className="sambee-markdown-editor"
-                      markdown={draftContent}
-                      diffMarkdown={content}
-                      theme={markdownEditorTheme}
-                      lineWrapping={wordWrapEnabled}
-                      onChange={handleEditorChange}
-                      onUserEdit={handleEditorUserEdit}
-                      ariaLabel={t("viewer.edit.editorLabel")}
-                      autoFocus={true}
-                      readOnly={editorShouldBeReadOnly}
-                      searchText={activeEditorSearchText}
-                      searchOpen={searchPanelOpen}
-                      searchAutoNavigate={editorSearchAutoNavigate}
-                      searchCaseSensitive={editorSearchCaseSensitive}
-                      onSearchStateChange={handleEditorSearchStateChange}
-                      searchRegexp={editorSearchRegexp}
-                      searchReplaceText={editorSearchReplaceText}
-                      searchWholeWord={editorSearchWholeWord}
-                    />
-                  </MarkdownEditorErrorBoundary>
-                ) : null}
-              </Box>
+                  ) : editorLoadError ? (
+                    <Box sx={{ display: "flex", flexDirection: "column", gap: 2, py: 2 }}>
+                      <Alert severity="error">
+                        <Box component="div" sx={{ fontWeight: 600, mb: 0.5 }}>
+                          {t("viewer.edit.editorLoadTitle")}
+                        </Box>
+                        {t("viewer.edit.editorLoadMessage")}
+                      </Alert>
+                      <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+                        <Button variant="contained" onClick={handleRetryEditor}>
+                          {t("viewer.edit.retryEditor")}
+                        </Button>
+                        <Button
+                          variant="outlined"
+                          onClick={() => {
+                            void handleCancelEdit();
+                          }}
+                        >
+                          {t("viewer.edit.returnToPreview")}
+                        </Button>
+                      </Box>
+                    </Box>
+                  ) : EditorComponent ? (
+                    <MarkdownEditorErrorBoundary
+                      key={editorBoundaryKey}
+                      title={t("viewer.edit.editorCrashTitle")}
+                      description={t("viewer.edit.editorCrashMessage")}
+                      retryLabel={t("viewer.edit.retryEditor")}
+                      returnToPreviewLabel={t("viewer.edit.returnToPreview")}
+                      onError={handleEditorCrashed}
+                      onRetry={handleRetryEditor}
+                      onReturnToPreview={() => {
+                        void handleCancelEdit();
+                      }}
+                    >
+                      <EditorComponent
+                        ref={editorRef}
+                        className="sambee-markdown-editor"
+                        markdown={draftContent}
+                        diffMarkdown={content}
+                        theme={markdownEditorTheme}
+                        lineWrapping={wordWrapEnabled}
+                        onChange={handleEditorChange}
+                        onUserEdit={handleEditorUserEdit}
+                        ariaLabel={t("viewer.edit.editorLabel")}
+                        autoFocus={true}
+                        readOnly={editorShouldBeReadOnly}
+                        searchText={activeEditorSearchText}
+                        searchOpen={searchPanelOpen}
+                        searchAutoNavigate={editorSearchAutoNavigate}
+                        searchCaseSensitive={editorSearchCaseSensitive}
+                        onSearchStateChange={handleEditorSearchStateChange}
+                        searchRegexp={editorSearchRegexp}
+                        searchReplaceText={editorSearchReplaceText}
+                        searchWholeWord={editorSearchWholeWord}
+                        changeSummary={editorChangeSummary ?? undefined}
+                        showChangeGutter={!isMobile}
+                        describedById={editorChangeSummary ? editorChangeSummaryId : undefined}
+                      />
+                    </MarkdownEditorErrorBoundary>
+                  ) : null}
+                </Box>
+              </>
             ) : (
               <Box
                 data-markdown-search-root="true"
@@ -1996,47 +2070,15 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         </Box>
       </Dialog>
 
-      <ResponsiveDialogShell
-        open={recoveryDraft !== null}
-        onClose={() => setRecoveryDraft(null)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            event.stopPropagation();
-            setRecoveryDraft(null);
-          }
-        }}
-        title="Recovered draft needs review"
-        description="This file changed since the draft was saved. Choose whether to resume the recovered draft or discard it."
-        maxWidth="xs"
-        actions={
-          <>
-            <Button
-              color="warning"
-              onClick={() => {
-                clearDraft(connectionId, path, "markdown");
-                setRecoveryDraft(null);
-              }}
-            >
-              Discard draft
-            </Button>
-            <Button
-              variant="contained"
-              onClick={() => {
-                const recovered = recoveryDraft;
-                setRecoveryDraft(null);
-                if (recovered) {
-                  void handleEnterEditMode().then(() => setDraftContent(recovered.content));
-                }
-              }}
-            >
-              Resume draft
-            </Button>
-          </>
-        }
-      >
-        {null}
-      </ResponsiveDialogShell>
+      <RecoveredDraftDialog
+        draft={recoveryDraft}
+        fileSize={fileSize}
+        fileModifiedAt={fileModifiedAt}
+        error={editError}
+        isResuming={isResumingRecoveryDraft}
+        onDiscard={handleDiscardRecoveryDraft}
+        onResume={handleResumeRecoveryDraft}
+      />
 
       <ResponsiveDialogShell
         open={unsavedChangesDialogOpen}

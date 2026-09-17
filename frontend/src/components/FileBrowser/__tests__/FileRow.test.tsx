@@ -72,6 +72,19 @@ describe("FileRow", () => {
     expect(props.onClick).toHaveBeenCalledWith(props.file, props.index);
   });
 
+  it("shows an accessible marker for an unsaved local draft", async () => {
+    await setLocale("en-XA");
+    render(<FileRow {...createDefaultFileRowProps()} hasUnsavedLocalDraft />);
+
+    const markerLabel = translate("fileBrowser.row.unsavedLocalDraft");
+    expect(screen.getByRole("img", { name: markerLabel })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: `${translate("fileBrowser.row.itemTypes.file")}: report.pdf${translate("fileBrowser.row.unsavedLocalDraftSuffix")}${translate("fileBrowser.row.selectedSuffix")}`,
+      })
+    ).toBeInTheDocument();
+  });
+
   it("rerenders a selected row when its styles change", () => {
     const props = createDefaultFileRowProps();
     props.isMultiSelected = false;
