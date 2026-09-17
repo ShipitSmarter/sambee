@@ -10,7 +10,7 @@
  * - Does not render when open is false
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { FileType } from "../../../types";
@@ -103,13 +103,11 @@ describe("RenameDialog", () => {
 
   it("submits on Enter key press", async () => {
     const onConfirm = vi.fn();
-    const user = userEvent.setup();
     render(<RenameDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(RENAME_DIALOG_STRINGS.INPUT_LABEL);
-    await user.clear(input);
-    await user.type(input, "new-name.txt");
-    await user.keyboard("{Enter}");
+    fireEvent.change(input, { target: { value: "new-name.txt" } });
+    fireEvent.keyDown(input, { key: "Enter" });
 
     expect(onConfirm).toHaveBeenCalledWith("new-name.txt");
   });
@@ -120,7 +118,7 @@ describe("RenameDialog", () => {
     render(<RenameDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(RENAME_DIALOG_STRINGS.INPUT_LABEL);
-    await user.clear(input);
+    fireEvent.change(input, { target: { value: "" } });
     await user.click(screen.getByRole("button", { name: RENAME_DIALOG_STRINGS.BUTTON_RENAME }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_EMPTY)).toBeInTheDocument();
@@ -145,8 +143,7 @@ describe("RenameDialog", () => {
     render(<RenameDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(RENAME_DIALOG_STRINGS.INPUT_LABEL);
-    await user.clear(input);
-    await user.type(input, "file/name.txt");
+    fireEvent.change(input, { target: { value: "file/name.txt" } });
     await user.click(screen.getByRole("button", { name: RENAME_DIALOG_STRINGS.BUTTON_RENAME }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_INVALID_CHARS)).toBeInTheDocument();
@@ -159,8 +156,7 @@ describe("RenameDialog", () => {
     render(<RenameDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(RENAME_DIALOG_STRINGS.INPUT_LABEL);
-    await user.clear(input);
-    await user.type(input, "..");
+    fireEvent.change(input, { target: { value: ".." } });
     await user.click(screen.getByRole("button", { name: RENAME_DIALOG_STRINGS.BUTTON_RENAME }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_DOT_NAMES)).toBeInTheDocument();
@@ -209,8 +205,7 @@ describe("RenameDialog", () => {
     render(<RenameDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(RENAME_DIALOG_STRINGS.INPUT_LABEL);
-    await user.clear(input);
-    await user.type(input, "badname.");
+    fireEvent.change(input, { target: { value: "badname." } });
     await user.click(screen.getByRole("button", { name: RENAME_DIALOG_STRINGS.BUTTON_RENAME }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_TRAILING)).toBeInTheDocument();

@@ -165,22 +165,19 @@ describe("CopyMoveDialog", () => {
     render(<CopyMoveDialog {...props} />);
 
     const input = screen.getByLabelText(S.LABEL_FILENAME);
-    await user.clear(input);
-    await user.type(input, "  renamed.txt");
+    fireEvent.change(input, { target: { value: "  renamed.txt" } });
     await user.click(screen.getByRole("button", { name: S.BUTTON_COPY }));
 
     expect(onConfirm).toHaveBeenCalledWith("  renamed.txt");
   });
 
-  it("rejects a single-item rename with trailing whitespace", async () => {
+  it("rejects a single-item rename with trailing whitespace", () => {
     const onConfirm = vi.fn();
-    const user = userEvent.setup();
     const props = { ...defaultProps, files: [createFile("readme.txt")], onConfirm };
     render(<CopyMoveDialog {...props} />);
 
     const input = screen.getByLabelText(S.LABEL_FILENAME);
-    await user.clear(input);
-    await user.type(input, "renamed.txt ");
+    fireEvent.change(input, { target: { value: "renamed.txt " } });
 
     expect(screen.getByText("Names cannot end in a space or period.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: S.BUTTON_COPY })).toBeDisabled();
@@ -297,8 +294,7 @@ describe("CopyMoveDialog", () => {
     render(<CopyMoveDialog {...props} />);
 
     const input = screen.getByLabelText(S.LABEL_FILENAME);
-    await user.clear(input);
-    await user.type(input, "readme-copy.txt");
+    fireEvent.change(input, { target: { value: "readme-copy.txt" } });
     await user.click(screen.getByRole("button", { name: S.BUTTON_COPY }));
 
     expect(onConfirm).toHaveBeenCalledWith("readme-copy.txt");
@@ -325,8 +321,7 @@ describe("CopyMoveDialog", () => {
     expect(onConfirm).toHaveBeenCalledWith("readme (copy).txt");
   });
 
-  it("shows a detailed filename error when a same-directory target is changed back to its original name", async () => {
-    const user = userEvent.setup();
+  it("shows a detailed filename error when a same-directory target is changed back to its original name", () => {
     const props = {
       ...defaultProps,
       files: [createFile("readme.txt")],
@@ -338,8 +333,7 @@ describe("CopyMoveDialog", () => {
     expect(fileNameInput).toHaveValue("readme (copy).txt");
     expect(screen.getByRole("button", { name: S.BUTTON_COPY })).toBeEnabled();
 
-    await user.clear(fileNameInput);
-    await user.type(fileNameInput, "readme.txt");
+    fireEvent.change(fileNameInput, { target: { value: "readme.txt" } });
 
     expect(screen.getByText(S.ERROR_SAME_FILENAME)).toBeInTheDocument();
     expect(screen.getByText(S.ERROR_SAME_FILENAME)).not.toHaveStyle({ overflow: "hidden", whiteSpace: "nowrap" });
@@ -388,13 +382,12 @@ describe("CopyMoveDialog", () => {
     expect(screen.getByText("Something went wrong")).toBeInTheDocument();
   });
 
-  it("disables confirm when file name is empty (single-item)", async () => {
-    const user = userEvent.setup();
+  it("disables confirm when file name is empty (single-item)", () => {
     const props = { ...defaultProps, files: [createFile("readme.txt")] };
     render(<CopyMoveDialog {...props} />);
 
     const input = screen.getByLabelText(S.LABEL_FILENAME);
-    await user.clear(input);
+    fireEvent.change(input, { target: { value: "" } });
 
     expect(screen.getByRole("button", { name: S.BUTTON_COPY })).toBeDisabled();
     expect(screen.getByText(S.WARN_EMPTY_FILENAME)).toBeInTheDocument();

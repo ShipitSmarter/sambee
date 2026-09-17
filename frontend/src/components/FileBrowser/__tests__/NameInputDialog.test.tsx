@@ -17,7 +17,7 @@
  * - Preserves whitespace before confirming
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import NameInputDialog from "../NameInputDialog";
@@ -159,12 +159,11 @@ describe("NameInputDialog", () => {
 
   it("calls onConfirm when Enter is pressed", async () => {
     const onConfirm = vi.fn();
-    const user = userEvent.setup();
     render(<NameInputDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText("Name");
-    await user.type(input, "my-file.txt");
-    await user.keyboard("{Enter}");
+    fireEvent.change(input, { target: { value: "my-file.txt" } });
+    fireEvent.keyDown(input, { key: "Enter" });
 
     expect(onConfirm).toHaveBeenCalledWith("my-file.txt");
   });
@@ -177,7 +176,7 @@ describe("NameInputDialog", () => {
     const input = screen.getByLabelText("Name");
     const nfdName = "Auftragsbesta\u0308tigung.pdf";
     const nfcName = "Auftragsbestätigung.pdf";
-    await user.type(input, nfdName);
+    fireEvent.change(input, { target: { value: nfdName } });
 
     expect(input).toHaveValue(nfdName);
     await user.click(screen.getByRole("button", { name: "Submit" }));
@@ -235,7 +234,7 @@ describe("NameInputDialog", () => {
     render(<NameInputDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText("Name");
-    await user.type(input, "file/name");
+    fireEvent.change(input, { target: { value: "file/name" } });
     await user.click(screen.getByRole("button", { name: "Submit" }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_INVALID_CHARS)).toBeInTheDocument();
@@ -248,7 +247,7 @@ describe("NameInputDialog", () => {
     render(<NameInputDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText("Name");
-    await user.type(input, "..");
+    fireEvent.change(input, { target: { value: ".." } });
     await user.click(screen.getByRole("button", { name: "Submit" }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_DOT_NAMES)).toBeInTheDocument();
@@ -261,7 +260,7 @@ describe("NameInputDialog", () => {
     render(<NameInputDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText("Name");
-    await user.type(input, "myfile.");
+    fireEvent.change(input, { target: { value: "myfile." } });
     await user.click(screen.getByRole("button", { name: "Submit" }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_TRAILING)).toBeInTheDocument();
@@ -274,7 +273,7 @@ describe("NameInputDialog", () => {
     render(<NameInputDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText("Name");
-    await user.type(input, "myfile ");
+    fireEvent.change(input, { target: { value: "myfile " } });
     await user.click(screen.getByRole("button", { name: "Submit" }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_TRAILING)).toBeInTheDocument();
@@ -324,7 +323,7 @@ describe("NameInputDialog", () => {
 
     // Type something — error should clear
     const input = screen.getByLabelText("Name");
-    await user.type(input, "a");
+    fireEvent.change(input, { target: { value: "a" } });
 
     expect(screen.queryByText(NAME_DIALOG_STRINGS.VALIDATION_EMPTY)).not.toBeInTheDocument();
   });

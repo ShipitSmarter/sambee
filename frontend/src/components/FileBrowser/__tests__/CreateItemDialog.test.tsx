@@ -13,7 +13,7 @@
  * - Does not render when open is false
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { FileType } from "../../../types";
@@ -99,12 +99,11 @@ describe("CreateItemDialog", () => {
 
   it("calls onConfirm on Enter key press", async () => {
     const onConfirm = vi.fn();
-    const user = userEvent.setup();
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, "my-document.txt");
-    await user.keyboard("{Enter}");
+    fireEvent.change(input, { target: { value: "my-document.txt" } });
+    fireEvent.keyDown(input, { key: "Enter" });
 
     expect(onConfirm).toHaveBeenCalledWith("my-document.txt");
   });
@@ -115,7 +114,7 @@ describe("CreateItemDialog", () => {
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, "  spaced-name");
+    fireEvent.change(input, { target: { value: "  spaced-name" } });
     await user.click(screen.getByRole("button", { name: CREATE_ITEM_DIALOG_STRINGS.BUTTON_CREATE }));
 
     expect(onConfirm).toHaveBeenCalledWith("  spaced-name");
@@ -151,7 +150,7 @@ describe("CreateItemDialog", () => {
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, "bad:name");
+    fireEvent.change(input, { target: { value: "bad:name" } });
     await user.click(screen.getByRole("button", { name: CREATE_ITEM_DIALOG_STRINGS.BUTTON_CREATE }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_INVALID_CHARS)).toBeInTheDocument();
@@ -164,7 +163,7 @@ describe("CreateItemDialog", () => {
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, ".");
+    fireEvent.change(input, { target: { value: "." } });
     await user.click(screen.getByRole("button", { name: CREATE_ITEM_DIALOG_STRINGS.BUTTON_CREATE }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_DOT_NAMES)).toBeInTheDocument();
@@ -177,7 +176,7 @@ describe("CreateItemDialog", () => {
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, "myfile.");
+    fireEvent.change(input, { target: { value: "myfile." } });
     await user.click(screen.getByRole("button", { name: CREATE_ITEM_DIALOG_STRINGS.BUTTON_CREATE }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_TRAILING)).toBeInTheDocument();
@@ -190,7 +189,7 @@ describe("CreateItemDialog", () => {
     render(<CreateItemDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const input = screen.getByLabelText(CREATE_ITEM_DIALOG_STRINGS.INPUT_LABEL);
-    await user.type(input, "myfile ");
+    fireEvent.change(input, { target: { value: "myfile " } });
     await user.click(screen.getByRole("button", { name: CREATE_ITEM_DIALOG_STRINGS.BUTTON_CREATE }));
 
     expect(screen.getByText(NAME_DIALOG_STRINGS.VALIDATION_TRAILING)).toBeInTheDocument();

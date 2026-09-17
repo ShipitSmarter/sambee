@@ -123,15 +123,12 @@ describe("ArchiveExtractDialog", () => {
   });
 
   it("normalizes separators before submitting a destination", async () => {
-    const user = userEvent.setup();
     const onConfirm = vi.fn();
     render(<ArchiveExtractDialog {...defaultProps} onConfirm={onConfirm} />);
 
     const destinationInput = screen.getByLabelText("fileBrowser.archive.destinationNameLabel");
-    await user.click(destinationInput);
-    await user.clear(destinationInput);
-    await user.type(destinationInput, "output\\release");
-    await user.click(screen.getByRole("button", { name: "fileBrowser.archive.buttonExtract" }));
+    fireEvent.change(destinationInput, { target: { value: "output\\release" } });
+    fireEvent.click(screen.getByRole("button", { name: "fileBrowser.archive.buttonExtract" }));
 
     expect(onConfirm).toHaveBeenCalledWith("output/release");
   });
