@@ -111,13 +111,12 @@ describe("ArchiveExtractDialog", () => {
   });
 
   it("rejects traversal destination paths", async () => {
-    const user = userEvent.setup();
     const onConfirm = vi.fn();
     render(<ArchiveExtractDialog {...defaultProps} onConfirm={onConfirm} />);
 
-    await user.clear(screen.getByLabelText("fileBrowser.archive.destinationNameLabel"));
-    await user.type(screen.getByLabelText("fileBrowser.archive.destinationNameLabel"), "../outside");
-    await user.click(screen.getByRole("button", { name: "fileBrowser.archive.buttonExtract" }));
+    const destinationInput = screen.getByLabelText("fileBrowser.archive.destinationNameLabel");
+    fireEvent.change(destinationInput, { target: { value: "../outside" } });
+    fireEvent.click(screen.getByRole("button", { name: "fileBrowser.archive.buttonExtract" }));
 
     expect(await screen.findByText("fileBrowser.archive.validationDestinationUnsafe")).toBeInTheDocument();
     expect(onConfirm).not.toHaveBeenCalled();
