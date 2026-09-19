@@ -11,6 +11,7 @@ import type {
   AdminUserUpdateInput,
   AdvancedSystemSettings,
   AdvancedSystemSettingsUpdate,
+  ArchiveCompanionSession,
   ArchiveDirectoryListing,
   ArchiveExtractionDecisionAction,
   ArchiveOperation,
@@ -84,6 +85,27 @@ export interface CrossBackendTransferOptions {
   onProgress?: (bytesTransferred: number, totalBytes: number | null) => void;
 }
 
+type ClientConfig = Pick<AxiosRequestConfig, "headers">;
+
+const EXPIRED_EDIT_LOCK_CODE = "edit_lock_lost";
+const EXPIRED_EDIT_LOCK_MESSAGE = "Lock not found or expired";
+
+export class ExpiredEditLockError extends Error {
+  constructor() {
+    super(EXPIRED_EDIT_LOCK_MESSAGE);
+    this.name = "ExpiredEditLockError";
+  }
+}
+
+function isExpiredEditLockResponse(body: string): boolean {
+  try {
+    const response = JSON.parse(body) as { code?: unknown; detail?: { code?: unknown } };
+    return response.code === EXPIRED_EDIT_LOCK_CODE || response.detail?.code === EXPIRED_EDIT_LOCK_CODE;
+  } catch {
+    return false;
+  }
+}
+
 function supportsStreamUploadRequestBodies(): boolean {
   if (typeof Request === "undefined" || typeof ReadableStream === "undefined") return false;
 
@@ -105,7 +127,6 @@ function supportsStreamUploadRequestBodies(): boolean {
 
 const CONNECTIONS_API_BASE = "/connections";
 const API_PATH_SUFFIX = "/api";
-const LOCAL_DRIVE_EDIT_LOCKS_UNSUPPORTED_MESSAGE = "Edit locks are not supported for local drives";
 const DIRECTORY_LIST_REQUEST_TIMEOUT_MS = 40_000;
 const LOCAL_LINK_TARGET_REQUEST_TIMEOUT_MS = 15_000;
 const LOCAL_ARCHIVE_EXECUTION_POLL_INTERVAL_MS = 200;
@@ -497,7 +518,7 @@ class ApiService {
    * For local drives: returns the companion instance + HMAC headers.
    * For server connections: returns the main instance (Bearer via interceptor).
    */
-  private async getClientConfig(connectionId: string): Promise<{ client: AxiosInstance; extraConfig: AxiosRequestConfig }> {
+  private async getClientConfig(connectionId: string): Promise<{ client: AxiosInstance; extraConfig: ClientConfig }> {
     if (isLocalDrive(connectionId)) {
       const headers = await this.buildCompanionHeaders();
       return { client: this.companionApi, extraConfig: { headers } };
@@ -505,7 +526,7 @@ class ApiService {
     return { client: this.api, extraConfig: {} };
   }
 
-  private authenticatedArchiveRelayConfig(extraConfig: AxiosRequestConfig): AxiosRequestConfig {
+  private authenticatedArchiveRelayConfig(extraConfig: ClientConfig): ClientConfig {
     const accessToken = authSession.getAccessToken();
     if (!accessToken) {
       throw new Error("Authentication is required to start archive extraction");
@@ -1571,7 +1592,8 @@ class ApiService {
         error: { code: "unavailable", reason: "unsupported" },
       };
     }
-    if (!Number.isSafeInteger(sourceInfo.size) || sourceInfo.size < 0) {
+    const sourceSize = sourceInfo.size;
+    if (typeof sourceSize !== "number" || !Number.isSafeInteger(sourceSize) || sourceSize < 0) {
       return {
         status: "failed",
         replaced: false,
@@ -1596,7 +1618,7 @@ class ApiService {
         effects: { source: "unknown", destination: "unknown" },
       };
     }
-    const expectedSize = sourceInfo.size;
+    const expectedSize = sourceSize;
     const sourceModifiedAt = sourceInfo.modified_at ? `&source_modified_at=${encodeURIComponent(sourceInfo.modified_at)}` : "";
     const destinationUrl = `${getBaseUrl(destinationConnectionId)}/browse/${getBrowseSegment(destinationConnectionId)}/transfer-stream?path=${encodeURIComponent(destinationPath)}&target_resolution_policy=${encodeURIComponent(targetResolutionPolicy)}&expected_size=${expectedSize}${sourceModifiedAt}`;
     const destinationHeaders = await this.getTransferFetchHeaders(destinationConnectionId);
@@ -1606,7 +1628,7 @@ class ApiService {
           new TransformStream<Uint8Array, Uint8Array>({
             transform: (chunk, controller) => {
               bytesTransferred += chunk.byteLength;
-              options.onProgress?.(bytesTransferred, sourceInfo.size ?? null);
+              options.onProgress?.(bytesTransferred, sourceSize);
               controller.enqueue(chunk);
             },
           })
@@ -1712,8 +1734,9 @@ class ApiService {
     const abortHandler = () => {
       void onCancel?.();
     };
-    config.signal?.addEventListener("abort", abortHandler, { once: true });
-    if (config.signal?.aborted) {
+    const signal = config.signal;
+    signal?.addEventListener?.("abort", abortHandler, { once: true });
+    if (signal?.aborted) {
       abortHandler();
     }
     try {
@@ -1724,7 +1747,7 @@ class ApiService {
       }
       return { status: "outcome_unknown", replaced: false, effects: { source: "unknown", destination: "unknown" } };
     } finally {
-      config.signal?.removeEventListener("abort", abortHandler);
+      signal?.removeEventListener?.("abort", abortHandler);
     }
   }
 
@@ -1732,7 +1755,7 @@ class ApiService {
     client: AxiosInstance,
     segment: string,
     transferAttemptId: string,
-    extraConfig: AxiosRequestConfig
+    extraConfig: ClientConfig
   ): Promise<void> {
     try {
       await client.post(`/browse/${segment}/transfer-attempts/${encodeURIComponent(transferAttemptId)}/cancel`, {}, extraConfig);
@@ -1825,6 +1848,9 @@ class ApiService {
 
     if (!response.ok) {
       const text = await response.text().catch(() => response.statusText);
+      if (response.status === 404 && isExpiredEditLockResponse(text)) {
+        throw new ExpiredEditLockError();
+      }
       throw new Error(`Upload failed (${response.status}): ${text}`);
     }
   }
@@ -2062,11 +2088,13 @@ class ApiService {
       const params: Record<string, string | number> = { path };
 
       // Add viewport dimensions if provided (for server-side resizing)
-      if (options.viewportWidth) {
-        params["viewport_width"] = getDevicePixelDimension(options.viewportWidth);
+      const viewportWidth = getDevicePixelDimension(options.viewportWidth);
+      if (viewportWidth !== undefined) {
+        params["viewport_width"] = viewportWidth;
       }
-      if (options.viewportHeight) {
-        params["viewport_height"] = getDevicePixelDimension(options.viewportHeight);
+      const viewportHeight = getDevicePixelDimension(options.viewportHeight);
+      if (viewportHeight !== undefined) {
+        params["viewport_height"] = viewportHeight;
       }
       if (options.no_resizing) {
         params["no_resizing"] = 1;
@@ -2368,7 +2396,6 @@ class ApiService {
 
 export const apiService = new ApiService();
 export default apiService;
-export { LOCAL_DRIVE_EDIT_LOCKS_UNSUPPORTED_MESSAGE };
 
 // Export convenience functions
 export const login = (username: string, password: string) => apiService.login(username, password);
