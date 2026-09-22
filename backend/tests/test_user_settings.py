@@ -28,7 +28,19 @@ class TestCurrentUserSettingsApi:
         assert data["browser"]["quick_nav_include_dot_directories"] is False
         assert data["browser"]["touch_friendly_file_selection"] == "auto"
         assert data["browser"]["selected_connection_id"] is None
+        assert data["browser"]["live_directory_updates"] == {}
         assert data["text_editor"] == {"max_file_size_bytes": 52_428_800, "word_wrap_enabled": None}
+
+    def test_live_directory_updates_persist_per_connection(self, client: TestClient, auth_headers_user: dict[str, str]) -> None:
+        response = client.put(
+            "/api/auth/me/settings",
+            headers=auth_headers_user,
+            json={"field": "browser.live_directory_updates", "value": {"conn-1": False}},
+        )
+        assert response.status_code == 200
+
+        data = client.get("/api/auth/me/settings", headers=auth_headers_user).json()
+        assert data["browser"]["live_directory_updates"] == {"conn-1": False}
 
     def test_user_updates_independent_settings(self, client: TestClient, auth_headers_user: dict[str, str], session: Session) -> None:
         updates = (

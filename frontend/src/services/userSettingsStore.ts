@@ -83,6 +83,8 @@ function getFieldValue<Field extends CurrentUserSettingsField>(
       return settings.browser.selected_connection_id as ValueForField<Field>;
     case "browser.viewer_associations":
       return settings.browser.viewer_associations as ValueForField<Field>;
+    case "browser.live_directory_updates":
+      return settings.browser.live_directory_updates as ValueForField<Field>;
     case "text_editor.max_file_size_bytes":
       return settings.text_editor.max_file_size_bytes as ValueForField<Field>;
     case "text_editor.word_wrap_enabled":
@@ -114,6 +116,8 @@ function setFieldValue(settings: CurrentUserSettings, update: CurrentUserSetting
       return { ...settings, browser: { ...settings.browser, selected_connection_id: update.value } };
     case "browser.viewer_associations":
       return { ...settings, browser: { ...settings.browser, viewer_associations: update.value } };
+    case "browser.live_directory_updates":
+      return { ...settings, browser: { ...settings.browser, live_directory_updates: update.value } };
     case "text_editor.max_file_size_bytes":
       return { ...settings, text_editor: { ...settings.text_editor, max_file_size_bytes: update.value } };
     case "text_editor.word_wrap_enabled":

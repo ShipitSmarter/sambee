@@ -15,6 +15,7 @@ class UserSettingKey(StrEnum):
     BROWSER_PANE_MODE = "browser.pane_mode"
     BROWSER_SELECTED_CONNECTION_ID = "browser.selected_connection_id"
     BROWSER_VIEWER_ASSOCIATIONS = "browser.viewer_associations"
+    BROWSER_LIVE_DIRECTORY_UPDATES = "browser.live_directory_updates"
     TEXT_EDITOR_MAX_FILE_SIZE_BYTES = "text_editor.max_file_size_bytes"
     TEXT_EDITOR_WORD_WRAP_ENABLED = "text_editor.word_wrap_enabled"
 

@@ -1,5 +1,10 @@
-import { useEffect, useState } from "react";
-import { commitCurrentUserSetting, getConfirmedCurrentUserSetting, useCurrentUserSetting } from "../../services/userSettingsStore";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  commitCurrentUserSetting,
+  getConfirmedCurrentUserSetting,
+  useCurrentUserSetting,
+  userSettingsStore,
+} from "../../services/userSettingsStore";
 import type { PaneMode, ViewMode } from "./types";
 
 export const QUICK_NAV_INCLUDE_DOT_DIRECTORIES_STORAGE_KEY = "quick-nav-include-dot-directories";
@@ -132,6 +137,22 @@ export function useQuickNavIncludeDotDirectoriesPreference(): [boolean, (enabled
 export function useFileBrowserViewModePreference(): [ViewMode, (viewMode: ViewMode) => void] {
   const setting = useCurrentUserSetting("browser.file_browser_view_mode");
   return [setting.confirmedValue ?? "list", (viewMode) => void setting.commit(viewMode).catch(() => undefined)];
+}
+
+export function useLiveDirectoryUpdatesPreference(connectionId: string): [boolean, (enabled: boolean) => void] {
+  useSyncExternalStore(
+    userSettingsStore.subscribe,
+    () => getConfirmedCurrentUserSetting("browser.live_directory_updates"),
+    () => undefined
+  );
+  const preferences = getConfirmedCurrentUserSetting("browser.live_directory_updates") ?? {};
+  return [
+    preferences[connectionId] ?? true,
+    (enabled) =>
+      void commitCurrentUserSetting({ field: "browser.live_directory_updates", value: { ...preferences, [connectionId]: enabled } }).catch(
+        () => undefined
+      ),
+  ];
 }
 
 export function useTextEditorMaxFileSizeBytesPreference(): [number, (maxFileSizeBytes: number) => void] {

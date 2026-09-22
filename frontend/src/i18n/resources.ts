@@ -682,6 +682,7 @@ export const EN_TRANSLATIONS = {
     },
   },
   fileBrowser: {
+    liveDirectoryUpdates: "Live directory updates",
     search: {
       modeSelectorAriaLabel: "Switch quick bar mode",
       modes: {

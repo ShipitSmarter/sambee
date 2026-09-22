@@ -38,6 +38,7 @@ class BrowserUserSettingsRead(SQLModel):
     pane_mode: str
     selected_connection_id: Optional[str] = None
     viewer_associations: dict[str, str] = Field(default_factory=dict)
+    live_directory_updates: dict[str, bool] = Field(default_factory=dict)
 
 
 class TextEditorUserSettingsRead(SQLModel):
@@ -111,6 +112,11 @@ class ViewerAssociationsUserSettingUpdate(StrictCurrentUserSettingUpdate):
     value: dict[str, str]
 
 
+class LiveDirectoryUpdatesUserSettingUpdate(StrictCurrentUserSettingUpdate):
+    field: Literal["browser.live_directory_updates"]
+    value: dict[str, bool]
+
+
 class TextEditorMaxFileSizeUserSettingUpdate(StrictCurrentUserSettingUpdate):
     field: Literal["text_editor.max_file_size_bytes"]
     value: int
@@ -133,6 +139,7 @@ CurrentUserSettingsUpdate = Annotated[
     | PaneModeUserSettingUpdate
     | SelectedConnectionUserSettingUpdate
     | ViewerAssociationsUserSettingUpdate
+    | LiveDirectoryUpdatesUserSettingUpdate
     | TextEditorMaxFileSizeUserSettingUpdate
     | TextEditorWordWrapUserSettingUpdate,
     Field(discriminator="field"),

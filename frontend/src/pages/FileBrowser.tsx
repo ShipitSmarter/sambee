@@ -432,6 +432,9 @@ const Browser: React.FC = () => {
   // ──────────────────────────────────────────────────────────────────────────
 
   const [connections, setConnections] = useState<Connection[]>(() => initialRecoverySnapshotRef.current?.connections ?? []);
+  const liveDirectoryUpdatesRef = React.useRef<Record<string, boolean>>(
+    getConfirmedCurrentUserSetting("browser.live_directory_updates") ?? {}
+  );
   const [loadingConnections, setLoadingConnections] = useState(() => initialRecoverySnapshotRef.current === null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1732,6 +1735,8 @@ const Browser: React.FC = () => {
           return;
         }
         if (message.type === "directory_changed") {
+          liveDirectoryUpdatesRef.current = getConfirmedCurrentUserSetting("browser.live_directory_updates") ?? {};
+          if (liveDirectoryUpdatesRef.current[message.change.connectionId] === false) return;
           // Dispatch to both panes — each pane checks if it's viewing the affected directory
           leftPane.handleDirectoryChanged(message.change);
           rightPane.handleDirectoryChanged(message.change);
@@ -1909,6 +1914,8 @@ const Browser: React.FC = () => {
           return;
         }
         if (message.type === "directory_changed") {
+          liveDirectoryUpdatesRef.current = getConfirmedCurrentUserSetting("browser.live_directory_updates") ?? {};
+          if (liveDirectoryUpdatesRef.current[message.change.connectionId] === false) return;
           leftPane.handleDirectoryChanged(message.change);
           rightPane.handleDirectoryChanged(message.change);
         }

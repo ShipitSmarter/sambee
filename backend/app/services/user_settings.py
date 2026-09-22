@@ -243,6 +243,20 @@ def _parse_viewer_associations(raw_value: str | None) -> dict[str, str]:
     return valid_associations
 
 
+def _parse_live_directory_updates(raw_value: str | None) -> dict[str, bool]:
+    if raw_value is None:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except JSONDecodeError:
+        logger.error("Invalid stored live directory updates encountered in user settings")
+        return {}
+    if not isinstance(parsed, dict):
+        logger.error("Invalid stored live directory updates encountered in user settings")
+        return {}
+    return {connection_id: enabled for connection_id, enabled in parsed.items() if isinstance(connection_id, str) and isinstance(enabled, bool)}
+
+
 def build_current_user_settings_read(*, user_id: uuid.UUID, session: Session) -> CurrentUserSettingsRead:
     values = _load_user_setting_map(user_id, session)
     return CurrentUserSettingsRead(
@@ -286,6 +300,7 @@ def build_current_user_settings_read(*, user_id: uuid.UUID, session: Session) ->
             ),
             selected_connection_id=_parse_optional_string(values.get(UserSettingKey.BROWSER_SELECTED_CONNECTION_ID.value)),
             viewer_associations=_parse_viewer_associations(values.get(UserSettingKey.BROWSER_VIEWER_ASSOCIATIONS.value)),
+            live_directory_updates=_parse_live_directory_updates(values.get(UserSettingKey.BROWSER_LIVE_DIRECTORY_UPDATES.value)),
         ),
         text_editor=TextEditorUserSettingsRead(
             max_file_size_bytes=_parse_int(
@@ -405,6 +420,14 @@ def update_current_user_settings(
                 raise ValueError("Viewer associations must use non-empty file keys and viewer IDs")
             normalized_associations[normalized_key] = normalized_value
         value = normalized_associations
+    elif key is UserSettingKey.BROWSER_LIVE_DIRECTORY_UPDATES:
+        normalized_updates: dict[str, bool] = {}
+        for connection_id, enabled in cast(dict[str, bool], value).items():
+            normalized_connection_id = connection_id.strip()
+            if not normalized_connection_id:
+                raise ValueError("Live directory updates must use non-empty connection IDs")
+            normalized_updates[normalized_connection_id] = enabled
+        value = normalized_updates
     elif key is UserSettingKey.TEXT_EDITOR_MAX_FILE_SIZE_BYTES:
         normalized_max_file_size = int(cast(int, value))
         if normalized_max_file_size < MIN_TEXT_EDITOR_MAX_FILE_SIZE_BYTES or normalized_max_file_size > MAX_TEXT_EDITOR_MAX_FILE_SIZE_BYTES:
