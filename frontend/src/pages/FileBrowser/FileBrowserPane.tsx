@@ -14,7 +14,7 @@
  * @see FileBrowser — the parent page-level orchestrator
  */
 
-import { alpha, Box, Chip, CircularProgress, useTheme } from "@mui/material";
+import { alpha, Box, Chip, CircularProgress, FormControlLabel, Switch, useTheme } from "@mui/material";
 import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { BreadcrumbsNavigation } from "../../components/FileBrowser/BreadcrumbsNavigation";
@@ -37,6 +37,7 @@ import { FileType } from "../../types";
 import { isConnectionReadOnly } from "./access";
 import type { BrowserItem } from "./contentProviders";
 import type { FileOperationAction, FileOperationPolicyContext } from "./fileOperationActions";
+import { useLiveDirectoryUpdatesPreference } from "./preferences";
 import type { PaneId, PaneMode, UseFileBrowserPaneReturn } from "./types";
 
 // ============================================================================
@@ -195,6 +196,7 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
   } = pane;
 
   const currentConnection = useMemo(() => connections.find((connection) => connection.id === connectionId), [connections, connectionId]);
+  const [liveDirectoryUpdates, setLiveDirectoryUpdates] = useLiveDirectoryUpdatesPreference(connectionId);
   const [unsavedDraftPaths, setUnsavedDraftPaths] = React.useState<Set<string>>(new Set());
 
   React.useEffect(() => {
@@ -485,6 +487,13 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
               sx={{ ml: 1, flexShrink: 0 }}
             />
           )}
+          <FormControlLabel
+            sx={{ ml: "auto", flexShrink: 0 }}
+            control={
+              <Switch size="small" checked={liveDirectoryUpdates} onChange={(event) => setLiveDirectoryUpdates(event.target.checked)} />
+            }
+            label={t("fileBrowser.liveDirectoryUpdates")}
+          />
         </Box>
       )}
 

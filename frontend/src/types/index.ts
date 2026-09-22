@@ -367,6 +367,7 @@ export interface CurrentUserSettings {
     pane_mode: "single" | "dual";
     selected_connection_id: string | null;
     viewer_associations: Record<string, string>;
+    live_directory_updates?: Record<string, boolean>;
   };
   text_editor: {
     max_file_size_bytes: number;
@@ -386,6 +387,7 @@ export type CurrentUserSettingsUpdate =
   | { field: "browser.pane_mode"; value: "single" | "dual" }
   | { field: "browser.selected_connection_id"; value: string | null }
   | { field: "browser.viewer_associations"; value: Record<string, string> }
+  | { field: "browser.live_directory_updates"; value: Record<string, boolean> }
   | { field: "text_editor.max_file_size_bytes"; value: number }
   | { field: "text_editor.word_wrap_enabled"; value: boolean | null };
 

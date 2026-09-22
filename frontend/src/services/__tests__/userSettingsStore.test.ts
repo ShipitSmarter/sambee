@@ -57,6 +57,7 @@ const settings = {
     pane_mode: "single" as const,
     selected_connection_id: null,
     viewer_associations: {},
+    live_directory_updates: {},
   },
   text_editor: { max_file_size_bytes: 52_428_800, word_wrap_enabled: null },
 };
@@ -127,6 +128,17 @@ describe("userSettingsStore", () => {
     await userSettingsStore.getValue("browser.viewer_associations").commit(update.value);
 
     expect(updateCurrentUserSettingsMock).toHaveBeenCalledWith(update, { signal: expect.any(AbortSignal) });
+  });
+
+  it("persists live directory updates independently for each connection", async () => {
+    await authenticateAndLoad();
+    const update = { field: "browser.live_directory_updates", value: { "conn-1": false } } as const;
+    updateCurrentUserSettingsMock.mockResolvedValue(update);
+
+    await userSettingsStore.getValue("browser.live_directory_updates").commit(update.value);
+
+    expect(updateCurrentUserSettingsMock).toHaveBeenCalledWith(update, { signal: expect.any(AbortSignal) });
+    expect(userSettingsStore.getValue("browser.live_directory_updates").confirmedValue).toEqual({ "conn-1": false });
   });
 
   it("updates the touch-friendly file-selection field in the shared snapshot", async () => {
