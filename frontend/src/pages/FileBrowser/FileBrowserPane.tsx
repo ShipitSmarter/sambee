@@ -493,6 +493,7 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
             disabled={loading}
             onClick={pane.handleRefresh}
             size="small"
+            sx={{ mr: 1 }}
             title={t("fileBrowser.shortcuts.refresh")}
           >
             <RefreshIcon fontSize="small" />
