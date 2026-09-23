@@ -14,7 +14,8 @@
  * @see FileBrowser — the parent page-level orchestrator
  */
 
-import { alpha, Box, Chip, CircularProgress, FormControlLabel, Switch, useTheme } from "@mui/material";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import { alpha, Box, Chip, CircularProgress, FormControlLabel, IconButton, Switch, useTheme } from "@mui/material";
 import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { BreadcrumbsNavigation } from "../../components/FileBrowser/BreadcrumbsNavigation";
@@ -487,8 +488,17 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
               sx={{ ml: 1, flexShrink: 0 }}
             />
           )}
+          <IconButton
+            aria-label={t("fileBrowser.shortcuts.refresh")}
+            disabled={loading}
+            onClick={pane.handleRefresh}
+            size="small"
+            title={t("fileBrowser.shortcuts.refresh")}
+          >
+            <RefreshIcon fontSize="small" />
+          </IconButton>
           <FormControlLabel
-            sx={{ ml: "auto", flexShrink: 0 }}
+            sx={{ flexShrink: 0 }}
             control={
               <Switch size="small" checked={liveDirectoryUpdates} onChange={(event) => setLiveDirectoryUpdates(event.target.checked)} />
             }

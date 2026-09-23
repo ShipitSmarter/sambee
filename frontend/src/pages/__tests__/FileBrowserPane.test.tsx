@@ -363,6 +363,19 @@ describe("FileBrowserPane", () => {
       expect(screen.queryByTestId("search-bar")).not.toBeInTheDocument();
     });
 
+    it("renders a refresh button beside live directory updates and uses the existing refresh handler", async () => {
+      const user = userEvent.setup();
+      const pane = createMockPane();
+      render(<FileBrowserPane {...defaultProps({ pane })} />);
+
+      const refreshButton = screen.getByRole("button", { name: "fileBrowser.shortcuts.refresh" });
+      expect(refreshButton).toBeInTheDocument();
+
+      await user.click(refreshButton);
+
+      expect(pane.handleRefresh).toHaveBeenCalledOnce();
+    });
+
     it("shows a read-only chip for read-only connections", () => {
       const pane = createMockPane({ connectionId: "conn-2" });
       const connections = [testConnections[0], createMockConnection({ id: "conn-2", name: "Backup Server", access_mode: "read_only" })];
