@@ -627,6 +627,7 @@ export const EN_TRANSLATIONS = {
       readChunkSizeError: "Enter a whole number within the allowed chunk-size range.",
       sections: {
         protection: "Protection",
+        domainBasedDfs: "Domain-based DFS",
         connectionBehavior: "Connection behavior",
         fileStreaming: "File streaming",
       },
@@ -634,6 +635,8 @@ export const EN_TRANSLATIONS = {
         authenticationMode: "Authentication mode",
         encryptionMode: "Transport protection",
         connectionTimeout: "Connection timeout",
+        primaryDomainController: "Primary domain controller",
+        secondaryDomainController: "Secondary domain controller",
         readChunkSize: "SMB read chunk size",
       },
       helper: {
@@ -642,6 +645,7 @@ export const EN_TRANSLATIONS = {
         encryptionMode:
           "Signing is always required. Signing only permits unencrypted SMB 2 connections; require encryption to protect SMB traffic from network observers.",
         connectionTimeout: "Maximum time allowed to establish an SMB transport connection.",
+        domainController: "Used for DFS referral discovery. Leave blank when the SMB server does not use domain-based DFS.",
         readChunkSize: "Bytes read per file-streaming operation.",
       },
       options: {

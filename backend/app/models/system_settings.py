@@ -77,6 +77,8 @@ class SmbPolicySettings(SQLModel):
 class SmbSettingsRead(SQLModel):
     read_chunk_size_bytes: IntegerSystemSettingRead
     policy: SmbPolicySettings
+    domain_controller_primary: str = ""
+    domain_controller_secondary: str = ""
     require_signing: bool = True
     require_encryption: bool = False
 
@@ -118,8 +120,23 @@ class SmbConnectionTimeoutUpdate(StrictSettingUpdate):
     value: int
 
 
+class SmbDomainControllerPrimaryUpdate(StrictSettingUpdate):
+    field: Literal["domain_controller_primary"]
+    value: str = Field(default="", max_length=253)
+
+
+class SmbDomainControllerSecondaryUpdate(StrictSettingUpdate):
+    field: Literal["domain_controller_secondary"]
+    value: str = Field(default="", max_length=253)
+
+
 SmbSettingsUpdate = Annotated[
-    SmbReadChunkSizeUpdate | SmbAuthenticationModeUpdate | SmbEncryptionModeUpdate | SmbConnectionTimeoutUpdate,
+    SmbReadChunkSizeUpdate
+    | SmbAuthenticationModeUpdate
+    | SmbEncryptionModeUpdate
+    | SmbConnectionTimeoutUpdate
+    | SmbDomainControllerPrimaryUpdate
+    | SmbDomainControllerSecondaryUpdate,
     Field(discriminator="field"),
 ]
 SmbSettingsUpdateResult = SmbSettingsUpdate

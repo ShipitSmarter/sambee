@@ -22,7 +22,17 @@ SMB signing is always required by Sambee. It verifies that SMB messages have not
 
 Set the SMB connection timeout to limit how long Sambee waits to establish a transport connection.
 
-## File Streaming
+## Domain-Based DFS
+
+For domain-based DFS namespaces, configure the primary and secondary domain controllers in the **Domain-based DFS** fields above. Sambee tries them in configured order for the process-wide DFS referral cache and uses the first one that initializes successfully. This is startup/setup fallback, not continuous health-based failover.
+
+Configure a namespace connection using the existing connection fields:
+
+- `\\domain.example\\Namespace\\Share` → host `domain.example`, share `Namespace`, path prefix `/Share`.
+- `\\domain.example\\Share` → host `domain.example`, share `Share`, path prefix `/`.
+
+For DFS connections, leave **Live directory updates** disabled unless the deployment has been specifically validated with that namespace. Browsing and manual refresh remain available.
+
 
 Set the SMB read chunk size to control how much file data Sambee reads per streaming operation. The setting is stored as an administrator setting and is not available in `config.toml`.
 

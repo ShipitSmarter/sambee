@@ -32,6 +32,8 @@ const smbSettings: SmbSettingsData = {
     encryption_mode: "signing_only",
     connection_timeout_seconds: 30,
   },
+  domain_controller_primary: "",
+  domain_controller_secondary: "",
   policy_source: "default",
   require_signing: true,
   require_encryption: false,
@@ -72,6 +74,26 @@ describe("SmbSettings", () => {
       );
     });
     expect(screen.queryByRole("button", { name: "Save SMB settings" })).not.toBeInTheDocument();
+  });
+
+  it("persists an administrator-configured primary domain controller", async () => {
+    const user = userEvent.setup();
+    render(
+      <SambeeThemeProvider>
+        <SmbSettings />
+      </SambeeThemeProvider>
+    );
+
+    const controller = await screen.findByLabelText("Primary domain controller");
+    await user.type(controller, "dc-a.example");
+    await user.tab();
+
+    await waitFor(() => {
+      expect(api.updateSmbSettings).toHaveBeenCalledWith(
+        { field: "domain_controller_primary", value: "dc-a.example" },
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+    });
   });
 
   it("shows a retry action when the initial settings load fails", async () => {

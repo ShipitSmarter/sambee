@@ -28,6 +28,54 @@ from app.services.system_settings import (
 from app.services.system_settings import store as system_settings_store
 
 
+def test_smb_domain_controllers_are_loaded_from_system_settings(monkeypatch) -> None:
+    import app.services.system_settings as system_settings_service
+
+    overrides = {
+        SystemSettingKey.SMB_DOMAIN_CONTROLLER_PRIMARY: " dc-a.example ",
+        SystemSettingKey.SMB_DOMAIN_CONTROLLER_SECONDARY: "dc-b.example",
+    }
+    monkeypatch.setattr(system_settings_store, "get_override", lambda key: overrides.get(key))
+
+    assert system_settings_service.get_smb_domain_controllers() == ("dc-a.example", "dc-b.example")
+
+
+def test_smbclient_policy_configures_the_first_admin_supplied_domain_controller(monkeypatch) -> None:
+    import app.services.system_settings as system_settings_service
+
+    monkeypatch.setattr(
+        system_settings_store,
+        "get_override",
+        lambda key: {SystemSettingKey.SMB_DOMAIN_CONTROLLER_PRIMARY: "dc-a.example"}.get(key),
+    )
+    client_config = MagicMock()
+    monkeypatch.setattr(system_settings_service.smbclient, "ClientConfig", client_config)
+
+    system_settings_service.get_smbclient_policy_kwargs()
+
+    client_config.assert_called_once_with(domain_controller="dc-a.example")
+
+
+def test_smbclient_policy_tries_the_next_domain_controller_when_the_first_fails(monkeypatch) -> None:
+    import app.services.system_settings as system_settings_service
+
+    monkeypatch.setattr(
+        system_settings_store,
+        "get_override",
+        lambda key: {
+            SystemSettingKey.SMB_DOMAIN_CONTROLLER_PRIMARY: "dc-a.example",
+            SystemSettingKey.SMB_DOMAIN_CONTROLLER_SECONDARY: "dc-b.example",
+        }.get(key),
+    )
+    client_config = MagicMock(side_effect=[RuntimeError("first controller unavailable"), None])
+    monkeypatch.setattr(system_settings_service.smbclient, "ClientConfig", client_config)
+
+    system_settings_service.get_smbclient_policy_kwargs()
+
+    assert client_config.call_args_list[0].kwargs == {"domain_controller": "dc-a.example"}
+    assert client_config.call_args_list[1].kwargs == {"domain_controller": "dc-b.example"}
+
+
 def _create_system_settings_table(connection) -> None:
     connection.execute(
         text(
@@ -266,6 +314,8 @@ class TestSmbSettingsApi:
             "encryption_mode": "signing_only",
             "connection_timeout_seconds": 30,
         }
+        assert data["domain_controller_primary"] == ""
+        assert data["domain_controller_secondary"] == ""
         assert data["require_signing"] is True
         assert data["require_encryption"] is False
 
@@ -277,6 +327,8 @@ class TestSmbSettingsApi:
             {"field": "authentication_mode", "value": "kerberos_required"},
             {"field": "encryption_mode", "value": "encryption_required"},
             {"field": "connection_timeout_seconds", "value": 45},
+            {"field": "domain_controller_primary", "value": "dc-a.example"},
+            {"field": "domain_controller_secondary", "value": "dc-b.example"},
         ):
             response = client.put("/api/admin/settings/smb", headers=auth_headers_admin, json=payload)
             assert response.status_code == 200
@@ -289,6 +341,8 @@ class TestSmbSettingsApi:
             "connection_timeout_seconds": 45,
         }
         assert data["require_encryption"] is True
+        assert data["domain_controller_primary"] == "dc-a.example"
+        assert data["domain_controller_secondary"] == "dc-b.example"
         assert session.get(SystemSetting, SystemSettingKey.SMB_AUTHENTICATION_MODE.value) is not None
 
     def test_smb_update_rejects_legacy_policy_payload(self, client: TestClient, auth_headers_admin: dict[str, str]) -> None:
