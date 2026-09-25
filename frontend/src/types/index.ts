@@ -318,6 +318,8 @@ export interface SmbPolicySettings {
 export interface SmbSettings {
   read_chunk_size_bytes: IntegerSystemSetting;
   policy: SmbPolicySettings;
+  domain_controller_primary: string;
+  domain_controller_secondary: string;
   require_signing: boolean;
   require_encryption: boolean;
 }
@@ -326,7 +328,9 @@ export type SmbSettingsUpdate =
   | { field: "read_chunk_size_bytes"; value: number }
   | { field: "authentication_mode"; value: SmbAuthenticationMode }
   | { field: "encryption_mode"; value: SmbEncryptionMode }
-  | { field: "connection_timeout_seconds"; value: number };
+  | { field: "connection_timeout_seconds"; value: number }
+  | { field: "domain_controller_primary"; value: string }
+  | { field: "domain_controller_secondary"; value: string };
 
 export interface AboutSettings {
   version: string;

@@ -9,6 +9,8 @@ class SystemSettingKey(StrEnum):
     SMB_AUTHENTICATION_MODE = "smb.authentication_mode"
     SMB_ENCRYPTION_MODE = "smb.encryption_mode"
     SMB_CONNECTION_TIMEOUT_SECONDS = "smb.connection_timeout_seconds"
+    SMB_DOMAIN_CONTROLLER_PRIMARY = "smb.domain_controller_primary"
+    SMB_DOMAIN_CONTROLLER_SECONDARY = "smb.domain_controller_secondary"
     PREPROCESSOR_IMAGEMAGICK_MAX_FILE_SIZE_BYTES = "preprocessors.imagemagick.max_file_size_bytes"
     PREPROCESSOR_IMAGEMAGICK_TIMEOUT_SECONDS = "preprocessors.imagemagick.timeout_seconds"
     PDF_VIEWER_CACHE_QUOTA_BYTES = "pdf.viewer.cache_quota_bytes"

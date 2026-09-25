@@ -26,6 +26,10 @@ function getSettingsAfterUpdate(settings: SmbSettingsData, update: SmbSettingsUp
       return { ...settings, policy: { ...settings.policy, encryption_mode: update.value } };
     case "connection_timeout_seconds":
       return { ...settings, policy: { ...settings.policy, connection_timeout_seconds: update.value } };
+    case "domain_controller_primary":
+      return { ...settings, domain_controller_primary: update.value };
+    case "domain_controller_secondary":
+      return { ...settings, domain_controller_secondary: update.value };
     case "read_chunk_size_bytes":
       return { ...settings, read_chunk_size_bytes: { ...settings.read_chunk_size_bytes, value: update.value } };
   }
@@ -40,6 +44,10 @@ function getConfirmedSettingValue(settings: SmbSettingsData | null, field: SmbSe
       return settings.policy.encryption_mode;
     case "connection_timeout_seconds":
       return settings.policy.connection_timeout_seconds;
+    case "domain_controller_primary":
+      return settings.domain_controller_primary;
+    case "domain_controller_secondary":
+      return settings.domain_controller_secondary;
     case "read_chunk_size_bytes":
       return settings.read_chunk_size_bytes.value;
   }
@@ -48,6 +56,8 @@ function getConfirmedSettingValue(settings: SmbSettingsData | null, field: SmbSe
 export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
   const { t } = useTranslation();
   const [connectionTimeoutSeconds, setConnectionTimeoutSeconds] = useState("");
+  const [primaryDomainController, setPrimaryDomainController] = useState("");
+  const [secondaryDomainController, setSecondaryDomainController] = useState("");
   const [readChunkSizeBytes, setReadChunkSizeBytes] = useState("");
   const [touchedFields, setTouchedFields] = useState<Partial<Record<SmbSettingField, boolean>>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -77,6 +87,8 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
       return;
     }
     setConnectionTimeoutSeconds(String(settings.policy.connection_timeout_seconds));
+    setPrimaryDomainController(settings.domain_controller_primary);
+    setSecondaryDomainController(settings.domain_controller_secondary);
     setReadChunkSizeBytes(String(settings.read_chunk_size_bytes.value));
   }, [settings]);
 
@@ -167,6 +179,36 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               <MenuItem value="signing_only">{t("settings.smbSettings.options.signingOnly")}</MenuItem>
               <MenuItem value="encryption_required">{t("settings.smbSettings.options.encryptionRequired")}</MenuItem>
             </TextField>
+          </SettingsGroup>
+          <SettingsGroup title={t("settings.smbSettings.sections.domainBasedDfs")}>
+            <TextField
+              fullWidth
+              label={t("settings.smbSettings.fields.primaryDomainController")}
+              value={primaryDomainController}
+              onChange={(event) => {
+                setPrimaryDomainController(event.target.value);
+                persistence.clearFieldFeedback("domain_controller_primary");
+              }}
+              onBlur={() => void persistField({ field: "domain_controller_primary", value: primaryDomainController.trim() })}
+              disabled={persistence.isPending("domain_controller_primary")}
+              error={Boolean(persistence.fieldErrors.domain_controller_primary)}
+              helperText={persistence.fieldErrors.domain_controller_primary ?? t("settings.smbSettings.helper.domainController")}
+              slotProps={{ htmlInput: { maxLength: 253 }, input: { endAdornment: getStatusAdornment("domain_controller_primary") } }}
+            />
+            <TextField
+              fullWidth
+              label={t("settings.smbSettings.fields.secondaryDomainController")}
+              value={secondaryDomainController}
+              onChange={(event) => {
+                setSecondaryDomainController(event.target.value);
+                persistence.clearFieldFeedback("domain_controller_secondary");
+              }}
+              onBlur={() => void persistField({ field: "domain_controller_secondary", value: secondaryDomainController.trim() })}
+              disabled={persistence.isPending("domain_controller_secondary")}
+              error={Boolean(persistence.fieldErrors.domain_controller_secondary)}
+              helperText={persistence.fieldErrors.domain_controller_secondary ?? t("settings.smbSettings.helper.domainController")}
+              slotProps={{ htmlInput: { maxLength: 253 }, input: { endAdornment: getStatusAdornment("domain_controller_secondary") } }}
+            />
           </SettingsGroup>
           <SettingsGroup title={t("settings.smbSettings.sections.connectionBehavior")}>
             <TextField

@@ -13,6 +13,7 @@ from threading import RLock
 from typing import Literal, Optional, TypedDict
 from urllib.parse import urlparse, urlsplit
 
+import smbclient
 from sqlalchemy import inspect
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
@@ -81,6 +82,10 @@ SMB_POLICY_SETTING_KEYS = {
     "authentication_mode": SystemSettingKey.SMB_AUTHENTICATION_MODE,
     "encryption_mode": SystemSettingKey.SMB_ENCRYPTION_MODE,
     "connection_timeout_seconds": SystemSettingKey.SMB_CONNECTION_TIMEOUT_SECONDS,
+}
+SMB_DOMAIN_CONTROLLER_SETTING_KEYS = {
+    "domain_controller_primary": SystemSettingKey.SMB_DOMAIN_CONTROLLER_PRIMARY,
+    "domain_controller_secondary": SystemSettingKey.SMB_DOMAIN_CONTROLLER_SECONDARY,
 }
 STANDARD_OIDC_CLAIMS = frozenset({"sub", "name", "email", "groups", "preferred_username"})
 STANDARD_OIDC_SCOPES = frozenset({"openid", "profile", "email", "address", "phone", "offline_access"})
@@ -413,9 +418,36 @@ class SmbClientPolicyKwargs(TypedDict):
     require_signing: bool
 
 
+def _configure_smbclient_domain_controller() -> None:
+    """Configure DFS referral discovery from administrator-supplied settings."""
+
+    controllers = get_smb_domain_controllers()
+    last_error: Exception | None = None
+    for controller in controllers:
+        try:
+            # smbclient supports one active domain controller for its process-wide DFS domain cache.
+            smbclient.ClientConfig(domain_controller=controller)
+            return
+        except Exception as error:
+            last_error = error
+            logger.warning("DFS domain-controller referral discovery failed for configured controller %s", controller, exc_info=True)
+
+    if last_error is not None:
+        raise last_error
+
+
+def get_smb_domain_controllers() -> tuple[str, ...]:
+    """Return the administrator-configured DFS controllers in priority order."""
+
+    return tuple(
+        value.strip() for key in SMB_DOMAIN_CONTROLLER_SETTING_KEYS.values() if (value := store.get_override(key)) and value.strip()
+    )
+
+
 def get_smbclient_policy_kwargs() -> SmbClientPolicyKwargs:
     """Return transport and authentication kwargs for every high-level SMB call."""
 
+    _configure_smbclient_domain_controller()
     policy = get_smb_policy_settings()
     return {
         "encrypt": policy.encryption_mode is SmbEncryptionMode.ENCRYPTION_REQUIRED,
@@ -430,6 +462,8 @@ def build_smb_settings_read() -> SmbSettingsRead:
     return SmbSettingsRead(
         read_chunk_size_bytes=_build_integer_read(SYSTEM_SETTING_DEFINITIONS[SystemSettingKey.SMB_READ_CHUNK_SIZE_BYTES]),
         policy=policy,
+        domain_controller_primary=(store.get_override(SystemSettingKey.SMB_DOMAIN_CONTROLLER_PRIMARY) or "").strip(),
+        domain_controller_secondary=(store.get_override(SystemSettingKey.SMB_DOMAIN_CONTROLLER_SECONDARY) or "").strip(),
         require_encryption=policy.encryption_mode is SmbEncryptionMode.ENCRYPTION_REQUIRED,
     )
 
@@ -711,10 +745,13 @@ def update_smb_settings(
         definition = SYSTEM_SETTING_DEFINITIONS[SystemSettingKey.SMB_READ_CHUNK_SIZE_BYTES]
         value = _validate_integer_value(definition, payload.value)
         key = SystemSettingKey.SMB_READ_CHUNK_SIZE_BYTES
-    else:
+    elif payload.field in SMB_POLICY_SETTING_KEYS:
         next_policy = SmbPolicySettings.model_validate(build_smb_settings_read().policy.model_dump() | {payload.field: payload.value})
         value = getattr(next_policy, payload.field)
         key = SMB_POLICY_SETTING_KEYS[payload.field]
+    else:
+        value = payload.value.strip()
+        key = SMB_DOMAIN_CONTROLLER_SETTING_KEYS[payload.field]
 
     _write_system_setting(session, key, str(value), updated_by_user_id)
     session.commit()
@@ -727,6 +764,9 @@ def smb_policy_will_change(payload: SmbSettingsUpdate, session: Session) -> bool
 
     if payload.field == "read_chunk_size_bytes":
         return False
+    if payload.field in SMB_DOMAIN_CONTROLLER_SETTING_KEYS:
+        current_setting = session.get(SystemSetting, SMB_DOMAIN_CONTROLLER_SETTING_KEYS[payload.field].value)
+        return (current_setting.value if current_setting else "") != payload.value.strip()
     current_setting = session.get(SystemSetting, SMB_POLICY_SETTING_KEYS[payload.field].value)
     if current_setting is None:
         current_value = getattr(SmbPolicySettings(), payload.field)
