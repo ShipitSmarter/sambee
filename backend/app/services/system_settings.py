@@ -447,7 +447,12 @@ def get_smb_domain_controllers() -> tuple[str, ...]:
 def get_smbclient_policy_kwargs() -> SmbClientPolicyKwargs:
     """Return transport and authentication kwargs for every high-level SMB call."""
 
-    _configure_smbclient_domain_controller()
+    # Do not initialize ClientConfig(domain_controller=...) here. smbclient
+    # performs an immediate unauthenticated IPC$ referral lookup when that
+    # global setting is assigned, before the per-connection credentials reach
+    # get_smb_tree(). That breaks every SMB connection with credentialed users.
+    # Normal DFS referral resolution receives the per-connection credentials
+    # through the high-level SMB call itself.
     policy = get_smb_policy_settings()
     return {
         "encrypt": policy.encryption_mode is SmbEncryptionMode.ENCRYPTION_REQUIRED,

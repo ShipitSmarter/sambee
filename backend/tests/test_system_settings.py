@@ -40,7 +40,7 @@ def test_smb_domain_controllers_are_loaded_from_system_settings(monkeypatch) -> 
     assert system_settings_service.get_smb_domain_controllers() == ("dc-a.example", "dc-b.example")
 
 
-def test_smbclient_policy_configures_the_first_admin_supplied_domain_controller(monkeypatch) -> None:
+def test_smbclient_policy_does_not_initialize_global_domain_controller_credentials(monkeypatch) -> None:
     import app.services.system_settings as system_settings_service
 
     monkeypatch.setattr(
@@ -53,10 +53,10 @@ def test_smbclient_policy_configures_the_first_admin_supplied_domain_controller(
 
     system_settings_service.get_smbclient_policy_kwargs()
 
-    client_config.assert_called_once_with(domain_controller="dc-a.example")
+    client_config.assert_not_called()
 
 
-def test_smbclient_policy_tries_the_next_domain_controller_when_the_first_fails(monkeypatch) -> None:
+def test_smbclient_policy_does_not_probe_configured_domain_controllers(monkeypatch) -> None:
     import app.services.system_settings as system_settings_service
 
     monkeypatch.setattr(
@@ -67,13 +67,12 @@ def test_smbclient_policy_tries_the_next_domain_controller_when_the_first_fails(
             SystemSettingKey.SMB_DOMAIN_CONTROLLER_SECONDARY: "dc-b.example",
         }.get(key),
     )
-    client_config = MagicMock(side_effect=[RuntimeError("first controller unavailable"), None])
+    client_config = MagicMock()
     monkeypatch.setattr(system_settings_service.smbclient, "ClientConfig", client_config)
 
     system_settings_service.get_smbclient_policy_kwargs()
 
-    assert client_config.call_args_list[0].kwargs == {"domain_controller": "dc-a.example"}
-    assert client_config.call_args_list[1].kwargs == {"domain_controller": "dc-b.example"}
+    client_config.assert_not_called()
 
 
 def _create_system_settings_table(connection) -> None:
