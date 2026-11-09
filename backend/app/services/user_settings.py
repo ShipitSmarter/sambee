@@ -213,9 +213,7 @@ def _parse_live_directory_updates(raw_value: str | None) -> dict[str, bool]:
         logger.error("Invalid stored live directory updates encountered in user settings")
         return {}
     return {
-        connection_id: enabled
-        for connection_id, enabled in parsed.items()
-        if isinstance(connection_id, str) and isinstance(enabled, bool)
+        connection_id: enabled for connection_id, enabled in parsed.items() if isinstance(connection_id, str) and isinstance(enabled, bool)
     }
 
 
