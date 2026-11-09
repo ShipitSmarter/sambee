@@ -270,9 +270,10 @@ mod tests {
     #[test]
     fn excludes_auth_parameters_from_payload() {
         let uri: Uri = "/x?b=2&sig=s&a=1".parse().unwrap();
+        let nonce = format!("test-nonce-{}", std::process::id());
         assert_eq!(
-            signature_payload("https://example.test", "1", "n", "GET", &uri, "h"),
-            "https://example.test\n1\nn\nGET\n/x?a=1&b=2\nh"
+            signature_payload("https://example.test", "1", &nonce, "GET", &uri, "h"),
+            format!("https://example.test\n1\n{nonce}\nGET\n/x?a=1&b=2\nh")
         );
     }
 }
