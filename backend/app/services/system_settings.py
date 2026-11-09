@@ -822,6 +822,7 @@ def update_smb_settings(
 ) -> SmbSettingsUpdateResult:
     """Persist one validated SMB setting and return its canonical field/value pair."""
 
+    value: int | str
     if payload.field == "read_chunk_size_bytes":
         definition = SYSTEM_SETTING_DEFINITIONS[SystemSettingKey.SMB_READ_CHUNK_SIZE_BYTES]
         value = _validate_integer_value(definition, payload.value)
@@ -831,6 +832,8 @@ def update_smb_settings(
         value = getattr(next_policy, payload.field)
         key = SMB_POLICY_SETTING_KEYS[payload.field]
     else:
+        assert payload.field in SMB_DOMAIN_CONTROLLER_SETTING_KEYS
+        assert isinstance(payload.value, str)
         value = payload.value.strip()
         key = SMB_DOMAIN_CONTROLLER_SETTING_KEYS[payload.field]
 
@@ -846,6 +849,7 @@ def smb_policy_will_change(payload: SmbSettingsUpdate, session: Session) -> bool
     if payload.field == "read_chunk_size_bytes":
         return False
     if payload.field in SMB_DOMAIN_CONTROLLER_SETTING_KEYS:
+        assert isinstance(payload.value, str)
         current_setting = session.get(SystemSetting, SMB_DOMAIN_CONTROLLER_SETTING_KEYS[payload.field].value)
         return (current_setting.value if current_setting else "") != payload.value.strip()
     current_setting = session.get(SystemSetting, SMB_POLICY_SETTING_KEYS[payload.field].value)
