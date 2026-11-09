@@ -113,12 +113,13 @@ interface PairInitiateResponse {
 
 interface PairInitiateRequest {
   nonce_browser: string;
+  public_key: string;
   origin?: string;
 }
 
 /** Pairing confirmation response from the companion. */
 interface PairConfirmResponse {
-  secret: string;
+  paired: boolean;
 }
 
 interface CompanionApiErrorResponse {
@@ -170,19 +171,14 @@ function isWaitingForCompanionConfirmation(error: unknown): boolean {
   );
 }
 
-// ── Secret Persistence ──────────────────────────────────────────────────────
+// ── Pairing Key Management ──────────────────────────────────────────────────
 
-/** Store the pairing secret. */
-function storeSecret(secret: string): void {
-  companionSession.storeSecret(secret);
-}
-
-/** Remove the stored pairing secret. */
+/** Remove the stored pairing key. */
 export function clearStoredSecret(): void {
   companionSession.clearPairing();
 }
 
-/** Check if we have a stored pairing secret. */
+/** Check if a signing key is available in this browser session. */
 export function hasStoredSecret(): boolean {
   return companionSession.hasSecret();
 }
@@ -214,10 +210,7 @@ class CompanionService {
   // ── Auth Header Construction ─────────────────────────────────────────────
 
   /**
-   * Build the HMAC auth headers required by non-public companion endpoints.
-   *
-   * Returns an object with `X-Companion-Secret` (HMAC digest) and
-   * `X-Companion-Timestamp` headers.
+   * Build signature auth headers required by non-public companion endpoints.
    */
   private async buildAuthHeaders(method: string, path: string): Promise<Record<string, string>> {
     return companionSession.getSigningHeaders(method, `${COMPANION_BASE_URL}${path}`);
@@ -261,6 +254,7 @@ class CompanionService {
     const nonceBrowser = generateNonce();
     const requestBody: PairInitiateRequest = {
       nonce_browser: nonceBrowser,
+      public_key: await companionSession.preparePairing(),
       origin: window.location.origin || undefined,
     };
 
@@ -281,21 +275,22 @@ class CompanionService {
   /**
    * Confirm a pairing after both sides have verified the code.
    *
-   * Receives and stores the shared secret.
+   * Completes pairing and records the browser signing key as paired.
    */
   async confirmPairing(pairingId: string): Promise<void> {
     const deadline = Date.now() + PAIR_CONFIRM_MAX_WAIT_MS;
 
     while (true) {
       try {
-        const response = await this.client.post<PairConfirmResponse>("/pair/confirm", {
+        await this.client.post<PairConfirmResponse>("/pair/confirm", {
           pairing_id: pairingId,
+          public_key: await companionSession.getPublicKey(),
           origin: window.location.origin || undefined,
         });
 
-        storeSecret(response.data.secret);
+        await companionSession.storePairing();
         notifyCompanionSettingsChanged(true);
-        logger.info("Pairing confirmed — secret stored", {}, "companion");
+        logger.info("Pairing confirmed — browser signing key registered", {}, "companion");
         return;
       } catch (error) {
         if (!isWaitingForCompanionConfirmation(error) || Date.now() >= deadline) {
@@ -362,7 +357,7 @@ class CompanionService {
   /**
    * Enumerate all accessible drives/volumes.
    *
-   * Requires an active pairing (HMAC auth).
+   * Requires an active public-key pairing.
    */
   async getDrives(): Promise<DriveInfo[]> {
     const headers = await this.buildAuthHeaders("GET", "/drives");
@@ -418,17 +413,24 @@ export default companionService;
 
 // ── WebSocket helpers ────────────────────────────────────────────────────────
 
-/**
- * Build an authenticated WebSocket URL for the companion.
- *
- * The browser WebSocket API does not support custom headers, so HMAC
- * credentials are passed as query parameters on the upgrade request.
- * Returns `null` if no pairing secret is stored.
- */
+/** Build the unauthenticated WebSocket endpoint URL. */
 export async function buildCompanionWsUrl(): Promise<string | null> {
   if (!companionSession.hasSecret()) return null;
+  return `${COMPANION_BASE_URL.replace(/^http/, "ws")}/ws`;
+}
 
-  // Derive ws:// URL from the HTTP base URL
-  const wsBase = COMPANION_BASE_URL.replace(/^http/, "ws");
-  return `${wsBase}/ws?${await companionSession.getSignedQuery("GET", `${COMPANION_BASE_URL}/ws`)}`;
+/** Build the one-time authentication frame sent after the WebSocket opens. */
+export async function buildCompanionWsAuthMessage(): Promise<string | null> {
+  if (!companionSession.hasSecret()) return null;
+  const query = await companionSession.getSignedQuery("GET", `${COMPANION_BASE_URL}/ws`);
+  const params = new URLSearchParams(query);
+  return JSON.stringify({
+    type: "authenticate",
+    signature: params.get("sig"),
+    timestamp: params.get("ts"),
+    nonce: params.get("nonce"),
+    public_key: params.get("key"),
+    body_sha256: params.get("body_sha256"),
+    origin: params.get("origin"),
+  });
 }

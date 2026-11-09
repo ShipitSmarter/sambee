@@ -95,6 +95,7 @@ export function useCompanion(): UseCompanionResult {
         return;
       }
 
+      await companionSession.load();
       const storedSecret = hasStoredSecret();
       const pairStatus = await companionService.getPairStatus();
       const currentOriginPaired = pairStatus.status === "paired";
@@ -105,7 +106,7 @@ export function useCompanion(): UseCompanionResult {
         return;
       }
 
-      // Companion is reachable and the browser already has a shared secret.
+      // Companion is reachable and the browser already has a signing key.
       // Even if the companion's health flag is stale, a successful authenticated
       // drive fetch proves the pairing is still valid.
       if (storedSecret && currentOriginPaired) {
@@ -183,7 +184,7 @@ export function useCompanion(): UseCompanionResult {
   }, []);
 
   /**
-   * Complete pairing — stores the shared secret and refreshes drives.
+   * Complete pairing — registers the browser signing key and refreshes drives.
    */
   const confirmPairing = useCallback(
     async (pairingId: string) => {

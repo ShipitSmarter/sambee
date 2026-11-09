@@ -44,6 +44,7 @@ http-body-util = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 hmac = "0.12"
 sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa"] }
 hex = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 chrono = { version = "0.4", features = ["serde"] }

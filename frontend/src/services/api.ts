@@ -610,18 +610,14 @@ class ApiService {
     );
   }
 
-  /**
-   * Build HMAC auth headers for companion requests.
-   */
+  /** Build signature-based auth headers for companion requests. */
   private async buildCompanionHeaders(method: string, url: string): Promise<Record<string, string>> {
     return companionSession.getSigningHeaders(method, url);
   }
 
   /**
-   * Build HMAC auth as URL query parameters for companion viewer URLs.
-   *
-   * Used for `<img src>` / `<iframe>` contexts where headers can't be set.
-   * Returns a query string fragment: `hmac=...&ts=...&origin=...`
+   * Build a short-lived signed query for media contexts where headers cannot be set.
+   * The signature is nonce-bound and expires with the request timestamp.
    */
   private async buildCompanionQueryAuth(url: string): Promise<string> {
     return companionSession.getSignedQuery("GET", url);
@@ -2170,7 +2166,7 @@ class ApiService {
   /**
    * Build a direct URL for viewing a file.
    *
-   * For companion connections, embeds HMAC auth in query params since
+   * For companion connections, embeds a short-lived signed auth value in query params since
    * these URLs may be used in `<img src>` / `<iframe>` where headers can't be set.
    * Async because companion HMAC computation uses the Web Crypto API.
    */

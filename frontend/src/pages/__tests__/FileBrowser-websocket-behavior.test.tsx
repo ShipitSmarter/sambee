@@ -16,6 +16,7 @@ import FileBrowser from "../FileBrowser";
 
 const mockUseCompanion = vi.fn<() => UseCompanionResult>();
 const mockBuildCompanionWsUrl = vi.fn<() => Promise<string | null>>();
+const mockBuildCompanionWsAuthMessage = vi.fn<() => Promise<string | null>>();
 const mockCopyMoveDialog = vi.fn();
 const SUBSCRIPTION_ACK_TIMEOUT_MS = 30_000;
 
@@ -34,6 +35,7 @@ vi.mock("../../services/companion", async (importOriginal) => {
   return {
     ...actual,
     buildCompanionWsUrl: () => mockBuildCompanionWsUrl(),
+    buildCompanionWsAuthMessage: () => mockBuildCompanionWsAuthMessage(),
   };
 });
 
@@ -81,6 +83,11 @@ const parseSentMessages = (socket: InspectableWebSocket | undefined) =>
         return payload as { action: string; connection_id: string; path: string };
       })
     : [];
+
+const firstSubscriptionRequest = (socket: InspectableWebSocket | undefined) => {
+  const message = socket?.sentMessages.map((payload) => JSON.parse(payload)).find((payload) => payload.action === "subscribe");
+  return requireTestValue(message) as { action: string; connection_id: string; path: string; request_id: string };
+};
 
 const isServerSocket = (socket: InspectableWebSocket) => socket.url.includes("token=fake-token");
 const isCompanionSocket = (socket: InspectableWebSocket) => socket.url.includes("21549");
@@ -156,7 +163,17 @@ describe("FileBrowser WebSocket behavior", () => {
     });
 
     mockUseCompanion.mockReturnValue(buildDefaultCompanionResult());
-    mockBuildCompanionWsUrl.mockResolvedValue("ws://localhost:21549/api/ws?hmac=test&ts=1&origin=http%3A%2F%2Flocalhost%3A3000");
+    mockBuildCompanionWsUrl.mockResolvedValue("ws://localhost:21549/api/ws");
+    mockBuildCompanionWsAuthMessage.mockResolvedValue(
+      JSON.stringify({
+        message_type: "authenticate",
+        public_key: "public-key",
+        signature: "signature",
+        timestamp: "1700000000",
+        nonce: "nonce",
+        body_sha256: "body-hash",
+      })
+    );
 
     setupSuccessfulApiMocks(api as unknown as ApiMock);
   });
@@ -263,7 +280,7 @@ describe("FileBrowser WebSocket behavior", () => {
     const socket = requireTestValue(InspectableWebSocket.instances.find(isServerSocket));
     act(() => socket.open());
     await waitFor(() => expect(socket.sentMessages.length).toBeGreaterThan(0));
-    const request = JSON.parse(requireTestValue(socket.sentMessages[0]));
+    const request = firstSubscriptionRequest(socket);
     const initialCalls = vi.mocked(api.listDirectory).mock.calls.length;
     const reply = { ...request, type: "error", code: "directory_not_found" };
     act(() => socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ ...reply, request_id: "old-request" }) })));
@@ -278,7 +295,7 @@ describe("FileBrowser WebSocket behavior", () => {
     const socket = requireTestValue(InspectableWebSocket.instances.find(isServerSocket));
     act(() => socket.open());
     await waitFor(() => expect(socket.sentMessages.length).toBeGreaterThan(0));
-    const request = JSON.parse(requireTestValue(socket.sentMessages[0]));
+    const request = firstSubscriptionRequest(socket);
     browser.navigate("/browse/smb/test-server-1/Documents");
     await waitFor(() => expect(parseSentMessages(socket).some((message) => message.action === "unsubscribe")).toBe(true));
     const calls = vi.mocked(api.listDirectory).mock.calls.length;
@@ -301,7 +318,7 @@ describe("FileBrowser WebSocket behavior", () => {
     const socket = requireTestValue(InspectableWebSocket.instances.find(matches));
     act(() => socket.open());
     await waitFor(() => expect(socket.sentMessages.length).toBeGreaterThan(0));
-    const request = JSON.parse(requireTestValue(socket.sentMessages[0]));
+    const request = firstSubscriptionRequest(socket);
     const refreshControl = screen.getByRole("button", { name: "Refresh" });
     await act(async () =>
       socket.onmessage?.(
@@ -349,7 +366,7 @@ describe("FileBrowser WebSocket behavior", () => {
     const socket = requireTestValue(InspectableWebSocket.instances.find(isServerSocket));
     act(() => socket.open());
     await waitFor(() => expect(socket.sentMessages.length).toBeGreaterThan(0));
-    const request = JSON.parse(requireTestValue(socket.sentMessages[0]));
+    const request = firstSubscriptionRequest(socket);
     const timeout = requireTestValue(timer.mock.calls.find(([, delay]) => delay === SUBSCRIPTION_ACK_TIMEOUT_MS));
     act(() => {
       if (typeof timeout[0] === "function") timeout[0]();

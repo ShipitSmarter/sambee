@@ -2055,8 +2055,9 @@ const Browser: React.FC = () => {
   /**
    * Companion WebSocket for real-time local drive change notifications.
    *
-   * Only connects when the companion is paired. Uses HMAC query-param auth
-   * since the browser WebSocket API does not support custom headers.
+   * Only connects when the companion is paired. It authenticates with a
+   * signed first WebSocket frame because the browser WebSocket API does not
+   * support custom headers.
    * Reconnects independently from the server WebSocket.
    */
   // biome-ignore lint/correctness/useExhaustiveDependencies: handleDirectoryChanged refs are stable; companion/local pane state drives connect/disconnect.
@@ -2113,13 +2114,19 @@ const Browser: React.FC = () => {
         ws.close();
       }, COMPANION_WEBSOCKET_CONNECT_TIMEOUT_MS);
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
         clearConnectTimeout();
         if (disposed) {
           ws.close();
           return;
         }
-        logger.info("Companion WebSocket connected", {}, "websocket");
+        const authMessage = await browserContentServices.connections.getCompanionWebSocketAuthMessage();
+        if (!authMessage || ws.readyState !== WebSocket.OPEN) {
+          ws.close();
+          return;
+        }
+        ws.send(authMessage);
+        logger.info("Companion WebSocket authenticated", {}, "websocket");
         companionWsRef.current = ws;
         setCompanionDirectoryWs(ws);
       };

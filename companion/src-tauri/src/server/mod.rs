@@ -277,7 +277,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_auth_or_query));
 
-    // WebSocket route — uses query-param auth (browser WS API has no custom headers).
+    // WebSocket authentication is performed by a signed first message.
     let ws_routes = Router::new().route("/api/ws", axum::routing::get(handlers::ws_upgrade));
 
     let router = Router::new()

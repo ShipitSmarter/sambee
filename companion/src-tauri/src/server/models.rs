@@ -534,7 +534,7 @@ pub struct PairInitiateResponse {
 /// Response from `POST /api/pair/confirm`.
 #[derive(Debug, Serialize)]
 pub struct PairConfirmResponse {
-    pub secret: String,
+    pub paired: bool,
 }
 
 /// Public pairing status for the current browser origin.

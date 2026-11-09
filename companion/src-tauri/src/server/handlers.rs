@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{OriginalUri, Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -255,21 +255,21 @@ fn resolve_local_archive_inspection_coordinator(
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 
-/// Query parameters for WebSocket authentication.
-///
-/// The browser WebSocket API does not support custom headers, so HMAC
-/// credentials are passed as query parameters on the upgrade request.
+/// First WebSocket frame used to authenticate the connection.
 #[derive(Deserialize)]
-pub struct WsAuthParams {
-    hmac: Option<String>,
-    ts: Option<String>,
-    origin: Option<String>,
+struct WsAuthMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    signature: String,
+    timestamp: String,
+    nonce: String,
+    public_key: String,
+    body_sha256: String,
 }
 
 /// `GET /api/ws` — WebSocket endpoint for real-time directory change notifications.
 ///
-/// Authenticates via query parameters (`hmac`, `ts`, `origin`), then upgrades
-/// to a WebSocket connection. Uses the same JSON protocol as the backend:
+/// Authenticates with a signed first frame before accepting subscriptions.
 ///
 /// **Client → Companion:**
 /// - `{"action": "subscribe", "connection_id": "local-drive:c", "path": "some/dir"}`
@@ -281,31 +281,42 @@ pub struct WsAuthParams {
 /// - `{"type": "unsubscribed", "connection_id": "...", "path": "..."}`
 /// - `{"type": "directory_changed", "connection_id": "...", "path": "..."}`
 /// - `{"type": "pong"}`
-pub async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-    OriginalUri(uri): OriginalUri,
-    Query(params): Query<WsAuthParams>,
-) -> Result<Response, ApiError> {
-    let hmac_val = params.hmac.ok_or_else(|| ApiError::Forbidden("Missing hmac query param".into()))?;
-    let ts_val = params.ts.ok_or_else(|| ApiError::Forbidden("Missing ts query param".into()))?;
-    let origin_val = params
-        .origin
-        .ok_or_else(|| ApiError::Forbidden("Missing origin query param".into()))?;
-
-    let log_context = auth::AuthLogContext {
-        auth_transport: "query",
-        method: "GET",
-        path: "/api/ws",
-    };
-
-    auth::validate_hmac_public(&state, &origin_val, &hmac_val, &ts_val, &uri, &log_context)?;
-
-    Ok(ws.on_upgrade(move |socket| handle_ws_connection(socket, state)))
+pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let origin = headers.get("origin").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    Ok(ws.on_upgrade(move |socket| handle_ws_connection(socket, state, origin)))
 }
 
 /// Handle a single WebSocket connection after the upgrade.
-async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>, origin: Option<String>) {
+    let Some(Ok(Message::Text(auth_text))) = tokio::time::timeout(Duration::from_secs(5), socket.recv()).await.ok().flatten() else {
+        return;
+    };
+    let Ok(auth_message) = serde_json::from_str::<WsAuthMessage>(auth_text.as_str()) else {
+        return;
+    };
+    if auth_message.message_type != "authenticate" {
+        return;
+    }
+    let Some(origin) = origin else {
+        return;
+    };
+    let uri: axum::http::Uri = "/api/ws".parse().expect("static websocket URI");
+    let context = auth::AuthLogContext { method: "GET" };
+    if auth::validate_signed_request(
+        &state,
+        &origin,
+        &auth_message.public_key,
+        &auth_message.signature,
+        &auth_message.timestamp,
+        &auth_message.nonce,
+        &auth_message.body_sha256,
+        &uri,
+        &context,
+    )
+    .is_err()
+    {
+        return;
+    }
     info!("WebSocket client connected");
     let mut rx = state.watcher.subscribe_events();
     let mut subscriptions: HashSet<String> = HashSet::new();
@@ -472,6 +483,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 #[derive(Deserialize)]
 pub struct PairInitiateRequest {
     pub nonce_browser: String,
+    pub public_key: String,
     pub origin: Option<String>,
 }
 
@@ -483,10 +495,13 @@ pub async fn pair_initiate(
 ) -> Result<Json<PairInitiateResponse>, ApiError> {
     let origin = extract_origin(&headers).or_else(|_| extract_origin_from_pair_initiate_request(&body))?;
 
-    let (pairing_id, nonce_companion, code) = state.pairing.initiate(&body.nonce_browser, &origin).map_err(|err| match err {
-        PairingInitiateError::Validation(msg) => ApiError::BadRequest(msg),
-        PairingInitiateError::RateLimited(msg) => ApiError::TooManyRequests(msg),
-    })?;
+    let (pairing_id, nonce_companion, code) = state
+        .pairing
+        .initiate_with_key(&body.nonce_browser, &body.public_key, &origin)
+        .map_err(|err| match err {
+            PairingInitiateError::Validation(msg) => ApiError::BadRequest(msg),
+            PairingInitiateError::RateLimited(msg) => ApiError::TooManyRequests(msg),
+        })?;
 
     show_pairing_window(&state.app, &pairing_id, &origin, &code);
 
@@ -504,6 +519,7 @@ pub async fn pair_initiate(
 #[derive(Deserialize)]
 pub struct PairConfirmRequest {
     pub pairing_id: String,
+    pub public_key: String,
     pub origin: Option<String>,
 }
 
@@ -514,11 +530,14 @@ pub async fn pair_confirm(
     Json(body): Json<PairConfirmRequest>,
 ) -> Result<Json<PairConfirmResponse>, ApiError> {
     let origin = resolve_pair_confirm_origin(&headers, body.origin.as_deref())?;
-    let secret = state.pairing.confirm(&body.pairing_id, &origin).map_err(map_pair_confirm_error)?;
+    state
+        .pairing
+        .confirm(&body.pairing_id, &origin, &body.public_key)
+        .map_err(map_pair_confirm_error)?;
 
     show_pairing_success(&state.app);
 
-    Ok(Json(PairConfirmResponse { secret }))
+    Ok(Json(PairConfirmResponse { paired: true }))
 }
 
 /// `POST /api/localization` — synchronize browser localization to the companion.
@@ -6276,7 +6295,7 @@ fn extract_normalized_request_origin(request_origin: Option<&str>, missing_messa
 
 fn build_pair_status_response(pairing: &PairingState, current_origin: Option<&str>) -> PairStatusResponse {
     let (current_origin_paired, status) = current_origin.map_or((false, PublicPairingStatus::Unpaired), |origin| {
-        let paired = pairing.get_secret_for_origin(origin).is_some();
+        let paired = pairing.get_public_key_for_origin(origin).is_some();
         if paired && !pairing.is_origin_paired(origin) {
             pairing.record_verified_origin(
                 origin,
@@ -10465,7 +10484,13 @@ mod tests {
     #[test]
     fn pair_status_reports_pending_local_approval_for_current_origin() {
         let pairing = PairingState::new();
-        pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
 
         let response = build_pair_status_response(&pairing, Some("https://sambee.example"));
 

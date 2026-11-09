@@ -18,6 +18,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import api from "../../services/api";
 import { authSession } from "../../services/authSession";
+import { companionSession } from "../../services/companionSession";
 import { type ApiMock, setupSuccessfulApiMocks } from "../../test/helpers";
 import { FileType } from "../../types";
 import type { ViewerComponentProps } from "../../utils/FileTypeRegistry";
@@ -98,7 +99,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     localStorage.removeItem("selectedConnectionId");
     localStorage.removeItem("dual-pane-mode");
     localStorage.removeItem("active-pane");
-    localStorage.removeItem("companion_secret");
+    companionSession.clearPairing();
 
     setupSuccessfulApiMocks(api as unknown as ApiMock);
   });
@@ -1114,7 +1115,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("keeps Retry for unrelated local-drive permission errors", async () => {
-      localStorage.setItem("companion_secret", "valid-secret");
+      await companionSession.storePairing();
       vi.mocked(api.listDirectory).mockRejectedValue({ response: { status: 403, data: { detail: "Permission denied" } } });
 
       await renderBrowserAndFlush("/browse/local/c/Users");
@@ -1125,7 +1126,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("keeps Retry for a temporary local-drive network failure", async () => {
-      localStorage.setItem("companion_secret", "valid-secret");
+      await companionSession.storePairing();
       vi.mocked(api.listDirectory).mockRejectedValue(new Error("Network Error"));
 
       await renderBrowserAndFlush("/browse/local/c/Users");

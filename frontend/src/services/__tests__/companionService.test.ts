@@ -50,29 +50,27 @@ describe("local drive listing pairing errors", () => {
   it("requires pairing when the secret is missing or the companion reports a missing pairing", () => {
     expect(getLocalDrivePairingErrorKind("local-drive:c", new Error("Network Error"))).toBe("pairing_required");
 
-    localStorage.setItem("companion_secret", "shared-secret");
     expect(
       getLocalDrivePairingErrorKind("local-drive:c", {
         response: { status: 403, data: { code: "companion_pairing_not_found" } },
       })
     ).toBe("pairing_required");
-    expect(getLocalDrivePairingErrorKind("local-drive:c", new Error("Network Error"))).toBeNull();
+    expect(getLocalDrivePairingErrorKind("local-drive:c", new Error("Network Error"))).toBe("pairing_required");
   });
 });
 
 describe("companion request signatures", () => {
   it("binds method and URL while normalizing query order", async () => {
-    localStorage.setItem("companion_secret", "shared-secret");
     const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
     try {
       const first = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/file?z=2&A=1");
       const reordered = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/file?A=1&z=2");
       const differentPath = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/download?A=1&z=2");
       const differentMethod = await companionSession.getSigningHeaders("DELETE", "http://localhost:21549/api/viewer/root/file?A=1&z=2");
-      expect(first["X-Companion-Secret"]).toBe("2213e964861fc8d4db9ae41c96188ce038ed113c0d064d8d6c96c5314c033d33");
-      expect(first["X-Companion-Secret"]).toBe(reordered["X-Companion-Secret"]);
-      expect(first["X-Companion-Secret"]).not.toBe(differentPath["X-Companion-Secret"]);
-      expect(first["X-Companion-Secret"]).not.toBe(differentMethod["X-Companion-Secret"]);
+      expect(first["X-Companion-Signature"]).toEqual(expect.any(String));
+      expect(first["X-Companion-Key"]).toBe(reordered["X-Companion-Key"]);
+      expect(first["X-Companion-Signature"]).not.toBe(differentPath["X-Companion-Signature"]);
+      expect(first["X-Companion-Signature"]).not.toBe(differentMethod["X-Companion-Signature"]);
     } finally {
       clock.mockRestore();
     }
@@ -140,7 +138,7 @@ describe("companionService.confirmPairing", () => {
           },
         },
       })
-      .mockResolvedValueOnce({ data: { secret: "shared-secret" } });
+      .mockResolvedValueOnce({ data: { paired: true } });
 
     await companionService.confirmPairing("pair-1");
 
@@ -153,7 +151,7 @@ describe("companionService.confirmPairing", () => {
         origin: window.location.origin,
       })
     );
-    expect(localStorage.getItem("companion_secret")).toBe("shared-secret");
+    expect(localStorage.getItem("companion_secret")).toBeNull();
   });
 
   it("fails immediately for non-retriable confirmation errors", async () => {
@@ -174,12 +172,12 @@ describe("companionService.confirmPairing", () => {
           },
         },
       })
-      .mockResolvedValueOnce({ data: { secret: "shared-secret" } });
+      .mockResolvedValueOnce({ data: { paired: true } });
 
     await companionService.confirmPairing("pair-3");
 
     expect(mockAxiosInstance.post).toHaveBeenCalledTimes(2);
-    expect(localStorage.getItem("companion_secret")).toBe("shared-secret");
+    expect(localStorage.getItem("companion_secret")).toBeNull();
   });
 });
 
@@ -209,7 +207,6 @@ describe("companionService shared settings", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
-    localStorage.setItem("companion_secret", "shared-secret");
   });
 
   it("sends an authenticated opaque grant without browser settings values", async () => {
@@ -223,6 +220,7 @@ describe("companionService shared settings", () => {
       },
     });
 
+    await companionSession.ensureKeyPair();
     await companionService.redeemSettingsGrant("opaque-grant");
     expect(mockAxiosInstance.post).toHaveBeenCalledWith(
       "/settings/redeem",
@@ -232,7 +230,7 @@ describe("companionService shared settings", () => {
       },
       {
         headers: expect.objectContaining({
-          "X-Companion-Secret": expect.any(String),
+          "X-Companion-Signature": expect.any(String),
           "X-Companion-Timestamp": expect.any(String),
         }),
       }
@@ -244,7 +242,6 @@ describe("companionService.createArchive", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
-    localStorage.setItem("companion_secret", "shared-secret");
   });
 
   it("forwards an abort signal for direct local archive creation", async () => {
@@ -253,6 +250,7 @@ describe("companionService.createArchive", () => {
       data: { files_created: 1, directories_created: 0, source_bytes: 4 },
     });
 
+    await companionSession.ensureKeyPair();
     await companionService.createArchive("c", ["source.txt"], "archive.zip", controller.signal);
 
     expect(mockAxiosInstance.post).toHaveBeenCalledWith(
@@ -260,7 +258,7 @@ describe("companionService.createArchive", () => {
       { source_paths: ["source.txt"], target_path: "archive.zip" },
       {
         headers: expect.objectContaining({
-          "X-Companion-Secret": expect.any(String),
+          "X-Companion-Signature": expect.any(String),
           "X-Companion-Timestamp": expect.any(String),
         }),
         signal: controller.signal,

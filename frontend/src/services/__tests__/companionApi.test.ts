@@ -46,6 +46,7 @@ const companionResponseInterceptors = vi.mocked(mockAxiosInstance.interceptors.r
 describe("Companion API", () => {
   beforeEach(() => {
     localStorage.clear();
+    companionSession.clearPairing();
     vi.clearAllMocks();
 
     // Mock window.location.origin
@@ -141,7 +142,7 @@ describe("Companion API", () => {
 
   describe("getCompanionUri()", () => {
     it("does not send URI themes after pairing", async () => {
-      localStorage.setItem("companion_secret", "shared-secret");
+      await companionSession.storePairing();
       mockAxiosInstance.post.mockResolvedValueOnce({ data: { uri_token: "paired-token", expires_in: 60 } } as AxiosResponse);
       const uri = await apiService.getCompanionUri(
         "conn-1",
