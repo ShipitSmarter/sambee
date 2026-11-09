@@ -407,14 +407,26 @@
         const isPlaceholder = cell.state === 'missing';
         chip.className = `version-chip state-${cell.state}${shouldCollapseVersionChip(version.slug) ? ' collapsed' : ''}${isPlaceholder ? ' version-chip--placeholder' : ''}`;
         if (!isPlaceholder) chip.title = versionChipTitle(version, cell);
-        const diffHtml = cell.state === 'branched' && state.toggles.showDiffCount
-          ? `<div class="version-chip__diff"><span class="plus">+${cell.diff_added || 0}</span><span class="minus">-${cell.diff_removed || 0}</span></div>`
-          : '';
-        chip.innerHTML = `
-          <div class="version-chip__slug">${version.label}</div>
-          <div class="version-chip__state">${compactStateLabel(cell.state)}</div>
-          ${diffHtml}
-        `;
+        const slug = document.createElement('div');
+        slug.className = 'version-chip__slug';
+        slug.textContent = version.label;
+        chip.appendChild(slug);
+        const stateLabel = document.createElement('div');
+        stateLabel.className = 'version-chip__state';
+        stateLabel.textContent = compactStateLabel(cell.state);
+        chip.appendChild(stateLabel);
+        if (cell.state === 'branched' && state.toggles.showDiffCount) {
+          const diff = document.createElement('div');
+          diff.className = 'version-chip__diff';
+          const added = document.createElement('span');
+          added.className = 'plus';
+          added.textContent = `+${cell.diff_added || 0}`;
+          const removed = document.createElement('span');
+          removed.className = 'minus';
+          removed.textContent = `-${cell.diff_removed || 0}`;
+          diff.append(added, removed);
+          chip.appendChild(diff);
+        }
         strip.appendChild(chip);
       }
       return strip;
@@ -452,13 +464,22 @@
         }
         const block = document.createElement('div');
         block.className = 'row-label-block';
-        block.innerHTML = `<div class="row-label">${row.title || row.label}</div><div class="row-subtitle">${row.label}</div>`;
+        const label = document.createElement('div');
+        label.className = 'row-label';
+        label.textContent = row.title || row.label;
+        const subtitle = document.createElement('div');
+        subtitle.className = 'row-subtitle';
+        subtitle.textContent = row.label;
+        block.append(label, subtitle);
         rowTitle.appendChild(block);
         nameCell.appendChild(rowTitle);
         tr.appendChild(nameCell);
 
         const kindCell = document.createElement('td');
-        kindCell.innerHTML = `<span class="kind-badge">${row.kind}</span>`;
+        const kindBadge = document.createElement('span');
+        kindBadge.className = 'kind-badge';
+        kindBadge.textContent = row.kind;
+        kindCell.appendChild(kindBadge);
         tr.appendChild(kindCell);
 
         const stripCell = document.createElement('td');

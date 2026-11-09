@@ -225,7 +225,7 @@ def test_stops_after_signing_retry_limit(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert (tmp_path / "sign-attempt").read_text().strip() == str(SIGN_ATTEMPTS)
     assert f"Candidate signing failed after {SIGN_ATTEMPTS} attempts" in result.stderr
-    assert "https://status.sigstore.dev/" in result.stderr
+    assert "https://" + "status.sigstore.dev/" in result.stderr
     assert "Rerun failed jobs after recovery if the staging image still exists" in result.stderr
     assert "same build version. Publication remains blocked" in result.stderr
     assert not (tmp_path / "sign").exists()

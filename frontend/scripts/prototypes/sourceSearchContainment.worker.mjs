@@ -26,9 +26,22 @@ export function executeSourceSearchProof(request) {
     const cursor = query.getCursor(state, ...bounds);
     for (let result = cursor.next(); !result.done; result = cursor.next()) count += 1;
   } else {
-    const command = { next: findNext, previous: findPrevious, "replace-one": replaceNext, "replace-all": replaceAll }[request.operation];
-    if (!command) throw new Error("Unknown source-search operation");
-    command(target);
+    switch (request.operation) {
+      case "next":
+        findNext(target);
+        break;
+      case "previous":
+        findPrevious(target);
+        break;
+      case "replace-one":
+        replaceNext(target);
+        break;
+      case "replace-all":
+        replaceAll(target);
+        break;
+      default:
+        throw new Error("Unknown source-search operation");
+    }
   }
   const content = state.doc.toString();
   const selection = { from: state.selection.main.from, to: state.selection.main.to };

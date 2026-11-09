@@ -49,8 +49,22 @@ function* execute(): Generator<SourceSearchResponse> {
       transaction = state.update(spec);
     },
   };
-  const commands = { next: findNext, previous: findPrevious, "replace-one": replaceNext, "replace-all": replaceAll };
-  commands[request.operation](target as unknown as EditorView);
+  switch (request.operation) {
+    case "next":
+      findNext(target as unknown as EditorView);
+      break;
+    case "previous":
+      findPrevious(target as unknown as EditorView);
+      break;
+    case "replace-one":
+      replaceNext(target as unknown as EditorView);
+      break;
+    case "replace-all":
+      replaceAll(target as unknown as EditorView);
+      break;
+    default:
+      throw new Error("Unknown source-search operation");
+  }
   if (request.operation === "next" || request.operation === "previous") navigationState = transaction?.state ?? state;
   if (!transaction) {
     yield { type: "complete", announcements: [] };

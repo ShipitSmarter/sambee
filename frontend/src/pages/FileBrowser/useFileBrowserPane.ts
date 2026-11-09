@@ -209,8 +209,7 @@ function archiveLocationsMatch(left: ArchiveLocation | null, right: ArchiveLocat
 
 /** Generate a unique viewer session id for logging. */
 const createViewerSessionId = (): string => {
-  const randomPart = Math.random().toString(36).slice(2, 10);
-  return `${Date.now().toString(36)}-${randomPart}`;
+  return crypto.randomUUID();
 };
 
 function getRecentFileValidationError(error: unknown): RecentFileValidationError | null {
