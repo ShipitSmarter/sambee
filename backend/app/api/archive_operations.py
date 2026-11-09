@@ -83,6 +83,7 @@ from app.services.archive.creation import (
     ArchiveCreationCancelled,
     ArchiveCreationMemberOutcome,
     ArchiveCreationResult,
+    ArchiveCreationSource,
     build_archive_creation_manifest,
     create_archive_from_files,
     normalize_archive_creation_source_modified_at,
@@ -120,8 +121,10 @@ from app.services.archive.target_write import (
     collision_policy_from_action,
     resolve_target_write_attempt,
 )
+from app.services.archive.temporary_download import validate_selected_roots
 from app.services.archive.v2_checkpoint import canonical_v2_timestamp, new_v2_extraction_checkpoint
-from app.services.archive.zip_reader import ArchiveFormatError, ArchiveSourceUnavailableError
+from app.services.archive.zip_creation_source import ZipArchiveCreationSource
+from app.services.archive.zip_reader import ArchiveFormatError, ArchiveSourceUnavailableError, ZipReader
 from app.services.audit import AuditDetails, AuditEventName, AuditResult, write_audit_event
 from app.services.connection_access import get_accessible_connection_or_404, require_connection_write_access
 from app.services.history_common import LOCAL_DRIVE_PREFIX
@@ -447,13 +450,22 @@ async def prepare_archive_operation(
     _verify_operation_connection_scope(session, current_user, connection_id=payload.source_connection_id, requires_write_access=False)
     _verify_operation_connection_scope(session, current_user, connection_id=payload.destination_connection_id, requires_write_access=True)
     try:
-        resolve_archive_operation_topology_plan(
+        topology_plan = resolve_archive_operation_topology_plan(
             kind=payload.kind,
             source_connection_id=payload.source_connection_id,
             destination_connection_id=payload.destination_connection_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    if payload.kind == ArchiveOperationKind.CREATE and payload.selected_member_paths is not None:
+        if topology_plan.topology.driver != ArchiveExecutionDriver.BACKEND:
+            raise HTTPException(status_code=422, detail="ZIP member creation requires a same-connection SMB destination")
+        if not payload.source_path:
+            raise HTTPException(status_code=422, detail="ZIP member creation requires a source archive")
+        try:
+            validate_selected_roots(payload.selected_member_paths)
+        except ArchiveFormatError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     selected_member_paths_json = json.dumps(payload.selected_member_paths) if payload.selected_member_paths is not None else None
     operation = ArchiveOperation(
         user_id=current_user.id,
@@ -560,11 +572,12 @@ async def create_archive_companion_session(
         data=claims,
         expires_delta=timedelta(minutes=ARCHIVE_COMPANION_TOKEN_EXPIRE_MINUTES),
     )
+    selected_member_roots = _selected_member_roots(operation)
     return ArchiveCompanionSession(
         token=token,
         expires_in=ARCHIVE_COMPANION_TOKEN_EXPIRE_MINUTES * 60,
         operation=ArchiveOperationRead.model_validate(operation),
-        selected_member_paths=_selected_member_roots(operation),
+        selected_member_paths=list(selected_member_roots) if selected_member_roots is not None else None,
     )
 
 
@@ -836,12 +849,14 @@ def _companion_creation_manifest_response(
 
     try:
         entries = [
-            ArchiveCompanionCreationManifestEntry(
-                source_path=entry.source_path,
-                archive_path=entry.archive_path,
-                is_directory=entry.is_directory,
-                source_size=entry.source_size,
-                modified_at=entry.source_modified_at,
+            ArchiveCompanionCreationManifestEntry.model_validate(
+                {
+                    "source_path": entry.source_path,
+                    "archive_path": entry.archive_path,
+                    "is_directory": entry.is_directory,
+                    "source_size": entry.source_size,
+                    "modified_at": entry.source_modified_at,
+                }
             )
             for entry in manifest.members
         ]
@@ -992,15 +1007,17 @@ async def next_live_companion_local_archive_member(relay: ScopedCompanionRelay) 
         return None
     if member.is_directory:
         await source_session.mark_directory_delivery_ready(member.source_session_id, member.delivery_sequence)
-    return ArchiveCompanionLiveExtractionMember(
-        source_session_id=member.source_session_id,
-        delivery_sequence=member.delivery_sequence,
-        member_path=member.path,
-        is_directory=member.is_directory,
-        uncompressed_size=member.uncompressed_size,
-        modified_at=member.modified_at if isinstance(member.modified_at, datetime) else None,
-        target_path=member.target_path,
-        collision_policy=member.collision_policy,
+    return ArchiveCompanionLiveExtractionMember.model_validate(
+        {
+            "source_session_id": member.source_session_id,
+            "delivery_sequence": member.delivery_sequence,
+            "member_path": member.path,
+            "is_directory": member.is_directory,
+            "uncompressed_size": member.uncompressed_size,
+            "modified_at": member.modified_at if isinstance(member.modified_at, datetime) else None,
+            "target_path": member.target_path,
+            "collision_policy": member.collision_policy,
+        }
     )
 
 
@@ -2091,39 +2108,64 @@ async def execute_archive_creation(
         kind_name="creation",
         write_action="create archive",
     ) as (operation, backend):
-        source_paths = _creation_source_paths(operation)
-        preflight_entries = await build_archive_creation_manifest(backend, source_paths, operation.destination_path)
-        manifest = ArchiveCreationManifest.from_members(
-            [
-                ArchiveCreationManifestMember(
-                    archive_path=entry.archive_path,
-                    is_directory=entry.info.type == FileType.DIRECTORY,
-                    source_size=entry.info.size or 0,
-                    source_path=entry.source_path,
-                    source_modified_at=entry.source_modified_at,
-                )
-                for entry in preflight_entries
-            ]
-        )
-
-        async def run_creation(
-            on_member_completed: Callable[[ArchiveCreationMemberOutcome], Awaitable[None]],
-            is_cancelled: Callable[[], Awaitable[bool]],
-        ) -> ArchiveCreationResult:
-            return await create_archive_from_files(
-                backend,
-                destination=backend,
-                source_paths=source_paths,
-                target_path=operation.destination_path,
-                is_cancelled=is_cancelled,
-                on_member_completed=on_member_completed,
-                preflight_manifest=manifest,
+        reader = None
+        try:
+            selected_roots = _selected_member_roots(operation)
+            source: ArchiveCreationSource
+            if selected_roots is None:
+                source_paths = _creation_source_paths(operation)
+                source = backend
+            else:
+                source_paths = validate_selected_roots(list(selected_roots))
+                archive_info = await backend.get_file_info(operation.source_path)
+                if archive_info.type != FileType.FILE or archive_info.size is None:
+                    raise ArchiveFormatError("Archive creation source must be a regular ZIP file")
+                reader = await backend.open_random_access_reader(operation.source_path)
+                zip_source = ZipArchiveCreationSource(ZipReader(reader, archive_info.size))
+                await zip_source.validate_projection()
+                source = zip_source
+            preflight_entries = await build_archive_creation_manifest(
+                source,
+                source_paths,
+                operation.destination_path,
+                source_and_target_share_namespace=selected_roots is None,
+            )
+            manifest = ArchiveCreationManifest.from_members(
+                [
+                    ArchiveCreationManifestMember(
+                        archive_path=entry.archive_path,
+                        is_directory=entry.info.type == FileType.DIRECTORY,
+                        source_size=entry.info.size or 0,
+                        source_path=entry.source_path,
+                        source_modified_at=entry.source_modified_at,
+                    )
+                    for entry in preflight_entries
+                ]
             )
 
-        return await ArchiveCreationCoordinator(
-            operation=operation,
-            state_store=DurableArchiveExecutionStateStore(session),
-        ).run(run_creation, execution_plan=ArchiveCreationExecutionPlan(manifest))
+            async def run_creation(
+                on_member_completed: Callable[[ArchiveCreationMemberOutcome], Awaitable[None]],
+                is_cancelled: Callable[[], Awaitable[bool]],
+            ) -> ArchiveCreationResult:
+                return await create_archive_from_files(
+                    source,
+                    destination=backend,
+                    source_paths=source_paths,
+                    target_path=operation.destination_path,
+                    is_cancelled=is_cancelled,
+                    on_member_completed=on_member_completed,
+                    preflight_manifest=manifest,
+                )
+
+            return await ArchiveCreationCoordinator(
+                operation=operation,
+                state_store=DurableArchiveExecutionStateStore(session),
+            ).run(run_creation, execution_plan=ArchiveCreationExecutionPlan(manifest))
+        except (ArchiveFormatError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+        finally:
+            if reader is not None:
+                await reader.close()
 
 
 async def execute_archive_extraction(

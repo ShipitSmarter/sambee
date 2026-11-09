@@ -1,4 +1,4 @@
-import { LockReset as LockResetIcon } from "@mui/icons-material";
+import { LockReset as LockResetIcon, Refresh as RefreshIcon } from "@mui/icons-material";
 import {
   Alert,
   Box,
@@ -27,12 +27,12 @@ import { SettingsSectionList } from "../components/Settings/SettingsSectionList"
 import { settingsPrimaryButtonSx, settingsUtilityButtonSx } from "../components/Settings/settingsButtonStyles";
 import { clearCurrentBrowserSession, signOutCurrentBrowser } from "../services/accountSession";
 import api from "../services/api";
+import { PASSWORD_CHANGED_MARKER } from "../services/passwordChange";
 import type { AccountSessionKind, CurrentAccount, CurrentAccountSession, OidcBrowserSession } from "../types";
 import { getApiErrorMessage } from "../utils/apiErrors";
 import { dialogEnterKeyHandler } from "../utils/keyboardUtils";
 import { formatLocalizedDateTime } from "../utils/localeFormatting";
 
-const PASSWORD_CHANGED_MARKER = "sambee_password_changed";
 const PASSWORD_CONFIRMATION_MISMATCH_MESSAGE = "The new password and confirmation do not match.";
 const PASSWORD_FIELDS_REQUIRED_MESSAGE = "Complete all password fields.";
 
@@ -320,7 +320,7 @@ export function AccountSettings({ dialogSafe = false }: { dialogSafe?: boolean }
           </Box>
         ) : account === null ? (
           <Box>
-            <Button variant="outlined" onClick={() => void loadAccount()}>
+            <Button variant="outlined" sx={settingsUtilityButtonSx} startIcon={<RefreshIcon />} onClick={() => void loadAccount()}>
               Try again
             </Button>
           </Box>
@@ -374,8 +374,9 @@ export function AccountSettings({ dialogSafe = false }: { dialogSafe?: boolean }
                     <SettingsGroup title="Other sessions" level="subsection">
                       <Typography sx={{ color: "text.secondary" }}>Other sessions could not be loaded.</Typography>
                       <Button
-                        sx={{ mt: 2 }}
+                        sx={[settingsUtilityButtonSx, { mt: 2 }]}
                         variant="outlined"
+                        startIcon={<RefreshIcon />}
                         onClick={() => void loadAccount()}
                         disabled={revoking !== null || signingOut}
                       >

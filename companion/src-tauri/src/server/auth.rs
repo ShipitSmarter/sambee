@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::Request;
+use axum::http::Uri;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, Mac};
@@ -32,6 +33,11 @@ const TIMESTAMP_HEADER: &str = "x-companion-timestamp";
 
 /// Maximum clock skew allowed (seconds).
 const MAX_TIMESTAMP_SKEW: u64 = 30;
+
+pub(super) const AUTH_PROTOCOL_VERSION: u32 = 2;
+pub(super) const AUTH_SIGNATURE_MISMATCH_CODE: &str = "companion_auth_signature_mismatch";
+pub(super) const BROWSER_UPDATE_REQUIRED_CODE: &str = "companion_browser_update_required";
+pub(super) const PAIRING_NOT_FOUND_CODE: &str = "companion_pairing_not_found";
 
 /// Request context included in authentication warning logs.
 pub(super) struct AuthLogContext<'a> {
@@ -105,6 +111,34 @@ pub fn require_normalized_browser_origin(origin: &str) -> Result<String, ApiErro
         .ok_or_else(|| ApiError::Forbidden("Origin is not allowed to access the companion bootstrap API".to_string()))
 }
 
+fn signature_payload(origin: &str, timestamp: &str, method: &str, uri: &Uri) -> String {
+    let mut parameters: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .filter(|(key, _)| !matches!(key.as_ref(), "hmac" | "ts" | "origin"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    parameters.sort();
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters.iter().map(|(key, value)| (key, value)))
+        .finish();
+    let target = if query.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{}?{query}", uri.path())
+    };
+    format!("{origin}\n{timestamp}\n{method}\n{target}")
+}
+
+fn is_legacy_browser_signature(secret: &str, timestamp: &str, signature: &str) -> bool {
+    let Ok(signature_bytes) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(timestamp.as_bytes());
+    mac.verify_slice(&signature_bytes).is_ok()
+}
+
 /// Axum middleware that validates HMAC-authenticated requests.
 ///
 /// Extracts the `Origin` header to determine which pairing secret to use,
@@ -117,10 +151,12 @@ pub async fn require_auth(State(state): State<Arc<AppState>>, request: Request<a
     };
 
     match extract_auth_credentials(&request) {
-        Ok((origin, hmac_value, timestamp_str)) => match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &log_context) {
-            Ok(()) => next.run(request).await,
-            Err(e) => e.into_response(),
-        },
+        Ok((origin, hmac_value, timestamp_str)) => {
+            match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, request.uri(), &log_context) {
+                Ok(()) => next.run(request).await,
+                Err(e) => e.into_response(),
+            }
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -138,7 +174,7 @@ pub async fn require_auth_or_query(State(state): State<Arc<AppState>>, request: 
         path: request.uri().path(),
     };
     if let Ok((origin, hmac_value, timestamp_str)) = extract_auth_credentials(&request) {
-        return match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &header_log_context) {
+        return match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, request.uri(), &header_log_context) {
             Ok(()) => next.run(request).await,
             Err(e) => e.into_response(),
         };
@@ -168,7 +204,7 @@ pub async fn require_auth_or_query(State(state): State<Arc<AppState>>, request: 
         path: request.uri().path(),
     };
 
-    match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &query_log_context) {
+    match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, request.uri(), &query_log_context) {
         Ok(()) => next.run(request).await,
         Err(e) => e.into_response(),
     }
@@ -208,9 +244,10 @@ pub(super) fn validate_hmac_public(
     origin: &str,
     hmac_value: &str,
     timestamp_str: &str,
+    uri: &Uri,
     log_context: &AuthLogContext,
 ) -> Result<(), ApiError> {
-    validate_hmac(state, origin, hmac_value, timestamp_str, log_context)
+    validate_hmac(state, origin, hmac_value, timestamp_str, uri, log_context)
 }
 
 /// Validate HMAC credentials against the stored secret for an origin.
@@ -219,6 +256,7 @@ fn validate_hmac(
     origin: &str,
     hmac_value: &str,
     timestamp_str: &str,
+    uri: &Uri,
     log_context: &AuthLogContext,
 ) -> Result<(), ApiError> {
     let origin = require_normalized_browser_origin(origin)?;
@@ -229,7 +267,7 @@ fn validate_hmac(
             "Auth rejected: no pairing found for origin {origin}; transport={}; method={}; path={}",
             log_context.auth_transport, log_context.method, log_context.path,
         );
-        ApiError::Forbidden("Not paired with this origin".to_string())
+        ApiError::forbidden_code("Not paired with this origin", PAIRING_NOT_FOUND_CODE)
     })?;
 
     // Validate timestamp (within ±MAX_TIMESTAMP_SKEW seconds)
@@ -257,16 +295,26 @@ fn validate_hmac(
     // `TextEncoder.encode(secret)`).
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Internal("HMAC initialization failed".to_string()))?;
-    mac.update(timestamp_str.as_bytes());
+    mac.update(signature_payload(&origin, timestamp_str, log_context.method, uri).as_bytes());
 
     let expected = hex::encode(mac.finalize().into_bytes());
 
     if expected != hmac_value {
+        if is_legacy_browser_signature(&secret, timestamp_str, hmac_value) {
+            warn!(
+                "Auth rejected: outdated browser signature for origin {origin}; transport={}; method={}; path={}",
+                log_context.auth_transport, log_context.method, log_context.path,
+            );
+            return Err(ApiError::forbidden_code(
+                "Sambee browser is out of date. Reload the page.",
+                BROWSER_UPDATE_REQUIRED_CODE,
+            ));
+        }
         warn!(
             "Auth rejected: HMAC mismatch for origin {origin}; transport={}; method={}; path={}; server_ts={now}; request_ts={timestamp}",
             log_context.auth_transport, log_context.method, log_context.path,
         );
-        return Err(ApiError::Forbidden("Invalid authentication".to_string()));
+        return Err(ApiError::forbidden_code("Invalid authentication", AUTH_SIGNATURE_MISMATCH_CODE));
     }
 
     if !state.pairing.is_origin_paired(&origin) {
@@ -281,7 +329,50 @@ fn validate_hmac(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_browser_origin_for_cors, is_loopback_dev_origin, normalize_browser_origin};
+    use super::{
+        is_allowed_browser_origin_for_cors, is_legacy_browser_signature, is_loopback_dev_origin, normalize_browser_origin,
+        signature_payload,
+    };
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    #[test]
+    fn signature_is_scoped_to_method_path_and_query() {
+        let uri = "/api/viewer/root/file?path=notes%2Fone.txt&origin=https%3A%2F%2Fexample.test&ts=123&hmac=secret"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            signature_payload("https://example.test", "123", "GET", &uri),
+            "https://example.test\n123\nGET\n/api/viewer/root/file?path=notes%2Fone.txt"
+        );
+        assert_ne!(
+            signature_payload("https://example.test", "123", "GET", &uri),
+            signature_payload("https://example.test", "123", "DELETE", &uri)
+        );
+    }
+
+    #[test]
+    fn signature_matches_browser_test_vector() {
+        let uri = "/api/viewer/root/file?z=2&A=1".parse().unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(signature_payload("http://localhost:3000", "1700000000", "GET", &uri).as_bytes());
+        assert_eq!(
+            hex::encode(mac.finalize().into_bytes()),
+            "2213e964861fc8d4db9ae41c96188ce038ed113c0d064d8d6c96c5314c033d33"
+        );
+    }
+
+    #[test]
+    fn identifies_legacy_browser_signature_without_accepting_it_as_current() {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(b"1700000000");
+        let legacy_signature = hex::encode(mac.finalize().into_bytes());
+
+        assert!(is_legacy_browser_signature("shared-secret", "1700000000", &legacy_signature));
+        assert!(!is_legacy_browser_signature("other-secret", "1700000000", &legacy_signature));
+        assert!(!is_legacy_browser_signature("shared-secret", "1700000001", &legacy_signature));
+        assert!(!is_legacy_browser_signature("shared-secret", "1700000000", "invalid"));
+    }
 
     #[test]
     fn normalizes_browser_origins_exactly() {

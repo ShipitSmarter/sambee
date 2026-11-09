@@ -6,6 +6,7 @@ import { loadAuthenticationSettingsData, SETTINGS_DATA_CACHE_KEYS } from "../../
 import { clearCachedAsyncData, getCachedAsyncData, primeCachedAsyncData } from "../../hooks/useCachedAsyncData";
 import api from "../../services/api";
 import { authSession } from "../../services/authSession";
+import { uninitializedTestCallback } from "../../test/helpers/assertions";
 import type { OidcAdminConfigurationRead, OidcReviewedPolicy, OidcTestedIdentity, RedactedOidcConfiguration } from "../../types";
 import { AuthenticationSettings } from "../AuthenticationSettings";
 
@@ -35,6 +36,7 @@ const configuration = (displayName: string): RedactedOidcConfiguration => ({
   groups_claim: "groups",
   sign_in_mode: "oidc_or_password",
   interactive_reauthentication_max_age_days: 30,
+  no_refresh_session_limit_hours: 8,
   admission_mode: "selected_groups",
   admission_groups: ["sambee-users"],
   role_assignment_mode: "group_based",
@@ -62,6 +64,7 @@ const response = (value: RedactedOidcConfiguration): OidcAdminConfigurationRead 
 const reviewedPolicy = (value: RedactedOidcConfiguration): OidcReviewedPolicy => ({
   sign_in_mode: value.sign_in_mode,
   interactive_reauthentication_max_age_days: value.interactive_reauthentication_max_age_days,
+  no_refresh_session_limit_hours: value.no_refresh_session_limit_hours,
   admission_mode: value.admission_mode,
   admission_groups: value.admission_groups,
   role_assignment_mode: value.role_assignment_mode,
@@ -72,6 +75,7 @@ const reviewedPolicy = (value: RedactedOidcConfiguration): OidcReviewedPolicy =>
 
 const testedIdentity = (overrides: Partial<OidcTestedIdentity> = {}): OidcTestedIdentity => ({
   flow_id: "test-flow",
+  refresh_token_returned: true,
   candidate: configuration("Tested Provider"),
   replacement_mappings: [],
   expected_identity_mapping_revision: 1,
@@ -265,6 +269,7 @@ describe("Authentication settings", () => {
     const activated = configuration("Activated Provider");
     vi.mocked(api.getOidcConfiguration).mockResolvedValueOnce(response(active)).mockResolvedValueOnce(response(activated));
     vi.mocked(api.getOidcTestResult).mockResolvedValue({
+      refresh_token_returned: true,
       flow_id: "test-flow",
       candidate: tested,
       replacement_mappings: [],
@@ -319,6 +324,7 @@ describe("Authentication settings", () => {
     window.location.hash = "";
     vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
     vi.mocked(api.getOidcTestResult).mockResolvedValue({
+      refresh_token_returned: true,
       flow_id: "stored-flow",
       candidate: configuration("Stored Provider"),
       replacement_mappings: [],
@@ -537,6 +543,30 @@ describe("Authentication settings", () => {
     expect(await screen.findByRole("button", { name: "Activate configuration" })).toBeEnabled();
   });
 
+  it.each([
+    [true, "Session renewal: Refresh token returned in this test"],
+    [
+      false,
+      "Session renewal: No refresh token returned in this test; users will need to sign in again after the configured session limit.",
+    ],
+  ])("reports observed session renewal when refresh token returned is %s", async (refreshTokenReturned, result) => {
+    vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
+    vi.mocked(api.getOidcTestResult).mockResolvedValue(testedIdentity({ refresh_token_returned: refreshTokenReturned }));
+    window.location.hash = "flow=test-flow";
+    renderSettings();
+
+    expect(await screen.findByText(result)).toBeInTheDocument();
+  });
+
+  it("explains the no-refresh session limit in the provider form", async () => {
+    vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
+    window.location.hash = "";
+    renderSettings();
+    await openOidcConfiguration();
+
+    expect(screen.getByText("Applies only when sign-in does not return a refresh token")).toBeInTheDocument();
+  });
+
   it("blocks activation when the tested identity does not pass admission", async () => {
     vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
     vi.mocked(api.getOidcTestResult).mockResolvedValue(testedIdentity({ admitted: false }));
@@ -631,6 +661,7 @@ describe("Authentication settings", () => {
     window.location.hash = "flow=test-flow";
     vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
     vi.mocked(api.getOidcTestResult).mockResolvedValue({
+      refresh_token_returned: true,
       flow_id: "test-flow",
       candidate: configuration("Tested Provider"),
       replacement_mappings: [],
@@ -661,6 +692,7 @@ describe("Authentication settings", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Old Provider")));
     vi.mocked(api.getOidcTestResult).mockResolvedValue({
+      refresh_token_returned: true,
       flow_id: "test-flow",
       candidate: configuration("New Provider"),
       replacement_mappings: [
@@ -1209,7 +1241,7 @@ describe("Authentication settings", () => {
 
   it("keeps active group drafts unchanged when a policy preview resolves", async () => {
     const user = userEvent.setup();
-    let resolvePreview: (identity: OidcTestedIdentity) => void;
+    let resolvePreview: (identity: OidcTestedIdentity) => void = uninitializedTestCallback;
     const previewResult = new Promise<OidcTestedIdentity>((resolve) => {
       resolvePreview = resolve;
     });
@@ -1282,6 +1314,23 @@ describe("Authentication settings", () => {
       testError.compareDocumentPosition(screen.getByTestId("responsive-form-dialog-desktop-actions")) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy();
     expect(screen.queryByText("The redirect URI could not be copied.")).not.toBeInTheDocument();
+  });
+
+  it("omits the redirect URI copy action when the Clipboard API is unavailable", async () => {
+    const user = userEvent.setup();
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    vi.mocked(api.getOidcConfiguration).mockResolvedValue(response(configuration("Active Provider")));
+    try {
+      renderSettings();
+      await openOidcConfiguration(user);
+
+      expect(await screen.findByRole("textbox", { name: /redirect uri/i })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Copy redirect URI" })).not.toBeInTheDocument();
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
   });
 
   it("blocks testing for normalized group collisions and empty selected-group admission", async () => {

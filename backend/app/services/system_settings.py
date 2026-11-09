@@ -21,9 +21,13 @@ from sqlmodel import Session, select
 import app.core.config as config_module
 import app.db.database as database_module
 from app import __version__
+from app.core.directory_index_contract import MAX_WIRE_INTEGER
 from app.core.logging import get_logger
 from app.core.system_setting_definitions import (
+    DIRECTORY_INDEX_REVISION_KEYS,
+    DIRECTORY_INDEX_SETTING_KEYS,
     SYSTEM_SETTING_DEFINITIONS,
+    DirectoryIndexPolicyScope,
     IntegerSystemSettingDefinition,
     SystemSettingKey,
     SystemSettingSource,
@@ -34,6 +38,9 @@ from app.models.system_settings import (
     AboutSettingsRead,
     AdvancedSystemSettingsRead,
     AdvancedSystemSettingUpdate,
+    DirectoryIndexPolicy,
+    DirectoryIndexSettingsRead,
+    DirectoryIndexSettingUpdate,
     FileSearchSettings,
     FileSearchSettingsRead,
     FileSearchSettingsUpdate,
@@ -287,6 +294,70 @@ def get_integer_setting_value(key: SystemSettingKey) -> int:
     return _resolve_integer_setting(SYSTEM_SETTING_DEFINITIONS[key]).value
 
 
+def build_directory_index_settings_read(scope: DirectoryIndexPolicyScope, session: Session) -> DirectoryIndexSettingsRead:
+    from app.services.directory_policy_grants import backend_policy_identity
+
+    fields: dict[str, IntegerSystemSettingRead] = {}
+    values: dict[str, int] = {}
+    try:
+        for field, key in DIRECTORY_INDEX_SETTING_KEYS[scope].items():
+            definition = SYSTEM_SETTING_DEFINITIONS[key]
+            override = session.get(SystemSetting, key.value)
+            value = definition.default_value if override is None else _parse_override_value(definition, override.value)
+            values[field] = value
+            fields[field] = IntegerSystemSettingRead(
+                key=key,
+                label=definition.label,
+                description=definition.description,
+                value=value,
+                source=SystemSettingSource.DEFAULT if override is None else SystemSettingSource.DATABASE,
+                default_value=definition.default_value,
+                min_value=definition.min_value,
+                max_value=definition.max_value,
+                step=definition.step,
+            )
+        revision_row = session.get(SystemSetting, DIRECTORY_INDEX_REVISION_KEYS[scope].value)
+        revision = 0 if revision_row is None else int(revision_row.value)
+        if not 0 <= revision <= MAX_WIRE_INTEGER:
+            raise ValueError("Directory-index policy revision is outside the supported range.")
+        return DirectoryIndexSettingsRead(
+            scope=scope,
+            policy=DirectoryIndexPolicy.model_validate(values),
+            backend_identity=backend_policy_identity(),
+            revision=revision,
+            fields=fields,
+        )
+    except ValueError as error:
+        raise ValueError("Stored directory-index policy is invalid. Restore valid administration values before indexing.") from error
+
+
+def get_directory_index_policy(scope: DirectoryIndexPolicyScope = DirectoryIndexPolicyScope.BACKEND) -> DirectoryIndexPolicy:
+    with Session(database_module.engine) as session:
+        return build_directory_index_settings_read(scope, session).policy
+
+
+def update_directory_index_settings(
+    scope: DirectoryIndexPolicyScope, payload: DirectoryIndexSettingUpdate, *, updated_by_user_id: uuid.UUID, session: Session
+) -> DirectoryIndexSettingUpdate:
+    _begin_immediate_transaction(session)
+    current = build_directory_index_settings_read(scope, session)
+    values = current.policy.model_dump()
+    values[payload.field] = payload.value
+    policy = DirectoryIndexPolicy.model_validate(values)
+    if getattr(current.policy, payload.field) == payload.value:
+        session.commit()
+        return payload
+    if current.revision >= MAX_WIRE_INTEGER:
+        raise ValueError("Directory-index policy revision is exhausted. Restore policy revision storage before changing it.")
+    _write_system_setting(
+        session, DIRECTORY_INDEX_SETTING_KEYS[scope][payload.field], str(getattr(policy, payload.field)), updated_by_user_id
+    )
+    _write_system_setting(session, DIRECTORY_INDEX_REVISION_KEYS[scope], str(current.revision + 1), updated_by_user_id)
+    session.commit()
+    store.refresh_from_session(session)
+    return payload
+
+
 def _decode_string_set(raw_value: str | None, *, key: SystemSettingKey) -> set[str]:
     if raw_value is None:
         return set()
@@ -325,7 +396,7 @@ def build_file_search_settings_read(session: Session) -> FileSearchSettingsRead:
                 values["excluded_extensions"].value, key=FILE_SEARCH_SETTING_KEYS["excluded_extensions"]
             )
         source = SystemSettingSource.DATABASE if overrides else SystemSettingSource.DEFAULT
-        return FileSearchSettingsRead(settings=FileSearchSettings(**overrides), source=source)
+        return FileSearchSettingsRead(settings=FileSearchSettings.model_validate(overrides), source=source)
     except ValueError as exc:
         logger.critical("Invalid persisted File Search setting: %s", exc)
         raise ValueError("The persisted File Search policy is invalid") from exc
@@ -350,9 +421,11 @@ def update_file_search_settings(
     next_settings = FileSearchSettings.model_validate(next_settings)
 
     if next_settings.retention_limit < current.retention_limit:
+        from app.services.recent_directories import trim_all_recent_directories
         from app.services.recent_files import trim_all_recent_files
 
         trim_all_recent_files(retention_limit=next_settings.retention_limit, session=session)
+        trim_all_recent_directories(retention_limit=next_settings.retention_limit, session=session)
 
     value = getattr(next_settings, payload.field)
     serialized_value = _encode_string_set(value) if isinstance(value, set) else str(value)
@@ -363,6 +436,9 @@ def update_file_search_settings(
 
 def build_advanced_system_settings_read() -> AdvancedSystemSettingsRead:
     return AdvancedSystemSettingsRead(
+        temporary_archive_download_size_bytes=_build_integer_read(
+            SYSTEM_SETTING_DEFINITIONS[SystemSettingKey.TEMPORARY_ARCHIVE_DOWNLOAD_SIZE_BYTES]
+        ),
         preprocessors={
             "imagemagick": PreprocessorAdvancedSettingsRead(
                 max_file_size_bytes=_build_integer_read(

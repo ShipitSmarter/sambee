@@ -11,11 +11,12 @@
  */
 
 import axios from "axios";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { isLocalAbortError } from "../services/backendAvailability";
 import { error as logError, logger, info as logInfo } from "../services/logger";
 import { PreviewUnavailableError } from "../services/previewPolicy";
 import { isApiError } from "../types";
+import { PhysicalFileRequestError } from "../utils/apiErrors";
 import { checkIsTransientError, getTransientErrorMessage } from "./useApiRetry";
 
 // Delay before showing spinner to avoid flicker on fast loads
@@ -51,6 +52,7 @@ export interface UseImageGalleryDataParams {
   gallerySourceKey?: string;
   loadImageBlob: (path: string, options: { signal: AbortSignal; viewportWidth: number; viewportHeight: number }) => Promise<Blob>;
   initialIndex?: number;
+  selectionKey?: string;
   onIndexChange?: (index: number) => void;
   spinnerDelayMs?: number;
   cacheRange?: number;
@@ -66,6 +68,7 @@ export interface UseImageGalleryDataResult {
   filename: string;
   imageCacheRef: React.MutableRefObject<Map<number, string>>;
   getCachedImageSrc: (index: number) => string | undefined;
+  getCachedImageBlob: (index: number) => Blob | undefined;
   loadingStates: Map<number, boolean>;
   errorStates: Map<number, string | null>;
   currentImageLoadPhase: ImageLoadPhase;
@@ -73,7 +76,7 @@ export interface UseImageGalleryDataResult {
   showLoadingSpinner: boolean;
   canRetryCurrentImage: boolean;
   markImageAsDecoded: (index: number, source: string) => void;
-  markImageDecodeFailed: (index: number, source: string) => void;
+  markImageDecodeFailed: (index: number, source: string, message?: string) => void;
   cancelCurrentImageLoad: () => void;
   retryCurrentImage: () => void;
   abortControllersRef: React.MutableRefObject<Map<number, AbortController>>;
@@ -105,6 +108,7 @@ interface GallerySessionResources {
   galleryIdentity: string;
   generation: number;
   imageCache: Map<number, string>;
+  imageBlobs: Map<number, Blob>;
   abortControllers: Map<number, AbortController>;
   inFlightRequests: Map<number, InFlightImageRequest>;
   failedBackgroundRequestKeys: Set<string>;
@@ -148,6 +152,7 @@ function createGallerySessionResources(galleryIdentity: string, generation: numb
     galleryIdentity,
     generation,
     imageCache: new Map(),
+    imageBlobs: new Map(),
     abortControllers: new Map(),
     inFlightRequests: new Map(),
     failedBackgroundRequestKeys: new Set(),
@@ -185,6 +190,7 @@ function isManuallyRetryableImageFailure(err: unknown): boolean {
 }
 
 function getImageLoadErrorMessage(err: unknown): string {
+  if (err instanceof PhysicalFileRequestError) return err.message;
   if (!isApiError(err)) {
     return IMAGE_LOAD_FAILED_MESSAGE;
   }
@@ -193,6 +199,8 @@ function getImageLoadErrorMessage(err: unknown): string {
   if (
     typeof detail === "object" &&
     detail !== null &&
+    "code" in detail &&
+    "message" in detail &&
     detail.code === IMAGE_PREVIEW_TOO_LARGE_ERROR_CODE &&
     typeof detail.message === "string" &&
     detail.message.trim()
@@ -215,6 +223,7 @@ function disposeGallerySessionResources(session: GallerySessionResources): void 
     URL.revokeObjectURL(url);
   });
   session.imageCache.clear();
+  session.imageBlobs.clear();
 }
 
 function waitForRetryDelay(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -310,6 +319,7 @@ export const useCachedImageGallery = ({
   gallerySourceKey,
   loadImageBlob,
   initialIndex = 0,
+  selectionKey,
   onIndexChange,
   spinnerDelayMs = SPINNER_DELAY_MS_DEFAULT,
   cacheRange = CACHE_RANGE_DEFAULT,
@@ -354,7 +364,7 @@ export const useCachedImageGallery = ({
   // Cache of blob URLs for loaded images, keyed by index
   const imageCacheRef = useRef<Map<number, string>>(committedSessionResources.imageCache);
   // Timer for delayed spinner display
-  const loadingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const loadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = useRef(true);
   const failedBackgroundRequestKeysRef = useRef<Set<string>>(committedSessionResources.failedBackgroundRequestKeys);
   // Track in-flight requests by image index so a preload can be promoted to the
@@ -423,6 +433,7 @@ export const useCachedImageGallery = ({
   const suspendPreload = useCallback(() => shouldSuspendRef.current(), []);
 
   // Commit gallery switches after render so abandoned renders cannot retire the active session.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A new route entry must reapply even an unchanged index after an optimistic move.
   useEffect(() => {
     const committedResources = sessionResourcesRef.current;
 
@@ -461,12 +472,15 @@ export const useCachedImageGallery = ({
         index: safeInitialIndex,
       };
     });
-  }, [galleryIdentity, pendingSessionGeneration, pendingSessionResources, safeInitialIndex]);
+  }, [galleryIdentity, pendingSessionGeneration, pendingSessionResources, safeInitialIndex, selectionKey]);
 
-  // Notify parent component of index changes
+  const notifyIndexChange = useEffectEvent((index: number) => {
+    if (index !== safeInitialIndex) onIndexChange?.(index);
+  });
+
   useEffect(() => {
-    onIndexChange?.(currentIndex);
-  }, [currentIndex, onIndexChange]);
+    notifyIndexChange(currentIndex);
+  }, [currentIndex]);
 
   // Show spinner only after delay to avoid flicker on fast image loads
   useEffect(() => {
@@ -675,6 +689,7 @@ export const useCachedImageGallery = ({
         }
 
         requestSessionResources.imageCache.set(index, blobUrl);
+        requestSessionResources.imageBlobs.set(index, blob);
         setImageSourceRevision((revision) => revision + 1);
         requestSessionResources.failedBackgroundRequestKeys.delete(failureKey);
         if (requestSessionResources.currentRetryGate?.index === index) {
@@ -955,6 +970,7 @@ export const useCachedImageGallery = ({
         logInfo("Revoking blob URL for distant image", { index, url });
         URL.revokeObjectURL(url);
         imageCache.delete(index);
+        sessionResourcesRef.current.imageBlobs.delete(index);
         removedIndexes.push(index);
       }
     });
@@ -1000,13 +1016,13 @@ export const useCachedImageGallery = ({
   );
 
   const markImageDecodeFailed = useCallback(
-    (index: number, source: string) => {
+    (index: number, source: string, message = IMAGE_LOAD_FAILED_MESSAGE) => {
       updateSessionView(galleryIdentity, pendingSessionGeneration, (prev) => {
         if (sessionResourcesRef.current.imageCache.get(index) !== source) {
           return prev;
         }
 
-        return applyImageLoadFailure(prev, index, IMAGE_LOAD_FAILED_MESSAGE);
+        return applyImageLoadFailure(prev, index, message, { canRetry: true });
       });
     },
     [galleryIdentity, pendingSessionGeneration, updateSessionView]
@@ -1021,6 +1037,7 @@ export const useCachedImageGallery = ({
     if (cachedSource) {
       URL.revokeObjectURL(cachedSource);
       resources.imageCache.delete(index);
+      resources.imageBlobs.delete(index);
       setImageSourceRevision((revision) => revision + 1);
     }
 
@@ -1037,6 +1054,13 @@ export const useCachedImageGallery = ({
   const retryCurrentImage = useCallback(() => {
     const resources = sessionResourcesRef.current;
     const index = currentIndexRef.current;
+    const source = resources.imageCache.get(index);
+    if (source) {
+      URL.revokeObjectURL(source);
+      resources.imageCache.delete(index);
+      resources.imageBlobs.delete(index);
+      setImageSourceRevision((revision) => revision + 1);
+    }
 
     resources.currentRetryGate = null;
     void fetchAndCacheImageRef.current(index, { priority: "current" }).finally(() => {
@@ -1058,6 +1082,7 @@ export const useCachedImageGallery = ({
     filename,
     imageCacheRef,
     getCachedImageSrc,
+    getCachedImageBlob: (index: number) => activeSessionResources.imageBlobs.get(index),
     loadingStates,
     errorStates,
     currentImageLoadPhase,

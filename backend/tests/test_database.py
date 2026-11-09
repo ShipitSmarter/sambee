@@ -25,15 +25,226 @@ from app.db.migrations import (
     MIGRATION_TABLE_NAME,
     MIGRATIONS,
     _apply_archive_operation_contract_version_migration,
+    _apply_case_insensitive_usernames_migration,
+    _apply_history_usage_score_migration,
     run_migrations,
 )
 from app.models.connection import Connection
+from app.models.oidc import OidcBrowserSession, OidcBrowserSessionStatus, OidcProviderConfiguration
 from app.models.user import User, UserRole
 
 
 @pytest.mark.unit
 class TestDatabaseInitialization:
     """Test database initialization."""
+
+    @pytest.mark.parametrize("retention_limit", [0, 1, 200])
+    def test_history_upgrade_applies_existing_directory_retention(self, tmp_path: Path, retention_limit: int):
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'history-retention-upgrade.db'}")
+        try:
+            with test_engine.begin() as connection:
+                connection.execute(text("CREATE TABLE systemsetting (key TEXT PRIMARY KEY, value TEXT NOT NULL)"))
+                connection.execute(
+                    text("INSERT INTO systemsetting VALUES ('file_search.retention_limit', :value)"), {"value": str(retention_limit)}
+                )
+                connection.execute(
+                    text("CREATE TABLE recentdirectory (id TEXT PRIMARY KEY, user_id TEXT, last_visited_at TEXT, created_at TEXT)")
+                )
+                for user_id in ("first", "second"):
+                    for index in range(3):
+                        connection.execute(
+                            text("INSERT INTO recentdirectory VALUES (:id, :user_id, :visited, :visited)"),
+                            {"id": f"{user_id}-{index}", "user_id": user_id, "visited": f"2026-01-0{index + 1}"},
+                        )
+                _apply_history_usage_score_migration(connection)
+                _apply_history_usage_score_migration(connection)
+                for user_id in ("first", "second"):
+                    ids = (
+                        connection.execute(
+                            text("SELECT id FROM recentdirectory WHERE user_id = :user_id ORDER BY id DESC"), {"user_id": user_id}
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    assert ids == [f"{user_id}-{index}" for index in reversed(range(3))][:retention_limit]
+                assert connection.execute(text("SELECT value FROM systemsetting")).scalar_one() == str(retention_limit)
+        finally:
+            test_engine.dispose()
+
+    def test_history_score_migration_preserves_existing_records(self, tmp_path: Path):
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'history-upgrade.db'}")
+        try:
+            with test_engine.begin() as connection:
+                for table in ("recentfile", "recentdirectory"):
+                    connection.execute(text(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, path TEXT NOT NULL)"))
+                    connection.execute(text(f"INSERT INTO {table} (id, path) VALUES ('existing', 'Documents')"))
+                _apply_history_usage_score_migration(connection)
+                _apply_history_usage_score_migration(connection)
+                for table in ("recentfile", "recentdirectory"):
+                    assert connection.execute(text(f"SELECT path, usage_score FROM {table}")).one() == ("Documents", 1.0)
+        finally:
+            test_engine.dispose()
+
+    def test_username_migration_preserves_conflicts_and_guards_writes(self, tmp_path: Path):
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'username-upgrade.db'}")
+        try:
+            with test_engine.begin() as connection:
+                connection.exec_driver_sql('CREATE TABLE "user" (id TEXT PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT)')
+                connection.exec_driver_sql('CREATE TABLE owned_item (user_id TEXT REFERENCES "user"(id), value TEXT)')
+                connection.exec_driver_sql("INSERT INTO user VALUES ('first', 'UserA', 'hash-one'), ('second', 'usera', 'hash-two')")
+                connection.exec_driver_sql("INSERT INTO owned_item VALUES ('second', 'preserved')")
+                _apply_case_insensitive_usernames_migration(connection)
+                _apply_case_insensitive_usernames_migration(connection)
+                assert connection.exec_driver_sql('SELECT id, username, password_hash, username_key FROM "user" ORDER BY id').all() == [
+                    ("first", "UserA", "hash-one", "usera"),
+                    ("second", "usera", "hash-two", "usera"),
+                ]
+                assert connection.exec_driver_sql("SELECT * FROM owned_item").all() == [("second", "preserved")]
+            with pytest.raises(IntegrityError, match="user_username_key_collision"), test_engine.begin() as connection:
+                connection.exec_driver_sql("INSERT INTO user (id, username) VALUES ('third', 'USERA')")
+            with test_engine.begin() as connection:
+                connection.exec_driver_sql("UPDATE user SET username = 'USERA' WHERE id = 'first'")
+                connection.exec_driver_sql("UPDATE user SET username = 'UniqueUser' WHERE id = 'second'")
+            with pytest.raises(IntegrityError, match="user_username_key_collision"), test_engine.begin() as connection:
+                connection.exec_driver_sql("UPDATE user SET username = 'usera' WHERE id = 'second'")
+            with test_engine.begin() as connection:
+                connection.exec_driver_sql("DELETE FROM user WHERE id = 'first'")
+                connection.exec_driver_sql("INSERT INTO user (id, username) VALUES ('third', 'usera')")
+                assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        finally:
+            test_engine.dispose()
+
+    def test_concurrent_case_variants_cannot_both_be_created(self, tmp_path: Path):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'username-concurrent.db'}")
+        try:
+            with test_engine.begin() as connection:
+                connection.exec_driver_sql('CREATE TABLE "user" (id TEXT PRIMARY KEY, username TEXT UNIQUE)')
+                _apply_case_insensitive_usernames_migration(connection)
+            ready = Barrier(2)
+
+            def insert(username: str) -> bool:
+                ready.wait(timeout=10)
+                try:
+                    with test_engine.begin() as connection:
+                        connection.execute(text('INSERT INTO "user" (id, username) VALUES (:username, :username)'), {"username": username})
+                    return True
+                except IntegrityError as error:
+                    assert "user_username_key_collision" in str(error)
+                    return False
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                assert sorted(executor.map(insert, ["ConcurrentUser", "concurrentuser"])) == [False, True]
+        finally:
+            test_engine.dispose()
+
+    def test_no_refresh_migration_preserves_existing_session(self, tmp_path: Path):
+        from datetime import datetime, timedelta, timezone
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'oidc-upgrade.db'}")
+        try:
+            SQLModel.metadata.create_all(engine)
+            with Session(engine) as session:
+                user = User(username="upgrade-user", role=UserRole.VIEWER, password_hash=None)
+                configuration = OidcProviderConfiguration(display_name="IdP", issuer_url="https://issuer.example", client_id="client")
+                session.add_all([user, configuration])
+                session.commit()
+                now = datetime.now(timezone.utc)
+                existing = OidcBrowserSession(
+                    user_id=user.id,
+                    user_token_version=user.token_version,
+                    provider_configuration_id=configuration.id,
+                    configuration_revision=0,
+                    identity_mapping_revision=0,
+                    issuer=configuration.issuer_url,
+                    subject="subject",
+                    secret_hash="secret",
+                    encrypted_refresh_token="encrypted",
+                    status=OidcBrowserSessionStatus.ACTIVE,
+                    authenticated_at=now,
+                    absolute_expires_at=now + timedelta(days=1),
+                )
+                session.add(existing)
+                session.commit()
+                session_id = existing.id
+            with engine.begin() as connection:
+                old_columns = [
+                    column["name"] for column in inspect(connection).get_columns("oidcbrowsersession") if column["name"] != "capability"
+                ]
+                names = ", ".join(f'"{name}"' for name in old_columns)
+                connection.execute(text(f'CREATE TABLE "oidcbrowsersession__old" AS SELECT {names} FROM "oidcbrowsersession"'))
+                connection.execute(text('DROP TABLE "oidcbrowsersession"'))
+                connection.execute(text('ALTER TABLE "oidcbrowsersession__old" RENAME TO "oidcbrowsersession"'))
+                connection.execute(
+                    text(
+                        f"CREATE TABLE {MIGRATION_TABLE_NAME} (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+                    )
+                )
+                connection.execute(
+                    text(f"INSERT INTO {MIGRATION_TABLE_NAME} (version, name) VALUES (:version, :name)"),
+                    [{"version": migration.version, "name": migration.name} for migration in MIGRATIONS if migration.version < 37],
+                )
+            run_migrations(engine)
+            run_migrations(engine)
+            with Session(engine) as session:
+                upgraded = session.get(OidcBrowserSession, session_id)
+                assert upgraded is not None
+                assert upgraded.capability == "renewable"
+                assert upgraded.encrypted_refresh_token == "encrypted"
+            with engine.connect() as connection:
+                assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+        finally:
+            engine.dispose()
+
+    def test_migration_upgrades_existing_download_intents(self, tmp_path: Path):
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'old-download-intents.db'}")
+        try:
+            with test_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE download_intent ("
+                        "token_hash VARCHAR PRIMARY KEY, user_id CHAR(32) NOT NULL, connection_id CHAR(32) NOT NULL, "
+                        "path VARCHAR NOT NULL, member_path VARCHAR, expires_at DATETIME NOT NULL)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO download_intent (token_hash, user_id, connection_id, path, expires_at) "
+                        "VALUES ('old-ticket', :user_id, :connection_id, 'file.psd', '2099-01-01')"
+                    ),
+                    {"user_id": "a" * 32, "connection_id": "b" * 32},
+                )
+                connection.execute(
+                    text(
+                        f"CREATE TABLE {MIGRATION_TABLE_NAME} ("
+                        "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                    )
+                )
+                for migration in MIGRATIONS:
+                    if migration.version < 36:
+                        connection.execute(
+                            text(f"INSERT INTO {MIGRATION_TABLE_NAME} (version, name) VALUES (:version, :name)"),
+                            {"version": migration.version, "name": migration.name},
+                        )
+
+            run_migrations(test_engine)
+            run_migrations(test_engine)
+
+            assert "token_version" in {column["name"] for column in inspect(test_engine).get_columns("download_intent")}
+            with test_engine.begin() as connection:
+                assert connection.execute(text("SELECT count(*) FROM download_intent")).scalar_one() == 0
+                connection.execute(
+                    text(
+                        "INSERT INTO download_intent (token_hash, user_id, token_version, connection_id, path, expires_at) "
+                        "VALUES ('new-ticket', :user_id, 12, :connection_id, 'file.psd', '2099-01-01')"
+                    ),
+                    {"user_id": "a" * 32, "connection_id": "b" * 32},
+                )
+                assert connection.execute(text("SELECT token_version FROM download_intent")).scalar_one() == 12
+        finally:
+            test_engine.dispose()
 
     def test_init_db_creates_tables(self):
         """Test that init_db creates all tables."""
@@ -826,7 +1037,7 @@ class TestDatabaseEngine:
                         """
                     )
                 )
-                connection.execute(text('CREATE TABLE "user" (id CHAR(32) NOT NULL PRIMARY KEY)'))
+                connection.execute(text('CREATE TABLE "user" (id CHAR(32) NOT NULL PRIMARY KEY, username VARCHAR NOT NULL UNIQUE)'))
                 connection.execute(text("CREATE TABLE oidcproviderconfiguration (id INTEGER NOT NULL PRIMARY KEY)"))
                 connection.execute(
                     text(
@@ -850,7 +1061,10 @@ class TestDatabaseEngine:
                         """
                     )
                 )
-                connection.execute(text('INSERT INTO "user" (id) VALUES (:target), (:creator)'), {"target": "a" * 32, "creator": "b" * 32})
+                connection.execute(
+                    text("INSERT INTO \"user\" (id, username) VALUES (:target, 'target'), (:creator, 'creator')"),
+                    {"target": "a" * 32, "creator": "b" * 32},
+                )
                 connection.execute(text("INSERT INTO oidcproviderconfiguration (id) VALUES (1)"))
                 connection.execute(
                     text(

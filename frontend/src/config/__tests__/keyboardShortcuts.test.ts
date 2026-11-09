@@ -20,7 +20,24 @@ describe("Keyboard Shortcuts Configuration", () => {
     });
 
     it("should have valid key values", () => {
-      const validKeys = ["Enter", "Escape", "d", "e", "s", "S", "f", "F3", "Home", "End", "PageDown", "PageUp", "ArrowRight", "ArrowLeft"];
+      const validKeys = [
+        "Enter",
+        "Escape",
+        "d",
+        "e",
+        "s",
+        "S",
+        "r",
+        "R",
+        "f",
+        "F3",
+        "Home",
+        "End",
+        "PageDown",
+        "PageUp",
+        "ArrowRight",
+        "ArrowLeft",
+      ];
 
       for (const shortcut of Object.values(COMMON_SHORTCUTS)) {
         const keys = Array.isArray(shortcut.keys) ? shortcut.keys : [shortcut.keys];
@@ -71,6 +88,11 @@ describe("Keyboard Shortcuts Configuration", () => {
       expect(BROWSER_SHORTCUTS.FOCUS_CONNECTION_SELECTOR.keys).toBe("ArrowDown");
       expect(BROWSER_SHORTCUTS.FOCUS_CONNECTION_SELECTOR.allowInInputWithin).toBe('[data-quick-bar-input="true"]');
     });
+
+    it("registers upload and download as file actions", () => {
+      expect(BROWSER_SHORTCUTS.UPLOAD).toMatchObject({ keys: "u", ctrl: true, label: "Ctrl+U", helpGroup: "fileActions" });
+      expect(BROWSER_SHORTCUTS.DOWNLOAD).toMatchObject({ keys: "d", ctrl: true, label: "Ctrl+D", helpGroup: "fileActions" });
+    });
   });
 
   describe("PANE_SHORTCUTS", () => {
@@ -90,10 +112,16 @@ describe("Keyboard Shortcuts Configuration", () => {
       expect(uniqueIds.size).toBe(ids.length);
     });
 
-    it("should require ctrl modifier for pane focus shortcuts", () => {
+    it("should require ctrl modifier for the dual-pane toggle", () => {
       expect(PANE_SHORTCUTS.TOGGLE_DUAL_PANE.ctrl).toBe(true);
-      expect(PANE_SHORTCUTS.FOCUS_LEFT_PANE.ctrl).toBe(true);
-      expect(PANE_SHORTCUTS.FOCUS_RIGHT_PANE.ctrl).toBe(true);
+    });
+
+    it("does not register browser tab selection keys", () => {
+      for (const shortcut of Object.values(PANE_SHORTCUTS)) {
+        const keys = Array.isArray(shortcut.keys) ? shortcut.keys : [shortcut.keys];
+        expect(keys).not.toContain("1");
+        expect(keys).not.toContain("2");
+      }
     });
 
     it("should not require ctrl for tab pane switch", () => {

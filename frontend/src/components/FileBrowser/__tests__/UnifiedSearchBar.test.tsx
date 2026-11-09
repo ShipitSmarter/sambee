@@ -1,13 +1,25 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale, translate } from "../../../i18n";
+import { browserHistoryService } from "../../../services/browserHistoryService";
 import { SambeeThemeProvider } from "../../../theme/ThemeContext";
+import { type FileEntry, FileType } from "../../../types";
 import { getQuickBarResultRowHeight, QUICK_BAR_RESULT_GROUP_HEADER_HEIGHT, QUICK_BAR_RESULT_ITEM_HEIGHT } from "../QuickBarResultRow";
-import type { SearchProvider } from "../search/types";
+import { SEARCH_CONTRACT_VERSION } from "../search/recentHistory";
+import type { SearchProvider, SearchResultsUpdate } from "../search/types";
+import { useDirectorySearchProvider } from "../search/useDirectorySearchProvider";
+import { useFileSearchProvider } from "../search/useFileSearchProvider";
 import { UnifiedSearchBar } from "../UnifiedSearchBar";
 
 const virtualizerSizeCache = new Map<string | number, number>();
+const virtualizerScrollToOffset = vi.fn();
+const INPUT_DEBOUNCE_MS = 160;
+const QUIET_REFRESH_INTERVAL_MS = 500;
+const MOCK_HISTORY_RESPONSE_MS = 40;
+const MOCK_INDEX_RESPONSE_MS = 80;
+const VISIBLE_RESULTS_TARGET_MS = 300;
+const INCREMENTAL_KEY_INTERVAL_MS = 50;
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({
@@ -39,6 +51,7 @@ vi.mock("@tanstack/react-virtual", () => ({
           return virtualItem;
         });
       },
+      scrollToOffset: virtualizerScrollToOffset,
       scrollToIndex: vi.fn(),
     };
   },
@@ -58,6 +71,7 @@ const noResultsProvider: SearchProvider = {
   id: "no-results-provider",
   modeId: "navigate",
   modeLabel: "Navigate",
+  shortcutHint: "Ctrl+K",
   placeholder: "Search",
   debounceMs: 0,
   minQueryLength: 0,
@@ -197,7 +211,7 @@ function createGroupedProvider(onSelect: SearchProvider["onSelect"]): SearchProv
 function createRemovableGroupedProvider(): SearchProvider {
   let hasRemovedRecent = false;
 
-  const getResults = () => [
+  const getResults = (): Awaited<ReturnType<SearchProvider["fetchResults"]>> => [
     { kind: "group-header" as const, id: "recent", value: "", label: "Recent files" },
     ...(!hasRemovedRecent
       ? [
@@ -217,7 +231,7 @@ function createRemovableGroupedProvider(): SearchProvider {
       icon: "recent-file" as const,
       primaryText: "Second recent file",
     },
-    { kind: "group-header" as const, id: "current", value: "", label: "Current directory" },
+    { kind: "group-header" as const, id: "current", value: "" as const, label: "Current directory" },
     {
       kind: "result" as const,
       id: "current-file",
@@ -267,8 +281,364 @@ function renderWithProvider(component: React.ReactElement) {
 }
 
 describe("UnifiedSearchBar", () => {
+  it.each(["connection-1", "local-C"])("completes activation, recovery, source switching, and dismissal for %s", async (connectionId) => {
+    vi.useFakeTimers();
+    const retryMs = 2000;
+    let phase: "paused" | "failed" | "healthy" = "paused";
+    const history = {
+      ...browserHistoryService,
+      searchRecentDirectories: vi.fn().mockResolvedValue({ result_limit: 10, results: [] }),
+      searchDirectories: vi.fn(async () => {
+        if (phase === "failed") throw { response: { status: 503, data: { detail: { recoverable: true, retry_after_ms: retryMs } } } };
+        return {
+          results: phase === "healthy" ? ["Recovered Reports"] : [],
+          total_matches: phase === "healthy" ? 1 : 0,
+          directory_count: 1,
+          cache_state: "ready" as const,
+          monitoring_state: phase === "healthy" ? ("healthy" as const) : ("unavailable" as const),
+          retry_after_ms: phase === "healthy" ? null : retryMs,
+          search_contract_version: SEARCH_CONTRACT_VERSION,
+        };
+      }),
+    };
+    function RecoveryHarness({ source }: { source: string }) {
+      const provider = useDirectorySearchProvider(source, vi.fn(), { history });
+      return <UnifiedSearchBar provider={provider} />;
+    }
+    try {
+      const { rerender } = renderWithProvider(<RecoveryHarness source={connectionId} />);
+      const input = screen.getByRole("textbox");
+      await act(async () => input.focus());
+      fireEvent.change(input, { target: { value: "reports" } });
+      await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS));
+      expect(history.searchDirectories).toHaveBeenCalledWith(connectionId, "", expect.anything());
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      phase = "failed";
+      await act(() => vi.advanceTimersByTimeAsync(retryMs));
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      phase = "healthy";
+      await act(() => vi.advanceTimersByTimeAsync(retryMs));
+      expect(screen.getByRole("option", { name: /Recovered Reports/ })).toBeInTheDocument();
+      phase = "paused";
+      const replacement = connectionId === "connection-1" ? "local-C" : "connection-1";
+      rerender(
+        <SambeeThemeProvider>
+          <RecoveryHarness source={replacement} />
+        </SambeeThemeProvider>
+      );
+      await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS));
+      expect(history.searchDirectories).toHaveBeenCalledWith(replacement, expect.any(String), expect.anything());
+      expect(screen.queryByRole("option", { name: /Recovered Reports/ })).not.toBeInTheDocument();
+      fireEvent.keyDown(input, { key: "Escape" });
+      const calls = history.searchDirectories.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(retryMs * 3));
+      expect(history.searchDirectories).toHaveBeenCalledTimes(calls);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["pasted", "incremental"])("publishes selectable merged rows within the mocked %s-query timing budget", async (inputMode) => {
+    vi.useFakeTimers();
+    try {
+      const onNavigateDirectory = vi.fn();
+      const history = {
+        ...browserHistoryService,
+        searchRecentDirectories: vi.fn(async () => {
+          await new Promise((resolve) => setTimeout(resolve, MOCK_HISTORY_RESPONSE_MS));
+          return {
+            result_limit: 10,
+            results: [{ id: "recent", connection_id: "connection-1", path: "Reports", last_visited_at: "2026-01-01T00:00:00Z" }],
+          };
+        }),
+        searchDirectories: vi.fn(async () => {
+          await new Promise((resolve) => setTimeout(resolve, MOCK_INDEX_RESPONSE_MS));
+          return {
+            results: ["Reports", "Quarterly Reports"],
+            total_matches: 2,
+            directory_count: 100_000,
+            cache_state: "ready" as const,
+            search_contract_version: SEARCH_CONTRACT_VERSION,
+          };
+        }),
+      };
+      function DirectoryTimingHarness() {
+        const provider = useDirectorySearchProvider("connection-1", vi.fn(), { history, onNavigateDirectory });
+        return <UnifiedSearchBar provider={provider} />;
+      }
+      renderWithProvider(<DirectoryTimingHarness />);
+      const input = screen.getByRole("textbox");
+      if (inputMode === "incremental") {
+        for (const prefix of ["r", "re", "rep"]) {
+          fireEvent.change(input, { target: { value: prefix } });
+          await act(() => vi.advanceTimersByTimeAsync(INCREMENTAL_KEY_INTERVAL_MS));
+        }
+      }
+      const started = Date.now();
+      fireEvent.change(input, { target: { value: "reports" } });
+      await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS - 1));
+      expect(history.searchDirectories).not.toHaveBeenCalled();
+      expect(history.searchRecentDirectories).not.toHaveBeenCalled();
+      await act(() => vi.advanceTimersByTimeAsync(1 + MOCK_HISTORY_RESPONSE_MS));
+      expect(screen.getAllByRole("option")).toHaveLength(1);
+      expect(Date.now() - started).toBe(INPUT_DEBOUNCE_MS + MOCK_HISTORY_RESPONSE_MS);
+      await act(() => vi.advanceTimersByTimeAsync(MOCK_INDEX_RESPONSE_MS - MOCK_HISTORY_RESPONSE_MS));
+      expect(screen.getAllByRole("option")).toHaveLength(2);
+      expect(screen.getByRole("option", { name: /Quarterly Reports/ })).toBeInTheDocument();
+      expect(Date.now() - started).toBeLessThanOrEqual(VISIBLE_RESULTS_TARGET_MS);
+      expect(history.searchDirectories).toHaveBeenCalledTimes(1);
+      expect(history.searchRecentDirectories).toHaveBeenCalledTimes(1);
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(onNavigateDirectory).toHaveBeenCalledWith("connection-1", "Reports", "recent");
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not overlap quiet refreshes and gives new input priority over a blocked refresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const stableRows = [{ kind: "result" as const, id: "stable", value: "stable", icon: "directory" as const, primaryText: "Stable" }];
+      const freshRows = stableRows.map((row) => ({ ...row, id: "fresh", value: "fresh", primaryText: "Fresh" }));
+      let finishRefresh: ((rows: typeof stableRows) => void) | undefined;
+      const fetchResults = vi
+        .fn<SearchProvider["fetchResults"]>()
+        .mockResolvedValueOnce(stableRows)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishRefresh = resolve;
+            })
+        )
+        .mockResolvedValue(freshRows);
+      renderWithProvider(
+        <UnifiedSearchBar
+          provider={{
+            ...testProvider,
+            minQueryLength: 1,
+            debounceMs: INPUT_DEBOUNCE_MS,
+            fetchResults,
+            getRefreshIntervalMs: () => QUIET_REFRESH_INTERVAL_MS,
+          }}
+        />
+      );
+      const input = screen.getByPlaceholderText("Search");
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "stable" } });
+      await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS));
+      expect(fetchResults).toHaveBeenCalledTimes(1);
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS - 1));
+      expect(fetchResults).toHaveBeenCalledTimes(1);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS * 3));
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      expect(screen.getByText("Stable")).toBeInTheDocument();
+      const refreshSignal = fetchResults.mock.calls[1]?.[1];
+      fireEvent.change(input, { target: { value: "fresh" } });
+      expect(refreshSignal?.aborted).toBe(true);
+      await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS - 1));
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(fetchResults).toHaveBeenCalledTimes(3);
+      expect(fetchResults.mock.lastCall?.[0]).toBe("fresh");
+      expect(screen.getByText("Fresh")).toBeInTheDocument();
+      await act(async () => finishRefresh?.(stableRows));
+      expect(screen.queryByText("Stable")).not.toBeInTheDocument();
+      expect(screen.getByText("Fresh")).toBeInTheDocument();
+      expect(document.activeElement).toBe(input);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes without a foreground spinner and stops after dismissal", async () => {
+    const fetchResults = vi.fn(async () => [
+      { kind: "result" as const, id: "stable", value: "stable", icon: "directory" as const, primaryText: "Stable" },
+    ]);
+    render(
+      <SambeeThemeProvider>
+        <UnifiedSearchBar provider={{ ...testProvider, fetchResults, getRefreshIntervalMs: () => 500 }} />
+      </SambeeThemeProvider>
+    );
+    const input = screen.getByPlaceholderText("Search");
+    fireEvent.change(input, { target: { value: "stable" } });
+    await waitFor(() => expect(fetchResults).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchResults).toHaveBeenCalledTimes(2), { timeout: 1200 });
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.getByText("Stable")).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Escape" });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 550));
+    });
+    expect(fetchResults).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["", "reports"])("restarts recovery when a dismissed query '%s' is focused again", async (query) => {
+    vi.useFakeTimers();
+    try {
+      const fetchResults = vi
+        .fn<SearchProvider["fetchResults"]>()
+        .mockResolvedValue([{ kind: "result", id: "stable", value: "stable", icon: "directory", primaryText: "Stable" }]);
+      const onActivate = vi.fn();
+      renderWithProvider(
+        <UnifiedSearchBar
+          provider={{
+            ...testProvider,
+            minQueryLength: query ? 1 : 0,
+            fetchResults,
+            onActivate,
+            getRefreshIntervalMs: () => QUIET_REFRESH_INTERVAL_MS,
+          }}
+        />
+      );
+      const input = screen.getByPlaceholderText("Search");
+      await act(async () => input.focus());
+      if (query) {
+        fireEvent.change(input, { target: { value: query } });
+        await act(() => vi.advanceTimersByTimeAsync(INPUT_DEBOUNCE_MS));
+      }
+      expect(fetchResults).toHaveBeenCalledTimes(1);
+      fireEvent.keyDown(input, { key: "Escape" });
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS * 2));
+      expect(fetchResults).toHaveBeenCalledTimes(1);
+      act(() => input.blur());
+      await act(async () => input.focus());
+      expect(onActivate).toHaveBeenCalledTimes(2);
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      expect(fetchResults.mock.lastCall?.[0]).toBe(query);
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS));
+      expect(fetchResults).toHaveBeenCalledTimes(3);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("pauses hidden-tab work, resumes once, and cancels refresh on unmount", async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    try {
+      const rows = [{ kind: "result" as const, id: "stable", value: "stable", icon: "directory" as const, primaryText: "Stable" }];
+      let finishHiddenRequest: ((results: typeof rows) => void) | undefined;
+      const fetchResults = vi
+        .fn<SearchProvider["fetchResults"]>()
+        .mockResolvedValueOnce(rows)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishHiddenRequest = resolve;
+            })
+        )
+        .mockResolvedValue(rows);
+      const { unmount } = renderWithProvider(
+        <UnifiedSearchBar provider={{ ...testProvider, fetchResults, getRefreshIntervalMs: () => QUIET_REFRESH_INTERVAL_MS }} />
+      );
+      const input = screen.getByPlaceholderText("Search");
+      fireEvent.change(input, { target: { value: "stable" } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS));
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      visibility.mockReturnValue("hidden");
+      act(() => document.dispatchEvent(new Event("visibilitychange")));
+      expect(fetchResults.mock.calls[1]?.[1].aborted).toBe(true);
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS * 3));
+      expect(fetchResults).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      visibility.mockReturnValue("visible");
+      await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+      expect(fetchResults).toHaveBeenCalledTimes(3);
+      await act(async () => finishHiddenRequest?.(rows.map((row) => ({ ...row, primaryText: "Obsolete" }))));
+      expect(screen.queryByText("Obsolete")).not.toBeInTheDocument();
+      expect(screen.getByText("Stable")).toBeInTheDocument();
+      unmount();
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS * 3));
+      expect(fetchResults).toHaveBeenCalledTimes(3);
+    } finally {
+      cleanup();
+      visibility.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects old-source publications and cancels in-flight work on source replacement", async () => {
+    vi.useFakeTimers();
+    try {
+      const oldRows = [{ kind: "result" as const, id: "old", value: "old", icon: "directory" as const, primaryText: "Old source" }];
+      const newRows = oldRows.map((row) => ({ ...row, id: "new", value: "new", primaryText: "New source" }));
+      let finishOld: ((rows: typeof oldRows) => void) | undefined;
+      let publishOld: SearchResultsUpdate | undefined;
+      const onDeactivate = vi.fn();
+      const oldFetch = vi.fn<SearchProvider["fetchResults"]>().mockImplementation(
+        (_query, _signal, onUpdate) =>
+          new Promise((resolve) => {
+            publishOld = onUpdate;
+            finishOld = resolve;
+          })
+      );
+      const oldProvider = { ...testProvider, sourceKey: "old-source", minQueryLength: 1, fetchResults: oldFetch, onDeactivate };
+      const newFetch = vi.fn<SearchProvider["fetchResults"]>().mockResolvedValue(newRows);
+      const newProvider = { ...oldProvider, sourceKey: "new-source", fetchResults: newFetch };
+      const { rerender } = renderWithProvider(<UnifiedSearchBar provider={oldProvider} />);
+      const input = screen.getByPlaceholderText("Search");
+      act(() => input.focus());
+      fireEvent.change(input, { target: { value: "old" } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(oldFetch).toHaveBeenCalledTimes(1);
+      rerender(
+        <SambeeThemeProvider>
+          <UnifiedSearchBar provider={newProvider} />
+        </SambeeThemeProvider>
+      );
+      expect(oldFetch.mock.calls[0]?.[1].aborted).toBe(true);
+      expect(onDeactivate).toHaveBeenCalledTimes(1);
+      expect(input).toHaveValue("");
+      fireEvent.change(input, { target: { value: "new" } });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.getByText("New source")).toBeInTheDocument();
+      await act(async () => {
+        publishOld?.(oldRows);
+        finishOld?.(oldRows);
+      });
+      expect(screen.queryByText("Old source")).not.toBeInTheDocument();
+      expect(screen.getByText("New source")).toBeInTheDocument();
+      expect(document.activeElement).toBe(input);
+      await act(() => vi.advanceTimersByTimeAsync(QUIET_REFRESH_INTERVAL_MS * 3));
+      expect(oldFetch).toHaveBeenCalledTimes(1);
+      expect(newFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps accepted rows and stops refresh after a quiet request fails", async () => {
+    const fetchResults = vi
+      .fn()
+      .mockResolvedValueOnce([{ kind: "result", id: "stable", value: "stable", icon: "directory", primaryText: "Stable" }])
+      .mockRejectedValue(new Error("offline"));
+    render(
+      <SambeeThemeProvider>
+        <UnifiedSearchBar provider={{ ...testProvider, fetchResults, getRefreshIntervalMs: () => 500 }} />
+      </SambeeThemeProvider>
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search"), { target: { value: "stable" } });
+    await waitFor(() => expect(fetchResults).toHaveBeenCalledTimes(2), { timeout: 1200 });
+    expect(screen.getByText("Stable")).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 550));
+    });
+    expect(fetchResults).toHaveBeenCalledTimes(2);
+  });
+
   afterEach(async () => {
+    cleanup();
     virtualizerSizeCache.clear();
+    virtualizerScrollToOffset.mockClear();
     await setLocale("en");
   });
 
@@ -324,9 +694,136 @@ describe("UnifiedSearchBar", () => {
     await user.click(searchInput);
 
     await waitFor(() => {
-      expect(fetchResults).toHaveBeenCalledWith("", expect.any(AbortSignal));
+      expect(fetchResults).toHaveBeenCalledWith("", expect.any(AbortSignal), expect.any(Function));
     });
     expect(screen.queryByText("Loading history")).not.toBeInTheDocument();
+  });
+
+  it("opens status details by pointer without changing the query or list selection", async () => {
+    const user = userEvent.setup();
+    const loadDetails = vi.fn(async () => ({
+      source: "FS1",
+      issues: [{ path: "private", code: "access_denied" as const }],
+      incomplete: true,
+    }));
+    const status = { label: "FS1: not all directories could be indexed.", showSpinner: false, loadDetails };
+    renderWithProvider(<UnifiedSearchBar provider={{ ...footerProvider, getStatusInfo: () => status }} />);
+    const input = screen.getByRole("textbox");
+    await user.click(input);
+    await user.type(input, "reports");
+    const link = await screen.findByRole("link", { name: "details" });
+    expect(link.parentElement).toHaveTextContent("FS1: not all directories could be indexed (details).");
+    expect(link).toHaveAttribute("tabindex", "-1");
+    expect(link.querySelector("svg")).toBeNull();
+    expect(loadDetails).not.toHaveBeenCalled();
+    const selection = input.getAttribute("aria-activedescendant");
+    await user.click(link);
+    expect(await screen.findByRole("dialog", { name: "Directory Search Status" })).toBeInTheDocument();
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(await screen.findByText("private")).toBeInTheDocument();
+    expect(screen.getByText("Access denied")).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: "Affected locations" })).toBeInTheDocument();
+    expect(screen.getByText("Containing directory")).toBeInTheDocument();
+    expect(screen.getByText("Only a sample of affected locations is shown. More directories may be affected.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toHaveValue("reports");
+    expect(input.getAttribute("aria-activedescendant")).toBe(selection);
+    expect(screen.getByRole("option", { name: "Documents" })).toBeInTheDocument();
+  });
+
+  it.each(["stale", "failed"])("shows %s details without losing the quick-bar query", async (outcome) => {
+    const user = userEvent.setup();
+    const status = {
+      label: "FS1: not all directories could be indexed.",
+      showSpinner: false,
+      loadDetails:
+        outcome === "stale"
+          ? async () => ({ source: "FS1", issues: [] })
+          : async () => {
+              throw new Error("Disconnected");
+            },
+    };
+    renderWithProvider(<UnifiedSearchBar provider={{ ...footerProvider, getStatusInfo: () => status }} />);
+    const input = screen.getByRole("textbox");
+    await user.click(input);
+    await user.type(input, "reports");
+    await user.click(await screen.findByRole("link", { name: "details" }));
+    const message =
+      outcome === "stale"
+        ? "These details are no longer available. Refresh the status."
+        : "Could not load status details. Check the source connection and reopen this dialog.";
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toHaveValue("reports");
+  });
+
+  it("leaves statuses without additional information as plain text", async () => {
+    const user = userEvent.setup();
+    const status = { label: "FS1: not all directories could be indexed.", showSpinner: false };
+    renderWithProvider(<UnifiedSearchBar provider={{ ...footerProvider, getStatusInfo: () => status }} />);
+    await user.click(screen.getByRole("textbox"));
+    await user.type(screen.getByRole("textbox"), "reports");
+    expect(await screen.findByText(status.label)).toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    await user.click(screen.getByText(status.label));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("publishes selectable rows before the final response and rejects old-query updates", async () => {
+    const user = userEvent.setup();
+    const updates = new Map<string, SearchResultsUpdate>();
+    const provider: SearchProvider = {
+      ...testProvider,
+      fetchResults: async (query, _signal, onUpdate) => {
+        if (onUpdate) updates.set(query, onUpdate);
+        return new Promise<never>(() => undefined);
+      },
+    };
+    renderWithProvider(<UnifiedSearchBar provider={provider} />);
+    const input = screen.getByRole("textbox");
+    await user.click(input);
+    await user.type(input, "a");
+    await waitFor(() => expect(updates.has("a")).toBe(true));
+    act(() =>
+      updates.get("a")?.([{ kind: "result", id: "history", value: "history", icon: "recent-directory", primaryText: "Available history" }])
+    );
+    expect(await screen.findByRole("option", { name: "Available history" })).toBeInTheDocument();
+    await user.type(input, "b");
+    act(() => updates.get("a")?.([{ kind: "result", id: "stale", value: "stale", icon: "directory", primaryText: "Stale result" }]));
+    expect(screen.queryByRole("option", { name: "Stale result" })).not.toBeInTheDocument();
+  });
+
+  it("preserves the selected value when a complete-array update inserts a row", async () => {
+    const user = userEvent.setup();
+    let update: SearchResultsUpdate | undefined;
+    const onSelect = vi.fn();
+    const provider: SearchProvider = {
+      ...testProvider,
+      onSelect,
+      fetchResults: async (_query, _signal, onUpdate) => {
+        update = onUpdate;
+        return new Promise<never>(() => undefined);
+      },
+    };
+    const selected = {
+      kind: "result" as const,
+      id: "history",
+      value: "history",
+      icon: "recent-directory" as const,
+      primaryText: "History",
+    };
+    renderWithProvider(<UnifiedSearchBar provider={provider} />);
+    const input = screen.getByRole("textbox");
+    await user.click(input);
+    await user.type(input, "a");
+    await waitFor(() => expect(update).toBeTypeOf("function"));
+    act(() => update?.([selected]));
+    await screen.findByRole("option", { name: "History" });
+    act(() => update?.([{ kind: "result", id: "new", value: "new", icon: "directory", primaryText: "New directory" }, selected]));
+    await user.keyboard("{Enter}");
+    expect(onSelect).toHaveBeenCalledWith("history", "associated-viewer");
   });
 
   it("hides shortcut hints without hiding footer information", async () => {
@@ -507,6 +1004,16 @@ describe("UnifiedSearchBar", () => {
     });
   });
 
+  it("describes the quick-bar mode selector", async () => {
+    const user = userEvent.setup();
+
+    renderWithProvider(<UnifiedSearchBar provider={noResultsProvider} modeOptions={modeOptions} />);
+
+    await user.hover(screen.getByRole("button", { name: "Switch quick bar mode" }));
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Switch quick bar mode");
+  });
+
   it("supports arrow navigation in the mode menu after clicking from File Search with typed input", async () => {
     const user = userEvent.setup();
 
@@ -575,6 +1082,168 @@ describe("UnifiedSearchBar", () => {
     });
   });
 
+  it("fetches file history when the source updates during first activation", async () => {
+    const searchRecentFiles = vi.spyOn(browserHistoryService, "searchRecentFiles").mockResolvedValue({ results: [], result_limit: 50 });
+    const initialFiles: FileEntry[] = [];
+    const loadedFiles = [{ name: "report.txt", type: FileType.FILE }] as FileEntry[];
+    function SearchHarness({ active }: { active: boolean }) {
+      const fileProvider = useFileSearchProvider({
+        connectionId: "connection-1",
+        currentPath: "",
+        files: active ? loadedFiles : initialFiles,
+        connectionName: "Demo",
+        resultLimit: 50,
+        getConnectionName: () => "Demo",
+        onOpenCurrentFile: vi.fn(),
+        onOpenRecentFile: vi.fn(),
+      });
+      return <UnifiedSearchBar provider={active ? fileProvider : resultsProvider} activationToken={active ? 1 : 0} />;
+    }
+    const { rerender } = renderWithProvider(<SearchHarness active={false} />);
+
+    rerender(
+      <SambeeThemeProvider>
+        <SearchHarness active />
+      </SambeeThemeProvider>
+    );
+    await act(async () => screen.getByRole("textbox").focus());
+
+    expect(await screen.findByRole("option", { name: /report.txt/ })).toBeInTheDocument();
+    expect(searchRecentFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for file history before opening the initial file-search menu", async () => {
+    const user = userEvent.setup();
+    let releaseHistory = () => {};
+    vi.spyOn(browserHistoryService, "searchRecentFiles").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseHistory = () => resolve({ results: [], result_limit: 50 });
+        })
+    );
+    const files = [{ name: "report.txt", type: FileType.FILE }] as FileEntry[];
+    function SearchHarness() {
+      const provider = useFileSearchProvider({
+        connectionId: "connection-1",
+        currentPath: "",
+        files,
+        connectionName: "Demo",
+        resultLimit: 50,
+        getConnectionName: () => "Demo",
+        onOpenCurrentFile: vi.fn(),
+        onOpenRecentFile: vi.fn(),
+      });
+      return <UnifiedSearchBar provider={provider} />;
+    }
+    renderWithProvider(<SearchHarness />);
+
+    await user.click(screen.getByRole("textbox"));
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+
+    await act(async () => releaseHistory());
+    expect(await screen.findByRole("option", { name: /report.txt/ })).toBeInTheDocument();
+  });
+
+  it("starts one search when shortcut activation is followed by input focus", async () => {
+    const fetchResults = vi.fn<SearchProvider["fetchResults"]>(() => new Promise<[]>(() => {}));
+    const onActivate = vi.fn();
+    const provider = { ...resultsProvider, fetchResults, onActivate };
+    const { rerender } = renderWithProvider(<UnifiedSearchBar provider={provider} activationToken={0} />);
+
+    rerender(
+      <SambeeThemeProvider>
+        <UnifiedSearchBar provider={provider} activationToken={1} />
+      </SambeeThemeProvider>
+    );
+    await act(async () => screen.getByRole("textbox").focus());
+
+    expect(onActivate).toHaveBeenCalledTimes(1);
+    expect(fetchResults).toHaveBeenCalledTimes(1);
+    expect(onActivate.mock.invocationCallOrder[0]).toBeLessThan(fetchResults.mock.invocationCallOrder[0] ?? 0);
+    expect(fetchResults.mock.calls[0]?.[1]?.aborted).toBe(false);
+  });
+
+  it.each(["suppressDropdown", "disableDropdown"] as const)("preserves the query when %s is cleared", async (prop) => {
+    const user = userEvent.setup();
+    const fetchResults = vi.fn<SearchProvider["fetchResults"]>(async (query) => [
+      {
+        kind: "result",
+        id: query || "all-commands",
+        value: query || "all-commands",
+        icon: "command",
+        primaryText: query || "All commands",
+      },
+    ]);
+    const provider = { ...commandsProvider, fetchResults };
+    const { rerender } = renderWithProvider(<UnifiedSearchBar provider={provider} />);
+
+    await user.click(screen.getByRole("textbox"));
+    await user.type(screen.getByRole("textbox"), "rename");
+    expect(await screen.findByRole("option", { name: "rename" })).toBeInTheDocument();
+
+    rerender(
+      <SambeeThemeProvider>
+        <UnifiedSearchBar provider={provider} {...{ [prop]: true }} />
+      </SambeeThemeProvider>
+    );
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    fetchResults.mockClear();
+
+    rerender(
+      <SambeeThemeProvider>
+        <UnifiedSearchBar provider={provider} {...{ [prop]: false }} />
+      </SambeeThemeProvider>
+    );
+
+    expect(await screen.findByRole("option", { name: "rename" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("rename");
+    expect(fetchResults).toHaveBeenCalledTimes(1);
+    expect(fetchResults.mock.calls[0]?.[0]).toBe("rename");
+  });
+
+  it.each([
+    { grouped: false, shortcut: true, close: true },
+    { grouped: true, shortcut: true, close: true },
+    { grouped: false, shortcut: false, close: true },
+    { grouped: true, shortcut: false, close: true },
+    { grouped: false, shortcut: true, close: false },
+    { grouped: true, shortcut: true, close: false },
+  ])("resets results on activation (grouped: $grouped, shortcut: $shortcut, close: $close)", async ({ grouped, shortcut, close }) => {
+    const user = userEvent.setup();
+    const groupedProvider = createGroupedProvider(vi.fn());
+    const provider = {
+      ...groupedProvider,
+      fetchResults: async (query: string, signal: AbortSignal) =>
+        (await groupedProvider.fetchResults(query, signal)).filter((result) => grouped || result.kind === "result"),
+    };
+    const { rerender } = renderWithProvider(<UnifiedSearchBar provider={provider} activationToken={0} />);
+    const searchInput = screen.getByRole("textbox");
+
+    await user.click(searchInput);
+    expect(await screen.findByRole("option", { name: /Quarterly report/ })).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByRole("option", { name: /Annual report/ })).toHaveAttribute("aria-selected", "true");
+    if (close) {
+      await user.keyboard("{Escape}");
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    }
+    virtualizerScrollToOffset.mockClear();
+
+    if (shortcut) {
+      rerender(
+        <SambeeThemeProvider>
+          <UnifiedSearchBar provider={provider} activationToken={1} />
+        </SambeeThemeProvider>
+      );
+    } else {
+      fireEvent.blur(searchInput);
+      fireEvent.focus(searchInput);
+    }
+
+    expect(await screen.findByRole("option", { name: /Quarterly report/ })).toHaveAttribute("aria-selected", "true");
+    expect(virtualizerScrollToOffset).toHaveBeenCalledWith(0);
+  });
+
   it("reopens the commands dropdown when the same mode is reactivated from outside the quick bar", async () => {
     const user = userEvent.setup();
 
@@ -595,7 +1264,7 @@ describe("UnifiedSearchBar", () => {
     });
 
     const outsideTarget = screen.getByRole("button", { name: "File list focus target" });
-    outsideTarget.focus();
+    await user.click(outsideTarget);
     expect(outsideTarget).toHaveFocus();
 
     rerender(
@@ -655,7 +1324,7 @@ describe("UnifiedSearchBar", () => {
     expect(searchInput).toHaveValue("ab");
 
     const outsideTarget = screen.getByRole("button", { name: "Outside focus target" });
-    outsideTarget.focus();
+    await user.click(outsideTarget);
     expect(outsideTarget).toHaveFocus();
 
     rerender(

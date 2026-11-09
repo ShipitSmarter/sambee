@@ -70,6 +70,17 @@ export const COMMON_SHORTCUTS = {
     ctrl: true,
     allowInInput: true,
   },
+  RETRY_EDITING: {
+    id: "retry-editing",
+    keys: ["r", "R"],
+    get description() {
+      return translate("viewer.text.retryEditing");
+    },
+    label: "Ctrl+R",
+    helpGroup: "editing",
+    ctrl: true,
+    allowInInput: true,
+  },
 
   //
   // Search
@@ -419,6 +430,17 @@ export const MARKDOWN_EDITOR_SHORTCUTS = {
  * File browser specific shortcuts
  */
 export const BROWSER_SHORTCUTS = {
+  OPEN_LOCATION_IN_NEW_TAB: {
+    id: "open-location-in-new-tab",
+    keys: ["t", "T"],
+    ctrl: true,
+    alt: true,
+    get description() {
+      return translate("fileBrowser.shortcuts.openLocationInNewTab");
+    },
+    label: "Ctrl+Alt+T",
+    helpGroup: "navigation",
+  },
   //
   // Navigation
   //
@@ -546,6 +568,26 @@ export const BROWSER_SHORTCUTS = {
     helpGroup: "general",
     ctrl: true,
   },
+  UPLOAD: {
+    id: "upload-files",
+    keys: "u",
+    get description() {
+      return translate("fileBrowser.shortcuts.upload");
+    },
+    label: "Ctrl+U",
+    helpGroup: "fileActions",
+    ctrl: true,
+  },
+  DOWNLOAD: {
+    id: "download-items",
+    keys: "d",
+    get description() {
+      return translate("fileBrowser.shortcuts.download");
+    },
+    label: "Ctrl+D",
+    helpGroup: "fileActions",
+    ctrl: true,
+  },
   DELETE_ITEM: {
     id: "delete-item",
     keys: "Delete",
@@ -669,6 +711,26 @@ export const SELECTION_SHORTCUTS = {
     helpGroup: "selection",
     shift: true,
   },
+  SELECT_TO_FIRST: {
+    id: "select-to-first",
+    keys: "Home",
+    get description() {
+      return translate("fileBrowser.shortcuts.selectToFirst");
+    },
+    label: "Shift+Home",
+    helpGroup: "selection",
+    shift: true,
+  },
+  SELECT_TO_LAST: {
+    id: "select-to-last",
+    keys: "End",
+    get description() {
+      return translate("fileBrowser.shortcuts.selectToLast");
+    },
+    label: "Shift+End",
+    helpGroup: "selection",
+    shift: true,
+  },
   SELECT_ALL: {
     id: "select-all",
     keys: "a",
@@ -709,6 +771,26 @@ export const COPY_MOVE_SHORTCUTS = {
  * Dual-pane layout shortcuts (Norton Commander style)
  */
 export const PANE_SHORTCUTS = {
+  MATCH_LEFT_LOCATION: {
+    id: "match-left-pane-location",
+    keys: "ArrowLeft",
+    ctrl: true,
+    get description() {
+      return translate("fileBrowser.shortcuts.matchLeftPaneLocation");
+    },
+    label: "Ctrl+Left",
+    helpGroup: "panes",
+  },
+  MATCH_RIGHT_LOCATION: {
+    id: "match-right-pane-location",
+    keys: "ArrowRight",
+    ctrl: true,
+    get description() {
+      return translate("fileBrowser.shortcuts.matchRightPaneLocation");
+    },
+    label: "Ctrl+Right",
+    helpGroup: "panes",
+  },
   TOGGLE_DUAL_PANE: {
     id: "toggle-dual-pane",
     keys: "b",
@@ -719,26 +801,6 @@ export const PANE_SHORTCUTS = {
     helpGroup: "panes",
     ctrl: true,
     allowInInput: true,
-  },
-  FOCUS_LEFT_PANE: {
-    id: "focus-left-pane",
-    keys: "1",
-    get description() {
-      return translate("fileBrowser.shortcuts.focusLeftPane");
-    },
-    label: "Ctrl+1",
-    helpGroup: "panes",
-    ctrl: true,
-  },
-  FOCUS_RIGHT_PANE: {
-    id: "focus-right-pane",
-    keys: "2",
-    get description() {
-      return translate("fileBrowser.shortcuts.focusRightPane");
-    },
-    label: "Ctrl+2",
-    helpGroup: "panes",
-    ctrl: true,
   },
   SWITCH_PANE: {
     id: "switch-pane",

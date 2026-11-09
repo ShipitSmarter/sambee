@@ -1,9 +1,11 @@
 import type { Virtualizer } from "@tanstack/react-virtual";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale, translate } from "../../../i18n";
+import { requireTestValue } from "../../../test/helpers/assertions";
 import { FILE_BROWSER_ROW_HEIGHT } from "../../../theme/constants";
-import type { FileEntry } from "../../../types";
+import { type FileEntry, FileType } from "../../../types";
 import { FileList } from "../FileList";
 
 const rowVirtualizerStub = {
@@ -22,7 +24,54 @@ const fileRowStylesStub = {
 
 describe("FileList", () => {
   afterEach(async () => {
+    cleanup();
     await setLocale("en");
+  });
+
+  it("dismisses desktop selection on row or empty space without opening during the same gesture", () => {
+    const file: FileEntry = {
+      name: "readme.txt",
+      path: "readme.txt",
+      type: FileType.FILE,
+      is_readable: true,
+      is_hidden: false,
+    };
+    const virtualizer = {
+      getVirtualItems: () => [{ index: 0, key: "file-0", start: 0, size: 40 }],
+      getTotalSize: () => 40,
+    } as unknown as Virtualizer<HTMLDivElement, Element>;
+    const onFileClick = vi.fn();
+    const onClearSelection = vi.fn();
+    const renderList = (selectedFiles: Set<string>) => (
+      <FileList
+        files={[file]}
+        focusedIndex={0}
+        selectedFiles={selectedFiles}
+        onFileClick={onFileClick}
+        onIconClick={vi.fn()}
+        onClearSelection={onClearSelection}
+        rowVirtualizer={virtualizer}
+        parentRef={{ current: null }}
+        listContainerRef={() => {}}
+        fileRowStyles={fileRowStylesStub}
+        viewMode="list"
+      />
+    );
+    const { rerender } = render(renderList(new Set([file.path])));
+    const row = screen.getByRole("button", { name: /readme.txt/i });
+    fireEvent.click(row, { detail: 1 });
+    expect(onClearSelection).toHaveBeenCalledTimes(1);
+    expect(onFileClick).not.toHaveBeenCalled();
+
+    rerender(renderList(new Set()));
+    fireEvent.click(row, { detail: 2 });
+    expect(onFileClick).not.toHaveBeenCalled();
+    fireEvent.click(row, { detail: 1 });
+    expect(onFileClick).toHaveBeenCalledWith(file, 0);
+
+    rerender(renderList(new Set([file.path])));
+    fireEvent.click(screen.getByTestId("virtual-list"));
+    expect(onClearSelection).toHaveBeenCalledTimes(2);
   });
 
   it("renders the translated empty state", async () => {
@@ -78,7 +127,7 @@ describe("FileList", () => {
       {
         name: "readme.txt",
         path: "readme.txt",
-        type: "file",
+        type: FileType.FILE,
         size: 123,
         mime_type: "text/plain",
         modified_at: "2026-07-15T00:00:00Z",
@@ -106,12 +155,13 @@ describe("FileList", () => {
     expect(measureElement).not.toHaveBeenCalled();
   });
 
-  it("opens compact item actions from the visible more actions button", () => {
+  it("opens compact item actions from the visible more actions button", async () => {
+    const user = userEvent.setup();
     const files: FileEntry[] = [
       {
         name: "readme.txt",
         path: "readme.txt",
-        type: "file",
+        type: FileType.FILE,
         size: 123,
         modified_at: "2026-07-15T00:00:00Z",
         is_readable: true,
@@ -148,8 +198,8 @@ describe("FileList", () => {
       />
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "More actions for readme.txt" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Select" }));
+    await user.click(screen.getByRole("button", { name: "More actions for readme.txt" }));
+    await user.click(screen.getByRole("menuitem", { name: "Select" }));
 
     expect(onSelectItem).toHaveBeenCalledWith(files[0], 0);
     expect(onFileClick).not.toHaveBeenCalled();
@@ -161,7 +211,7 @@ describe("FileList", () => {
       {
         name: "readme.txt",
         path: "readme.txt",
-        type: "file",
+        type: FileType.FILE,
         size: 123,
         modified_at: "2026-07-15T00:00:00Z",
         is_readable: true,
@@ -178,7 +228,7 @@ describe("FileList", () => {
       <FileList
         files={files}
         focusedIndex={0}
-        selectedFiles={new Set([files[0].path])}
+        selectedFiles={new Set([requireTestValue(files[0]).path])}
         onFileClick={() => {}}
         onToggleItemSelection={onToggleItemSelection}
         onSelectItem={() => {}}
@@ -206,7 +256,7 @@ describe("FileList", () => {
       {
         name: "readme.txt",
         path: "readme.txt",
-        type: "file",
+        type: FileType.FILE,
         size: 123,
         modified_at: "2026-07-15T00:00:00Z",
         is_readable: true,
@@ -218,7 +268,7 @@ describe("FileList", () => {
       <FileList
         files={files}
         focusedIndex={0}
-        selectedFiles={new Set([files[0].path])}
+        selectedFiles={new Set([requireTestValue(files[0]).path])}
         onFileClick={() => {}}
         compactOverlay={<div data-testid="selection-dock-overlay" />}
         compactOverlayLayout="dock"
@@ -240,7 +290,7 @@ describe("FileList", () => {
       {
         name: "backup.zip",
         path: "backup.zip",
-        type: "file",
+        type: FileType.FILE,
         size: 123,
         modified_at: "2026-07-15T00:00:00Z",
         is_readable: true,

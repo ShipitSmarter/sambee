@@ -1,6 +1,8 @@
+import { availableParallelism, totalmem } from "node:os";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
+import { ciWorkerCount } from "./scripts/ci-test-policy.mjs";
 
 export default defineConfig({
   plugins: [react()],
@@ -8,11 +10,17 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
+    server: {
+      deps: {
+        inline: ["react-pdf"],
+      },
+    },
     css: true,
     exclude: ["e2e/**", "node_modules/**", "dist/**"],
     // Enable parallel file execution for better performance
     // Uses threads by default with fileParallelism enabled
     fileParallelism: true,
+    maxWorkers: process.env["SAMBEE_TEST_CI"] === "1" ? ciWorkerCount(availableParallelism(), totalmem()) : undefined,
     // Maximum number of concurrent test files
     maxConcurrency: 5,
     // Timeout for each test (default is 5000ms)
@@ -33,8 +41,9 @@ export default defineConfig({
     },
   },
   resolve: {
-    alias: {
-      "@": fileURLToPath(new URL("./src", import.meta.url)),
-    },
+    alias: [
+      { find: /^pdfjs-dist$/, replacement: "pdfjs-dist/legacy/build/pdf.mjs" },
+      { find: "@", replacement: fileURLToPath(new URL("./src", import.meta.url)) },
+    ],
   },
 });

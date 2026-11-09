@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale } from "../../../i18n";
@@ -7,6 +7,7 @@ import { SortControls } from "../SortControls";
 
 describe("SortControls", () => {
   afterEach(async () => {
+    cleanup();
     await setLocale("en");
   });
 
@@ -21,6 +22,20 @@ describe("SortControls", () => {
 
     expect(screen.getByRole("button", { name: "[Šóŕť óṕťíóńš]" })).toBeInTheDocument();
     expect(screen.getByText("[Šížé]")).toBeInTheDocument();
+  });
+
+  it("describes the sort menu trigger", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <SambeeThemeProvider>
+        <SortControls sortBy="name" onSortChange={vi.fn()} sortDirection="asc" onDirectionChange={vi.fn()} />
+      </SambeeThemeProvider>
+    );
+
+    await user.hover(screen.getByRole("button", { name: "Sort options" }));
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Sort options");
   });
 
   it.each([

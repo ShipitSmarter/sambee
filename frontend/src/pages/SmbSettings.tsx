@@ -157,8 +157,8 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               onChange={(event) => void persistField({ field: "authentication_mode", value: event.target.value as SmbAuthenticationMode })}
               onFocus={() => restoreAuthenticationModeFocus()}
               disabled={persistence.isPending("authentication_mode")}
-              error={Boolean(persistence.fieldErrors.authentication_mode)}
-              helperText={persistence.fieldErrors.authentication_mode ?? t("settings.smbSettings.helper.authenticationMode")}
+              error={Boolean(persistence.fieldErrors["authentication_mode"])}
+              helperText={persistence.fieldErrors["authentication_mode"] ?? t("settings.smbSettings.helper.authenticationMode")}
               slotProps={{ input: { endAdornment: getStatusAdornment("authentication_mode") } }}
             >
               <MenuItem value="negotiate">{t("settings.smbSettings.options.negotiate")}</MenuItem>
@@ -172,8 +172,8 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               onChange={(event) => void persistField({ field: "encryption_mode", value: event.target.value as SmbEncryptionMode })}
               onFocus={() => restoreEncryptionModeFocus()}
               disabled={persistence.isPending("encryption_mode")}
-              error={Boolean(persistence.fieldErrors.encryption_mode)}
-              helperText={persistence.fieldErrors.encryption_mode ?? t("settings.smbSettings.helper.encryptionMode")}
+              error={Boolean(persistence.fieldErrors["encryption_mode"])}
+              helperText={persistence.fieldErrors["encryption_mode"] ?? t("settings.smbSettings.helper.encryptionMode")}
               slotProps={{ input: { endAdornment: getStatusAdornment("encryption_mode") } }}
             >
               <MenuItem value="signing_only">{t("settings.smbSettings.options.signingOnly")}</MenuItem>
@@ -191,8 +191,8 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               }}
               onBlur={() => void persistField({ field: "domain_controller_primary", value: primaryDomainController.trim() })}
               disabled={persistence.isPending("domain_controller_primary")}
-              error={Boolean(persistence.fieldErrors.domain_controller_primary)}
-              helperText={persistence.fieldErrors.domain_controller_primary ?? t("settings.smbSettings.helper.domainController")}
+              error={Boolean(persistence.fieldErrors["domain_controller_primary"])}
+              helperText={persistence.fieldErrors["domain_controller_primary"] ?? t("settings.smbSettings.helper.domainController")}
               slotProps={{ htmlInput: { maxLength: 253 }, input: { endAdornment: getStatusAdornment("domain_controller_primary") } }}
             />
             <TextField
@@ -205,8 +205,8 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               }}
               onBlur={() => void persistField({ field: "domain_controller_secondary", value: secondaryDomainController.trim() })}
               disabled={persistence.isPending("domain_controller_secondary")}
-              error={Boolean(persistence.fieldErrors.domain_controller_secondary)}
-              helperText={persistence.fieldErrors.domain_controller_secondary ?? t("settings.smbSettings.helper.domainController")}
+              error={Boolean(persistence.fieldErrors["domain_controller_secondary"])}
+              helperText={persistence.fieldErrors["domain_controller_secondary"] ?? t("settings.smbSettings.helper.domainController")}
               slotProps={{ htmlInput: { maxLength: 253 }, input: { endAdornment: getStatusAdornment("domain_controller_secondary") } }}
             />
           </SettingsGroup>
@@ -229,11 +229,11 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               }}
               disabled={persistence.isPending("connection_timeout_seconds")}
               error={
-                Boolean(persistence.fieldErrors.connection_timeout_seconds) ||
+                Boolean(persistence.fieldErrors["connection_timeout_seconds"]) ||
                 Boolean(touchedFields.connection_timeout_seconds && !hasValidConnectionTimeout)
               }
               helperText={
-                persistence.fieldErrors.connection_timeout_seconds ??
+                persistence.fieldErrors["connection_timeout_seconds"] ??
                 (touchedFields.connection_timeout_seconds && !hasValidConnectionTimeout
                   ? t("settings.smbSettings.connectionTimeoutError")
                   : t("settings.smbSettings.helper.connectionTimeout"))
@@ -263,11 +263,11 @@ export function SmbSettings({ dialogSafeHeader = false }: SmbSettingsProps) {
               }}
               disabled={persistence.isPending("read_chunk_size_bytes")}
               error={
-                Boolean(persistence.fieldErrors.read_chunk_size_bytes) ||
+                Boolean(persistence.fieldErrors["read_chunk_size_bytes"]) ||
                 Boolean(touchedFields.read_chunk_size_bytes && !hasValidReadChunkSize)
               }
               helperText={
-                persistence.fieldErrors.read_chunk_size_bytes ??
+                persistence.fieldErrors["read_chunk_size_bytes"] ??
                 (touchedFields.read_chunk_size_bytes && !hasValidReadChunkSize
                   ? t("settings.smbSettings.readChunkSizeError")
                   : t("settings.smbSettings.helper.readChunkSize"))

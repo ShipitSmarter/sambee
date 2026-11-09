@@ -1,4 +1,5 @@
 import axios, { type AxiosError, type AxiosInstance, type AxiosRequestConfig } from "axios";
+import type { ThemeConfig } from "../theme/types";
 import type {
   AboutSettings,
   AdminUser,
@@ -28,6 +29,9 @@ import type {
   CurrentAccount,
   CurrentUserSettings,
   CurrentUserSettingsUpdate,
+  DirectoryIndexPolicyScope,
+  DirectoryIndexSettings,
+  DirectoryIndexSettingUpdate,
   DirectoryListing,
   DirectorySearchResult,
   EditLockInfo,
@@ -57,6 +61,9 @@ import type {
   SmbSettingsUpdate,
   User,
 } from "../types";
+import { FileType } from "../types";
+import type { CompanionSettingsGrant, CompanionSettingsGrantBinding, CompanionSettingsMetadata } from "../types/companionSettings";
+import { randomUuid } from "../utils/randomUuid";
 import { AuthSessionError, authSession } from "./authSession";
 import {
   getBackendAvailabilitySnapshot,
@@ -70,32 +77,54 @@ import { getBaseUrl, getBrowseSegment, isLocalDrive } from "./backendRouter";
 import { clearBrowserRecoverySnapshot } from "./browserRecoverySnapshot";
 import { COMPANION_BASE_URL } from "./companion";
 import { companionSession } from "./companionSession";
+import { notifyCompanionSettingsChanged } from "./companionSettingsEvents";
 import { snapshotRegisteredDrafts } from "./draftRecovery";
 import { logger } from "./logger";
-import type { ContentTransferResult, TargetResolutionPolicy } from "./storageContracts";
+import { sanitizeReturnPath } from "./oidcAuth";
+import { setPasswordChangeRequired } from "./passwordChange";
+import { type ContentTransferResult, ExpiredEditLockError, type TargetResolutionPolicy } from "./storageContracts";
+
+export { ExpiredEditLockError } from "./storageContracts";
+
+const COMPANION_TIMING_BROWSE_OPERATIONS = new Set(["directories", "list", "info"]);
+const COMPANION_TIMING_OTHER_ROUTE = "/{route}";
 
 export interface DirectorySearchOptions {
   includeDotDirectories?: boolean;
+  includeIssueDetails?: boolean;
   signal?: AbortSignal;
+}
+
+export interface StoredTheme {
+  id: string;
+  scope: "user" | "site";
+  version: number;
+  definition: Omit<ThemeConfig, "id">;
+}
+
+export interface ThemeList {
+  themes: StoredTheme[];
+  site_default_id: string;
+}
+
+export function getThemeRequestError(cause: unknown): string {
+  if (axios.isAxiosError(cause)) {
+    const detail: unknown = cause.response?.data?.detail;
+    if (typeof detail === "string") return detail;
+  }
+  return cause instanceof Error ? cause.message : "Could not change the theme. Check the connection and try again.";
 }
 
 export interface CrossBackendTransferOptions {
   signal?: AbortSignal;
   transferAttemptId?: string;
   onProgress?: (bytesTransferred: number, totalBytes: number | null) => void;
+  onUploadSent?: () => void;
 }
 
 type ClientConfig = Pick<AxiosRequestConfig, "headers">;
 
 const EXPIRED_EDIT_LOCK_CODE = "edit_lock_lost";
-const EXPIRED_EDIT_LOCK_MESSAGE = "Lock not found or expired";
-
-export class ExpiredEditLockError extends Error {
-  constructor() {
-    super(EXPIRED_EDIT_LOCK_MESSAGE);
-    this.name = "ExpiredEditLockError";
-  }
-}
 
 function isExpiredEditLockResponse(body: string): boolean {
   try {
@@ -185,6 +214,8 @@ export interface LocalArchiveRelayExtractionStatus {
     members_processed: number;
     members_completed: number;
     members_skipped: number;
+    encrypted_members_skipped?: number;
+    unsupported_compression_members_skipped?: number;
     members_failed: number;
     files_extracted: number;
     directories_created: number;
@@ -225,6 +256,8 @@ export interface ArchiveRelayExtractionResponse {
   members_processed: number;
   members_completed: number;
   members_skipped: number;
+  encrypted_members_skipped?: number;
+  unsupported_compression_members_skipped?: number;
   members_failed: number;
   files_extracted: number;
   directories_created: number;
@@ -256,6 +289,14 @@ function getDevicePixelDimension(value: number | undefined): number | undefined 
 }
 
 let controlledReauthenticationInProgress = false;
+let oidcExchangePending = window.location.pathname === "/login/oidc/callback";
+export function setOidcExchangePending(pending: boolean): void {
+  oidcExchangePending = pending;
+}
+
+export function isOidcExchangePending(): boolean {
+  return oidcExchangePending;
+}
 
 export function isControlledReauthenticationInProgress(): boolean {
   return controlledReauthenticationInProgress;
@@ -271,13 +312,18 @@ function isPublicAuthRequest(url: string): boolean {
 }
 
 export function startControlledReauthentication(): void {
+  if (oidcExchangePending) return;
   controlledReauthenticationInProgress = true;
   clearBrowserRecoverySnapshot();
   snapshotRegisteredDrafts();
   if (window.location.pathname !== "/login") {
-    window.location.assign(`/login?return_path=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+    window.location.assign(
+      `/login?return_path=${encodeURIComponent(sanitizeReturnPath(window.location.pathname + window.location.search))}`
+    );
   }
 }
+
+authSession.setReauthenticationHandler(startControlledReauthentication);
 
 function isConfirmedOidcReauthentication(error: AxiosError): boolean {
   const data = error.response?.data as { detail?: { code?: string } } | undefined;
@@ -335,10 +381,11 @@ class ApiService {
   private api: AxiosInstance;
   /** Separate axios instance for companion requests (no Bearer interceptor). */
   private companionApi: AxiosInstance;
+  private companionRequestStarts = new WeakMap<AxiosRequestConfig, number>();
 
   constructor() {
     // Use absolute URL for tests (required by MSW), relative for production
-    const baseURL = import.meta.env.VITE_API_URL || (import.meta.env.MODE === "test" ? "http://localhost:3000/api" : "/api");
+    const baseURL = import.meta.env["VITE_API_URL"] || (import.meta.env.MODE === "test" ? "http://localhost:3000/api" : "/api");
     this.api = axios.create({
       baseURL,
     });
@@ -348,12 +395,15 @@ class ApiService {
       async (config) => {
         const url = config.url ?? "";
         const publicAuthRequest = isPublicAuthRequest(url);
-        if (!publicAuthRequest) {
+        if (!publicAuthRequest && !oidcExchangePending) {
+          const tokenBeforeRefresh = authSession.getAccessToken();
           try {
             await authSession.refreshIfNeeded();
           } catch (error) {
             if (error instanceof AuthSessionError && error.code === "reauthentication-required") {
-              startControlledReauthentication();
+              if (!oidcExchangePending && (!authSession.getAccessToken() || authSession.getAccessToken() === tokenBeforeRefresh)) {
+                startControlledReauthentication();
+              }
               return Promise.reject(error);
             }
             if (!(error instanceof AuthSessionError)) {
@@ -362,6 +412,7 @@ class ApiService {
           }
         }
         const token = authSession.getAccessToken();
+        (config as typeof config & { _oidcExchangePending?: boolean })._oidcExchangePending = oidcExchangePending;
         if (token) {
           config.headers["Authorization"] = `Bearer ${token}`;
         }
@@ -398,6 +449,27 @@ class ApiService {
         return response;
       },
       (error: AxiosError) => {
+        const config = error.config as (AxiosRequestConfig & { _oidcRetried?: boolean; _oidcExchangePending?: boolean }) | undefined;
+        const sentAuthorization = error.config?.headers?.get?.("Authorization") ?? error.config?.headers?.Authorization;
+        const obsoleteSession = () => {
+          const currentToken = authSession.getAccessToken();
+          return (
+            currentToken &&
+            typeof sentAuthorization === "string" &&
+            sentAuthorization.startsWith("Bearer ") &&
+            sentAuthorization !== `Bearer ${currentToken}`
+          );
+        };
+        if (error.response?.status === 403 && !obsoleteSession()) {
+          const body = error.response.data as { detail?: { code?: string } } | undefined;
+          if (body?.detail?.code === "password_change_required") {
+            setPasswordChangeRequired(true);
+            return Promise.reject(error);
+          }
+        }
+        if (error.response?.status === 401 && (oidcExchangePending || config?._oidcExchangePending || obsoleteSession())) {
+          return Promise.reject(error);
+        }
         const backendSnapshot = getBackendAvailabilitySnapshot();
         const viewerBlobRequest = isViewerBlobRequest(error.config);
         const suppressViewerBlobErrorLog = viewerBlobRequest && isBackendConnectivityError(error);
@@ -450,7 +522,6 @@ class ApiService {
             return Promise.reject(error);
           }
 
-          const config = error.config as (AxiosRequestConfig & { _oidcRetried?: boolean }) | undefined;
           const method = config?.method?.toLowerCase();
           const safeMethod = method === "get" || method === "head" || method === "options";
           const url = config?.url ?? "";
@@ -463,10 +534,12 @@ class ApiService {
             const retryConfig = config;
             return authSession.requestRefresh().then(
               () => {
+                if (obsoleteSession() || oidcExchangePending) return Promise.reject(error);
                 retryConfig._oidcRetried = true;
                 return this.api.request(retryConfig);
               },
               (refreshError: unknown) => {
+                if (obsoleteSession() || oidcExchangePending) return Promise.reject(error);
                 if (
                   refreshError instanceof AuthSessionError &&
                   (refreshError.code === "transient" || (refreshError.code === "refresh-uncertain" && authSession.hasUsableAccessToken()))
@@ -483,23 +556,65 @@ class ApiService {
       }
     );
 
-    // Companion axios instance — no Bearer token interceptor.
-    // Auth headers are added per-request via buildCompanionHeaders().
+    // Companion requests are signed after axios has assembled their URL and query.
     this.companionApi = axios.create({
       baseURL: COMPANION_BASE_URL,
       timeout: 10_000,
     });
+    this.companionApi.interceptors.request.use(async (config) => {
+      Object.assign(config.headers, await companionSession.getSigningHeaders(config.method ?? "GET", this.companionApi.getUri(config)));
+      this.companionRequestStarts.set(config, performance.now());
+      return config;
+    });
+    this.companionApi.interceptors.response.use(
+      (response) => {
+        this.logCompanionTiming(response.config, response.status, false, response.data?.accepted_revision);
+        return response;
+      },
+      (error: AxiosError) => {
+        this.logCompanionTiming(error.config, error.response?.status ?? null, isLocalAbortError(error));
+        return Promise.reject(error);
+      }
+    );
   }
 
   // ── Routing helpers ─────────────────────────────────────────────────────
 
+  private logCompanionTiming(config: AxiosRequestConfig | undefined, status: number | null, cancelled: boolean, revision?: unknown): void {
+    if (!config) return;
+    const started = this.companionRequestStarts.get(config);
+    if (started === undefined) return;
+    this.companionRequestStarts.delete(config);
+    let route = COMPANION_TIMING_OTHER_ROUTE;
+    try {
+      const segments = new URL(config.url ?? "", `${COMPANION_BASE_URL}/`).pathname.split("/").filter(Boolean);
+      if (segments[0] === "api") segments.shift();
+      const operation = segments[2];
+      if (segments.length === 3 && segments[0] === "browse" && operation && COMPANION_TIMING_BROWSE_OPERATIONS.has(operation)) {
+        route = `/browse/{drive}/${operation}`;
+      }
+    } catch {
+      route = COMPANION_TIMING_OTHER_ROUTE;
+    }
+    logger.debug(
+      "Companion API request finished",
+      {
+        method: config.method?.toUpperCase() ?? "GET",
+        route,
+        status,
+        duration_ms: Math.max(0, performance.now() - started),
+        cancelled,
+        ...(typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0 ? { accepted_revision: revision } : {}),
+      },
+      "companion"
+    );
+  }
+
   /**
    * Build HMAC auth headers for companion requests.
-   *
-   * Uses Web Crypto API for HMAC-SHA256(secret, timestamp).
    */
-  private async buildCompanionHeaders(): Promise<Record<string, string>> {
-    return companionSession.getSigningHeaders();
+  private async buildCompanionHeaders(method: string, url: string): Promise<Record<string, string>> {
+    return companionSession.getSigningHeaders(method, url);
   }
 
   /**
@@ -508,8 +623,8 @@ class ApiService {
    * Used for `<img src>` / `<iframe>` contexts where headers can't be set.
    * Returns a query string fragment: `hmac=...&ts=...&origin=...`
    */
-  private async buildCompanionQueryAuth(): Promise<string> {
-    return companionSession.getSignedQuery();
+  private async buildCompanionQueryAuth(url: string): Promise<string> {
+    return companionSession.getSignedQuery("GET", url);
   }
 
   /**
@@ -520,8 +635,7 @@ class ApiService {
    */
   private async getClientConfig(connectionId: string): Promise<{ client: AxiosInstance; extraConfig: ClientConfig }> {
     if (isLocalDrive(connectionId)) {
-      const headers = await this.buildCompanionHeaders();
-      return { client: this.companionApi, extraConfig: { headers } };
+      return { client: this.companionApi, extraConfig: {} };
     }
     return { client: this.api, extraConfig: {} };
   }
@@ -569,7 +683,6 @@ class ApiService {
 
   async exchangeOidcGrant(grant: string): Promise<AuthToken> {
     const response = await this.api.post<AuthToken>("/auth/oidc/exchange", { grant });
-    authSession.setAuthenticated(response.data, true);
     return response.data;
   }
 
@@ -596,6 +709,36 @@ class ApiService {
 
   async getCurrentUserSettings(): Promise<CurrentUserSettings> {
     const response = await this.api.get<CurrentUserSettings>("/auth/me/settings");
+    return response.data;
+  }
+
+  async getThemes(): Promise<ThemeList> {
+    const response = await this.api.get<ThemeList>("/themes");
+    return response.data;
+  }
+
+  async createTheme(definition: Omit<ThemeConfig, "id">, scope: StoredTheme["scope"]): Promise<StoredTheme> {
+    const response = await this.api.post<StoredTheme>("/themes", { definition, scope });
+    return response.data;
+  }
+
+  async updateTheme(theme: StoredTheme, definition: Omit<ThemeConfig, "id">): Promise<StoredTheme> {
+    const identity = authSession.getIdentity().epoch;
+    const response = await this.api.put<StoredTheme>(`/themes/${theme.id}`, { definition, scope: theme.scope, version: theme.version });
+    if (identity === authSession.getIdentity().epoch) notifyCompanionSettingsChanged(true);
+    return response.data;
+  }
+
+  async deleteTheme(theme: StoredTheme): Promise<void> {
+    const identity = authSession.getIdentity().epoch;
+    await this.api.delete(`/themes/${theme.id}`, { params: { version: theme.version } });
+    if (identity === authSession.getIdentity().epoch) notifyCompanionSettingsChanged(true);
+  }
+
+  async setSiteDefaultTheme(themeId: string): Promise<ThemeList> {
+    const identity = authSession.getIdentity().epoch;
+    const response = await this.api.put<ThemeList>(`/themes/default/${themeId}`);
+    if (identity === authSession.getIdentity().epoch) notifyCompanionSettingsChanged(true);
     return response.data;
   }
 
@@ -822,6 +965,32 @@ class ApiService {
     return response.data;
   }
 
+  async getDirectoryIndexSettings(scope: DirectoryIndexPolicyScope): Promise<DirectoryIndexSettings> {
+    const response = await this.api.get<DirectoryIndexSettings>(`/admin/settings/directory-index/${scope}`);
+    return response.data;
+  }
+
+  async getCompanionSettingsMetadata(options?: { signal?: AbortSignal }): Promise<CompanionSettingsMetadata> {
+    return (await this.api.get<CompanionSettingsMetadata>("/admin/settings/companion", options)).data;
+  }
+
+  async issueCompanionSettingsGrant(
+    binding: CompanionSettingsGrantBinding,
+    options?: { signal?: AbortSignal }
+  ): Promise<CompanionSettingsGrant> {
+    return (await this.api.post<CompanionSettingsGrant>("/admin/settings/companion/grants", binding, options)).data;
+  }
+
+  async updateDirectoryIndexSettings(
+    scope: DirectoryIndexPolicyScope,
+    payload: DirectoryIndexSettingUpdate,
+    options?: { signal?: AbortSignal }
+  ): Promise<DirectoryIndexSettingUpdate> {
+    const response = await this.api.put<DirectoryIndexSettingUpdate>(`/admin/settings/directory-index/${scope}`, payload, options);
+    if (scope === "companion") notifyCompanionSettingsChanged();
+    return response.data;
+  }
+
   async getAboutSettings(): Promise<AboutSettings> {
     const response = await this.api.get<AboutSettings>("/admin/settings/about");
     return response.data;
@@ -891,8 +1060,8 @@ class ApiService {
     return response.data.deleted_count;
   }
 
-  async recordRecentDirectory(connectionId: string, path: string): Promise<RecentDirectory> {
-    const response = await this.api.post<RecentDirectory>("/browse/recent-directories", {
+  async recordRecentDirectory(connectionId: string, path: string): Promise<RecentDirectory | null> {
+    const response = await this.api.post<RecentDirectory | null>("/browse/recent-directories", {
       connection_id: connectionId,
       path,
       is_directory: true,
@@ -1424,6 +1593,7 @@ class ApiService {
       params: {
         q: query,
         include_dot_directories: options?.includeDotDirectories ?? false,
+        ...(options?.includeIssueDetails ? { include_issue_details: true } : {}),
       },
       signal: options?.signal,
     });
@@ -1512,7 +1682,7 @@ class ApiService {
     }
     const segment = getBrowseSegment(connectionId);
     const { client, extraConfig } = await this.getClientConfig(connectionId);
-    const transferAttemptId = options.transferAttemptId ?? crypto.randomUUID();
+    const transferAttemptId = options.transferAttemptId ?? randomUuid();
     return this.postTransfer(
       client,
       `/browse/${segment}/copy`,
@@ -1544,7 +1714,7 @@ class ApiService {
     }
     const segment = getBrowseSegment(connectionId);
     const { client, extraConfig } = await this.getClientConfig(connectionId);
-    const transferAttemptId = options.transferAttemptId ?? crypto.randomUUID();
+    const transferAttemptId = options.transferAttemptId ?? randomUuid();
     return this.postTransfer(
       client,
       `/browse/${segment}/move`,
@@ -1618,22 +1788,153 @@ class ApiService {
         effects: { source: "unknown", destination: "unknown" },
       };
     }
-    const expectedSize = sourceSize;
-    const sourceModifiedAt = sourceInfo.modified_at ? `&source_modified_at=${encodeURIComponent(sourceInfo.modified_at)}` : "";
+    const result = await this.publishTransferStream(
+      sourceResponse.body,
+      sourceSize,
+      sourceInfo.modified_at,
+      sourceInfo,
+      destinationConnectionId,
+      destinationPath,
+      targetResolutionPolicy,
+      options
+    );
+    if (kind !== "move" || result.status !== "completed") {
+      return result;
+    }
+    try {
+      await this.deleteItem(sourceConnectionId, sourcePath);
+      return { ...result, effects: { source: "mutated", destination: "mutated" } };
+    } catch (error) {
+      return {
+        status: "completed_with_source_retained",
+        replaced: result.replaced,
+        effects: { source: "unchanged", destination: "mutated" },
+        error: {
+          code: "source_delete_failed",
+          detail: `Destination was created but the original could not be removed: ${error instanceof Error ? error.message : "unknown error"}`,
+        },
+      };
+    }
+  }
+
+  async publishBrowserFile(
+    file: File,
+    destinationConnectionId: string,
+    destinationPath: string,
+    targetResolutionPolicy: TargetResolutionPolicy = "ask",
+    options: CrossBackendTransferOptions = {}
+  ): Promise<ContentTransferResult> {
+    if (!Number.isSafeInteger(file.size) || file.size < 0) throw new Error("Invalid upload file size");
+    if (!file.name || file.name === "." || file.name === ".." || /[/\\\0]/.test(file.name)) {
+      throw new Error("Invalid upload filename");
+    }
+    const sourceInfo = {
+      name: file.name,
+      path: file.name,
+      type: FileType.FILE,
+      size: file.size,
+      modified_at: new Date(file.lastModified).toISOString(),
+      is_readable: true,
+      is_hidden: file.name.startsWith("."),
+    };
+    const startedAt = performance.now();
+    let sourceConsumedAt: number | null = null;
+    try {
+      const destinationUrl = `${getBaseUrl(destinationConnectionId)}/browse/${getBrowseSegment(destinationConnectionId)}/transfer-stream?path=${encodeURIComponent(destinationPath)}&target_resolution_policy=${encodeURIComponent(targetResolutionPolicy)}&expected_size=${file.size}&source_modified_at=${encodeURIComponent(sourceInfo.modified_at)}`;
+      const headers = await this.getTransferFetchHeaders(destinationConnectionId, "POST", destinationUrl);
+      if (options.signal?.aborted) {
+        return { status: "cancelled", replaced: false, effects: { source: "unchanged", destination: "unchanged" } };
+      }
+      let sent = false;
+      const response = await new Promise<Response | null>((resolve) => {
+        const xhr = new XMLHttpRequest();
+        const cleanup = () => {
+          options.signal?.removeEventListener("abort", abort);
+          xhr.upload.onprogress = null;
+          xhr.upload.onload = null;
+          xhr.onload = null;
+          xhr.onerror = null;
+          xhr.ontimeout = null;
+          xhr.onabort = null;
+        };
+        const settle = (result: Response | null) => {
+          cleanup();
+          resolve(result);
+        };
+        const abort = () => xhr.abort();
+        xhr.open("POST", destinationUrl);
+        for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, String(value));
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) options.onProgress?.(event.loaded, file.size);
+        };
+        xhr.upload.onload = () => {
+          sourceConsumedAt = performance.now();
+          options.onUploadSent?.();
+        };
+        xhr.onload = () => settle(xhr.status ? new Response(xhr.responseText, { status: xhr.status, statusText: xhr.statusText }) : null);
+        xhr.onerror = () => settle(null);
+        xhr.ontimeout = () => settle(null);
+        xhr.onabort = () => settle(null);
+        options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted) {
+          cleanup();
+          resolve(null);
+          return;
+        }
+        sent = true;
+        try {
+          xhr.send(file);
+        } catch {
+          settle(null);
+        }
+      });
+      if (!response) {
+        return sent
+          ? { status: "outcome_unknown", replaced: false, effects: { source: "unchanged", destination: "unknown" } }
+          : { status: "cancelled", replaced: false, effects: { source: "unchanged", destination: "unchanged" } };
+      }
+      return await this.resolveTransferResponse(response, destinationConnectionId, destinationPath, sourceInfo);
+    } finally {
+      const finishedAt = performance.now();
+      logger.debug(
+        "Browser file upload timing",
+        {
+          bytes: file.size,
+          totalMs: Math.round(finishedAt - startedAt),
+          sourceConsumedMs: sourceConsumedAt === null ? null : Math.round(sourceConsumedAt - startedAt),
+          responseAfterSourceConsumedMs: sourceConsumedAt === null ? null : Math.round(finishedAt - sourceConsumedAt),
+        },
+        "file-browser"
+      );
+    }
+  }
+
+  private async publishTransferStream(
+    sourceStream: ReadableStream<Uint8Array>,
+    expectedSize: number,
+    modifiedAt: string | undefined,
+    sourceInfo: FileInfo,
+    destinationConnectionId: string,
+    destinationPath: string,
+    targetResolutionPolicy: TargetResolutionPolicy,
+    options: CrossBackendTransferOptions
+  ): Promise<ContentTransferResult> {
+    const sourceModifiedAt = modifiedAt ? `&source_modified_at=${encodeURIComponent(modifiedAt)}` : "";
     const destinationUrl = `${getBaseUrl(destinationConnectionId)}/browse/${getBrowseSegment(destinationConnectionId)}/transfer-stream?path=${encodeURIComponent(destinationPath)}&target_resolution_policy=${encodeURIComponent(targetResolutionPolicy)}&expected_size=${expectedSize}${sourceModifiedAt}`;
-    const destinationHeaders = await this.getTransferFetchHeaders(destinationConnectionId);
+    const destinationHeaders = await this.getTransferFetchHeaders(destinationConnectionId, "POST", destinationUrl);
     let bytesTransferred = 0;
     const relayStream = options.onProgress
-      ? sourceResponse.body.pipeThrough(
+      ? sourceStream.pipeThrough(
           new TransformStream<Uint8Array, Uint8Array>({
             transform: (chunk, controller) => {
               bytesTransferred += chunk.byteLength;
-              options.onProgress?.(bytesTransferred, sourceSize);
+              options.onProgress?.(bytesTransferred, expectedSize);
               controller.enqueue(chunk);
             },
           })
         )
-      : sourceResponse.body;
+      : sourceStream;
     let destinationBody: ReadableStream<Uint8Array> | Blob = relayStream;
     if (!supportsStreamUploadRequestBodies()) {
       let bufferedBody: Blob;
@@ -1684,6 +1985,15 @@ class ApiService {
       }
       return { status: "outcome_unknown", replaced: false, effects: { source: "unknown", destination: "unknown" } };
     }
+    return this.resolveTransferResponse(destinationResponse, destinationConnectionId, destinationPath, sourceInfo);
+  }
+
+  private async resolveTransferResponse(
+    destinationResponse: Response,
+    destinationConnectionId: string,
+    destinationPath: string,
+    sourceInfo: FileInfo
+  ): Promise<ContentTransferResult> {
     if (!destinationResponse.ok) {
       if (destinationResponse.status === 409) {
         const existingFile = await this.getFileInfo(destinationConnectionId, destinationPath).catch(() => null);
@@ -1702,24 +2012,7 @@ class ApiService {
             : { code: "transport", detail: `Transfer destination failed (${destinationResponse.status}): ${detail}` },
       };
     }
-    const result = this.normalizeTransferResult((await destinationResponse.json()) as ContentTransferResult);
-    if (kind !== "move" || result.status !== "completed") {
-      return result;
-    }
-    try {
-      await this.deleteItem(sourceConnectionId, sourcePath);
-      return { ...result, effects: { source: "mutated", destination: "mutated" } };
-    } catch (error) {
-      return {
-        status: "completed_with_source_retained",
-        replaced: result.replaced,
-        effects: { source: "unchanged", destination: "mutated" },
-        error: {
-          code: "source_delete_failed",
-          detail: `Destination was created but the original could not be removed: ${error instanceof Error ? error.message : "unknown error"}`,
-        },
-      };
-    }
+    return this.normalizeTransferResult((await destinationResponse.json()) as ContentTransferResult);
   }
 
   // ── Transfer routing helpers ────────────────────────────────────────────
@@ -1785,9 +2078,9 @@ class ApiService {
     return isLocalDrive(sourceConnectionId) !== isLocalDrive(destConnectionId);
   }
 
-  private async getTransferFetchHeaders(connectionId: string): Promise<Record<string, string>> {
+  private async getTransferFetchHeaders(connectionId: string, method: string, url: string): Promise<Record<string, string>> {
     if (isLocalDrive(connectionId)) {
-      return this.buildCompanionHeaders();
+      return this.buildCompanionHeaders(method, url);
     }
     const token = authSession.getAccessToken();
     return token ? { Authorization: `Bearer ${token}` } : {};
@@ -1795,7 +2088,7 @@ class ApiService {
 
   private async fetchRawFileStream(connectionId: string, path: string, options: { signal?: AbortSignal } = {}): Promise<Response> {
     const url = `${getBaseUrl(connectionId)}/viewer/${getBrowseSegment(connectionId)}/download?path=${encodeURIComponent(path)}`;
-    const response = await fetch(url, { headers: await this.getTransferFetchHeaders(connectionId), signal: options.signal });
+    const response = await fetch(url, { headers: await this.getTransferFetchHeaders(connectionId, "GET", url), signal: options.signal });
     if (!response.ok) {
       throw new Error(`Download failed (${response.status}): ${response.statusText}`);
     }
@@ -1832,14 +2125,14 @@ class ApiService {
     formData.append("file", blob, filename);
 
     const headers: Record<string, string> = {};
+    const requestUrl = params ? `${url}&${new URLSearchParams(params).toString()}` : url;
     if (isLocalDrive(connectionId)) {
-      Object.assign(headers, await this.buildCompanionHeaders());
+      Object.assign(headers, await this.buildCompanionHeaders("POST", requestUrl));
     } else {
       const token = authSession.getAccessToken();
       if (token) headers["Authorization"] = `Bearer ${token}`;
     }
 
-    const requestUrl = params ? `${url}&${new URLSearchParams(params).toString()}` : url;
     const response = await fetch(requestUrl, {
       method: "POST",
       headers,
@@ -1850,6 +2143,19 @@ class ApiService {
       const text = await response.text().catch(() => response.statusText);
       if (response.status === 404 && isExpiredEditLockResponse(text)) {
         throw new ExpiredEditLockError();
+      }
+      if (params?.["editor_operation_id"]) {
+        const { normalizePhysicalFileFailure } = await import("../utils/apiErrors");
+        throw await normalizePhysicalFileFailure(
+          {
+            response: {
+              status: response.status,
+              data: text,
+              headers: { "content-type": response.headers.get("content-type") ?? "" },
+            },
+          },
+          destPath
+        );
       }
       throw new Error(`Upload failed (${response.status}): ${text}`);
     }
@@ -1872,7 +2178,7 @@ class ApiService {
     const baseUrl = getBaseUrl(connectionId);
     const segment = getBrowseSegment(connectionId);
     if (isLocalDrive(connectionId)) {
-      const authParams = await this.buildCompanionQueryAuth();
+      const authParams = await this.buildCompanionQueryAuth(`${baseUrl}/viewer/${segment}/file?path=${encodeURIComponent(path)}`);
       return `${baseUrl}/viewer/${segment}/file?path=${encodeURIComponent(path)}&${authParams}`;
     }
     return `${baseUrl}/viewer/${segment}/file?path=${encodeURIComponent(path)}`;
@@ -1882,7 +2188,7 @@ class ApiService {
     const baseUrl = getBaseUrl(connectionId);
     const segment = getBrowseSegment(connectionId);
     if (isLocalDrive(connectionId)) {
-      const authParams = await this.buildCompanionQueryAuth();
+      const authParams = await this.buildCompanionQueryAuth(`${baseUrl}/viewer/${segment}/download?path=${encodeURIComponent(path)}`);
       return `${baseUrl}/viewer/${segment}/download?path=${encodeURIComponent(path)}&${authParams}`;
     }
     return `${baseUrl}/viewer/${segment}/download?path=${encodeURIComponent(path)}`;
@@ -1945,33 +2251,106 @@ class ApiService {
     }
   }
 
-  async downloadFile(connectionId: string, path: string, filename: string): Promise<void> {
+  async downloadFile(connectionId: string, path: string, filename: string, signal?: AbortSignal): Promise<void> {
+    const url = await this.issueBrowserDownloadUrl(connectionId, path, undefined, signal);
+    if (!signal?.aborted) this.startNativeDownload(url, filename);
+  }
+
+  async downloadArchiveMember(
+    connectionId: string,
+    archivePath: string,
+    memberPath: string,
+    filename: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const url = await this.issueBrowserDownloadUrl(connectionId, archivePath, memberPath, signal);
+    if (!signal?.aborted) this.startNativeDownload(url, filename);
+  }
+
+  private async issueBrowserDownloadUrl(connectionId: string, path: string, memberPath?: string, signal?: AbortSignal): Promise<string> {
     const baseUrl = getBaseUrl(connectionId);
-    const segment = getBrowseSegment(connectionId);
-    const url = `${baseUrl}/viewer/${segment}/download?path=${encodeURIComponent(path)}`;
+    const localDrive = isLocalDrive(connectionId);
+    const issueUrl = `${baseUrl}/${localDrive ? "download-intents" : "viewer/download-intents"}`;
+    const response = await fetch(issueUrl, {
+      method: "POST",
+      headers: {
+        ...(await this.getTransferFetchHeaders(connectionId, "POST", issueUrl)),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        [localDrive ? "drive" : "connection_id"]: getBrowseSegment(connectionId),
+        path,
+        ...(memberPath === undefined ? {} : { member_path: memberPath }),
+      }),
+      signal,
+    });
+    if (!response.ok) throw new Error(`Download preparation failed (${response.status})`);
+    const { url } = (await response.json()) as { url: string };
+    return new URL(url, new URL(baseUrl, location.href)).href;
+  }
 
-    const headers: Record<string, string> = {};
+  private startNativeDownload(url: string, filename: string): void {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.rel = "noreferrer";
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
+
+  private async getSelectionDownloadHeaders(connectionId: string, url: string): Promise<Record<string, string>> {
+    const headers = await this.getTransferFetchHeaders(connectionId, "POST", url);
     if (isLocalDrive(connectionId)) {
-      const companionHeaders = await this.buildCompanionHeaders();
-      Object.assign(headers, companionHeaders);
-    } else {
       const token = authSession.getAccessToken();
-      if (token) headers["Authorization"] = `Bearer ${token}`;
+      if (!token) throw new Error("Authentication is required to download a local selection");
+      headers["Authorization"] = `Bearer ${token}`;
     }
+    return headers;
+  }
 
-    const response = await fetch(url, { headers });
-
+  async downloadSelectionArchive(connectionId: string, paths: string[], signal?: AbortSignal): Promise<void> {
+    const url = `${getBaseUrl(connectionId)}/browse/${getBrowseSegment(connectionId)}/download-selection`;
+    const headers = await this.getSelectionDownloadHeaders(connectionId, url);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(paths),
+      signal,
+    });
     if (!response.ok) {
-      throw new Error(`Download failed: ${response.statusText}`);
+      const failure = (await response.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(failure?.detail ?? `Archive download failed (${response.status})`);
     }
-
     const blob = await response.blob();
+    if (!signal?.aborted) this.saveDownloadBlob(blob, "Sambee-download.zip");
+  }
+
+  async downloadZipSelectionArchive(connectionId: string, archivePath: string, paths: string[], signal?: AbortSignal): Promise<void> {
+    const url = `${getBaseUrl(connectionId)}/browse/${getBrowseSegment(connectionId)}/archive/download-selection`;
+    const headers = await this.getSelectionDownloadHeaders(connectionId, url);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ archive_path: archivePath, paths }),
+      signal,
+    });
+    if (!response.ok) {
+      const failure = (await response.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(failure?.detail ?? `Archive download failed (${response.status})`);
+    }
+    const blob = await response.blob();
+    if (!signal?.aborted) this.saveDownloadBlob(blob, "Sambee-download.zip");
+  }
+
+  saveDownloadBlob(blob: Blob, filename: string): void {
     const blobUrl = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = blobUrl;
     link.download = filename;
     link.click();
-    URL.revokeObjectURL(blobUrl);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
   }
 
   async getFileContent(connectionId: string, path: string): Promise<string> {
@@ -2018,7 +2397,7 @@ class ApiService {
     const { client, extraConfig } = await this.getClientConfig(connectionId);
     const response = await client.post<EditLockInfo>(`/browse/${segment}/lock`, undefined, {
       ...extraConfig,
-      params: { path },
+      params: { path, check_write_access: true },
     });
 
     return response.data;
@@ -2031,18 +2410,25 @@ class ApiService {
 
     const segment = getBrowseSegment(connectionId);
     const { client, extraConfig } = await this.getClientConfig(connectionId);
-    await client.post(
-      `/browse/${segment}/lock/heartbeat`,
-      {
-        operation_id: lockInfo.operation_id,
-        lock_id: lockInfo.lock_id,
-        lock_capability: lockInfo.lock_capability,
-      },
-      {
-        ...extraConfig,
-        params: { path },
+    try {
+      await client.post(
+        `/browse/${segment}/lock/heartbeat`,
+        {
+          operation_id: lockInfo.operation_id,
+          lock_id: lockInfo.lock_id,
+          lock_capability: lockInfo.lock_capability,
+        },
+        {
+          ...extraConfig,
+          params: { path },
+        }
+      );
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404 && isExpiredEditLockResponse(JSON.stringify(error.response.data))) {
+        throw new ExpiredEditLockError();
       }
-    );
+      throw error;
+    }
   }
 
   async releaseEditLock(connectionId: string, path: string, lockInfo: EditLockInfo): Promise<void> {
@@ -2345,7 +2731,7 @@ class ApiService {
 
     let uri = `sambee://open?server=${serverUrl}&token=${uri_token}&connId=${connectionId}&path=${encodedPath}`;
 
-    if (themeJson) {
+    if (themeJson && !companionSession.hasSecret()) {
       uri += `&theme=${btoa(themeJson)}`;
     }
 

@@ -22,6 +22,7 @@ class RecentDirectory(SQLModel, table=True):
     connection_id: str = Field(index=True, max_length=256)
     path: str = Field(max_length=4096)
     last_visited_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    usage_score: float = Field(default=1.0, ge=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -36,11 +37,15 @@ class RecentDirectoryRead(SQLModel):
     connection_id: str
     path: str
     last_visited_at: datetime
+    usage_score: float = 0
+    match_rank: int = 3
+    matched_term_count: int = 0
 
 
 class RecentDirectorySearchRead(SQLModel):
     results: list[RecentDirectoryRead]
     result_limit: int
+    search_contract_version: int = 1
 
 
 class RecentDirectoryClearRead(SQLModel):

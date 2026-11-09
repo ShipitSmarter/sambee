@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setRegionalLocalePreference } from "../../i18n";
+import { requireTestValue } from "../../test/helpers/assertions";
 import { SambeeThemeProvider } from "../../theme";
 import type { CurrentAccount } from "../../types";
 import { formatLocalizedDateTime } from "../../utils/localeFormatting";
@@ -10,6 +11,8 @@ import { AccountSettings } from "../AccountSettings";
 
 vi.mock("../../services/api", () => ({
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
+    getCurrentUser: () => Promise.resolve({ role: "editor" }),
     getCurrentAccount: vi.fn(),
     getOidcBrowserSessions: vi.fn(),
     revokeOidcBrowserSession: vi.fn(),
@@ -38,6 +41,7 @@ const PASSWORD_ACCOUNT: CurrentAccount = {
   has_local_password: true,
   identity_source: "local",
   password_change_available: true,
+  password_change_required: false,
   browser_session_management_available: false,
   oidc_provider_name: null,
   current_session: {
@@ -101,7 +105,7 @@ describe("AccountSettings", () => {
     vi.mocked(api.getCurrentAccount).mockResolvedValue({
       ...PASSWORD_ACCOUNT,
       current_session: {
-        ...PASSWORD_ACCOUNT.current_session,
+        ...requireTestValue(PASSWORD_ACCOUNT.current_session),
         started_at: startedAt,
       },
     });

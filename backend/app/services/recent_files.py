@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import heapq
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
+from typing import Iterator
 
 from fastapi import HTTPException, status
 from sqlmodel import Session, col, select
 
 from app.models.recent_file import RecentFile, RecentFileRead
 from app.models.user import User
+from app.services.directory_index import search_terms
 from app.services.history_common import (
+    HISTORY_QUERY_BATCH_SIZE,
+    history_search_relevance,
+    history_usage_score,
     normalize_history_search_text,
     normalize_recent_history_path,
+    updated_history_usage_score,
     validate_history_connection_access,
 )
 from app.services.system_settings import get_file_search_settings
@@ -144,6 +151,7 @@ def record_recent_file(
         )
     else:
         record.file_name = file_name
+        record.usage_score = updated_history_usage_score(record.usage_score, record.last_opened_at, now)
         record.last_opened_at = now
     session.add(record)
     _trim_user_recent_files(user_id=current_user.id, retention_limit=settings.retention_limit, session=session)
@@ -152,34 +160,53 @@ def record_recent_file(
     return RecentFileRead.model_validate(record)
 
 
-def _match_rank(*, normalized_file_name: str, normalized_query: str) -> int | None:
-    if not normalized_query:
-        return 3
-    if normalized_file_name == normalized_query:
-        return 0
-    if normalized_file_name.startswith(normalized_query):
-        return 1
-    for index, character in enumerate(normalized_file_name):
-        if index > 0 and not character.isalnum() and normalized_file_name[index + 1 :].startswith(normalized_query):
-            return 2
-    if normalized_query in normalized_file_name:
-        return 3
-    return None
-
-
 def search_recent_files(*, query: str, limit: int, current_user: User, session: Session) -> list[RecentFileRead]:
     bounded_limit = get_recent_file_result_limit(limit=limit, session=session)
-    normalized_query = _normalize_for_matching(query.strip())
+    terms = search_terms(query)
     records = session.exec(
-        select(RecentFile).where(RecentFile.user_id == current_user.id).order_by(col(RecentFile.last_opened_at).desc())
-    ).all()
-    matched: list[tuple[int, RecentFile]] = []
-    for record in records:
-        rank = _match_rank(normalized_file_name=_normalize_for_matching(record.file_name), normalized_query=normalized_query)
-        if rank is not None:
-            matched.append((rank, record))
-    matched.sort(key=lambda result: (result[0], -result[1].last_opened_at.timestamp()))
-    return [RecentFileRead.model_validate(record) for _, record in matched[:bounded_limit]]
+        select(RecentFile).where(RecentFile.user_id == current_user.id).execution_options(yield_per=HISTORY_QUERY_BATCH_SIZE)
+    )
+    now = datetime.now(timezone.utc)
+
+    def matches() -> Iterator[tuple[int, int, RecentFile]]:
+        try:
+            for record in records:
+                key = _normalize_for_matching(record.file_name)
+                relevance = history_search_relevance(key, key, terms)
+                if relevance is None:
+                    continue
+                try:
+                    validate_history_connection_access(connection_id=record.connection_id, current_user=current_user, session=session)
+                except (HTTPException, ValueError):
+                    continue
+                yield *relevance, record
+        finally:
+            records.close()
+
+    matched = heapq.nsmallest(
+        bounded_limit,
+        matches(),
+        key=lambda result: (
+            -result[0],
+            result[1],
+            -history_usage_score(result[2].usage_score, result[2].last_opened_at, now),
+            -result[2].last_opened_at.replace(tzinfo=timezone.utc).timestamp(),
+            _normalize_for_matching(result[2].file_name),
+            result[2].path,
+            result[2].connection_id,
+            str(result[2].id),
+        ),
+    )
+    return [
+        RecentFileRead.model_validate(record).model_copy(
+            update={
+                "matched_term_count": count,
+                "match_rank": rank,
+                "usage_score": history_usage_score(record.usage_score, record.last_opened_at, now),
+            }
+        )
+        for count, rank, record in matched
+    ]
 
 
 def get_recent_file_result_limit(*, limit: int, session: Session) -> int:

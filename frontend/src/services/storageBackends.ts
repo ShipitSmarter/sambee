@@ -1,5 +1,6 @@
 import { type EditLockInfo, isApiError } from "../types";
 import api, { ExpiredEditLockError } from "./api";
+import { claimEditLockRecovery, EditLockUnavailableError } from "./editLockRecovery";
 import { assertLocalPreviewSupported } from "./previewPolicy";
 import type {
   ArchiveCreationOperations,
@@ -178,7 +179,12 @@ abstract class ApiStorageBackend implements StorageBackend {
       return { status: "removed" };
     } catch (error) {
       const detail = isApiError(error) ? error.response?.data?.detail : null;
-      if (error.response?.status === 409 && typeof detail === "string" && detail.startsWith("Directory is not empty:")) {
+      if (
+        isApiError(error) &&
+        error.response?.status === 409 &&
+        typeof detail === "string" &&
+        detail.startsWith("Directory is not empty:")
+      ) {
         return { status: "not_empty" };
       }
       throw error;
@@ -204,7 +210,7 @@ abstract class ApiStorageBackend implements StorageBackend {
         request.idempotencyKey,
         destinationConnectionId,
         request.targetResolutionPolicy,
-        { signal: request.signal }
+        { signal: request.signal, transferAttemptId: request.transferAttemptId }
       );
     } else {
       return api.copyItem(
@@ -214,7 +220,7 @@ abstract class ApiStorageBackend implements StorageBackend {
         request.idempotencyKey,
         destinationConnectionId,
         request.targetResolutionPolicy,
-        { signal: request.signal }
+        { signal: request.signal, transferAttemptId: request.transferAttemptId }
       );
     }
   }
@@ -236,7 +242,36 @@ abstract class ApiStorageBackend implements StorageBackend {
       assertOwned(this.kind, item.resolvedTarget);
       if (!this.getCapabilities(item.resolvedTarget).canEditText) return { kind: "read-only" };
       const id = connectionId(item.target);
-      let lockInfo = await api.acquireEditLock(id, item.path);
+      let recovery: Awaited<ReturnType<typeof claimEditLockRecovery>>;
+      try {
+        recovery = await claimEditLockRecovery(id, item.path);
+      } catch (error) {
+        if (error instanceof EditLockUnavailableError) return { kind: "locked" };
+        throw error;
+      }
+      let lockInfo: EditLockInfo;
+      try {
+        const saved = recovery.load();
+        if (saved) {
+          try {
+            await api.heartbeatEditLock(id, item.path, saved);
+            lockInfo = saved;
+          } catch (error) {
+            if (!(error instanceof ExpiredEditLockError)) throw error;
+            recovery.clear();
+            lockInfo = await api.acquireEditLock(id, item.path);
+          }
+        } else {
+          lockInfo = await api.acquireEditLock(id, item.path);
+        }
+        requireEditLockContext(lockInfo);
+        recovery.save(lockInfo);
+      } catch (error) {
+        await recovery.release();
+        if (isApiError(error) && error.response?.status === 409) return { kind: "locked" };
+        if (isApiError(error) && error.response?.status === 403) return { kind: "permission-denied" };
+        throw error;
+      }
       let lockContext = requireEditLockContext(lockInfo);
       let released = false;
       return {
@@ -247,17 +282,23 @@ abstract class ApiStorageBackend implements StorageBackend {
             try {
               await api.writeTextWithEditLock(id, item.path, content, lockContext, { mimeType: options?.mimeType });
             } catch (error) {
-              if (!(error instanceof ExpiredEditLockError)) throw error;
+              if (!(error instanceof ExpiredEditLockError) || options?.reacquireExpiredLock === false) throw error;
 
               lockInfo = await api.acquireEditLock(id, item.path);
               lockContext = requireEditLockContext(lockInfo);
+              recovery.save(lockInfo);
               await api.writeTextWithEditLock(id, item.path, content, lockContext, { mimeType: options?.mimeType });
             }
           },
           release: async () => {
             if (released) return;
-            await api.releaseEditLock(id, item.path, lockInfo);
-            released = true;
+            try {
+              await api.releaseEditLock(id, item.path, lockInfo);
+              recovery.clear();
+              released = true;
+            } finally {
+              await recovery.release();
+            }
           },
         },
       };
@@ -269,14 +310,24 @@ export class SambeeSmbBackend extends ApiStorageBackend {
   readonly kind = "smb" as const;
   readonly archiveCreation: ArchiveCreationOperations = {
     prepareCreate: async (request) => {
+      if (
+        request.selectedMemberPaths &&
+        (request.sources.length !== 1 ||
+          request.sources[0]!.target.kind !== "smb" ||
+          request.destination.target.kind !== "smb" ||
+          connectionId(request.sources[0]!.target) !== connectionId(request.destination.target))
+      ) {
+        throw new Error("ZIP member creation requires a same-connection SMB destination");
+      }
       const operation = await api.prepareArchiveOperation({
         contract_version: "v2",
         kind: "create",
         source_connection_id: connectionId(request.sources[0]!.target),
-        source_path: "",
+        source_path: request.selectedMemberPaths ? request.sources[0]!.path : "",
         destination_connection_id: connectionId(request.destination.target),
         destination_path: archiveTargetPath(request),
         plan_json: JSON.stringify({ source_paths: request.sources.map((source) => source.path) }),
+        ...(request.selectedMemberPaths ? { selected_member_paths: [...request.selectedMemberPaths] } : {}),
       });
       return {
         recovery: {

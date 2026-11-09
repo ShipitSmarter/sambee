@@ -1,3 +1,4 @@
+import { createMockAuthToken } from "../../test/fixtures/users";
 /**
  * FileBrowser — URL Routing Tests (Phase 3)
  * ==========================================
@@ -12,16 +13,17 @@
  * - URL query param constants are correct
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import api from "../../services/api";
 import { authSession } from "../../services/authSession";
-import { type ApiMock, createMarkdownViewerMock, createSettingsDialogMock, setupSuccessfulApiMocks } from "../../test/helpers";
+import { type ApiMock, setupSuccessfulApiMocks } from "../../test/helpers";
 import { FileType } from "../../types";
-import { parseBrowseRoute, serializeBrowseRoute } from "../FileBrowser/routing";
+import type { ViewerComponentProps } from "../../utils/FileTypeRegistry";
+import { type BrowseRouteState, parseBrowseRoute, serializeBrowseRoute } from "../FileBrowser/routing";
 import { ACTIVE_PANE_QUERY_KEY, RIGHT_PANE_QUERY_KEY } from "../FileBrowser/types";
-import { renderBrowser } from "./FileBrowser.test.utils";
+import { mockDirectoryListing, renderBrowserAndFlush } from "./FileBrowser.test.utils";
 
 const expectDirectoryLoad = (connectionId: string, path: string) => {
   expect(api.listDirectory).toHaveBeenCalledWith(
@@ -35,20 +37,68 @@ const expectDirectoryLoad = (connectionId: string, path: string) => {
 
 // Mock the API module
 vi.mock("../../services/api");
+vi.mock("../AccountSettings", () => ({ AccountSettings: () => <div>Account content</div> }));
 
 // Mock components using lazy mock factories
-vi.mock("../../components/Viewer/MarkdownViewer", () => createMarkdownViewerMock());
-vi.mock("../../components/Settings/SettingsDialog", () => createSettingsDialogMock());
+vi.mock("../../components/Viewer/MarkdownViewer", () => ({
+  default: ({ onClose, navigation, path, isTransitioning }: ViewerComponentProps) => {
+    return (
+      <div role="dialog" data-testid="markdown-viewer" data-mode={navigation?.mode} data-path={path} data-pending={isTransitioning}>
+        Markdown Viewer
+        <button type="button" onClick={() => navigation?.onModeChange("edit")}>
+          Enter editor
+        </button>
+        <button type="button" onClick={() => navigation?.onModeChange("view")}>
+          Leave editor
+        </button>
+        <button type="button" onClick={onClose}>
+          Close Viewer
+        </button>
+      </div>
+    );
+  },
+}));
+vi.mock("../../components/Settings/SettingsDialog", () => ({
+  default: ({
+    open,
+    category,
+    onNavigate,
+    onClose,
+  }: {
+    open: boolean;
+    category: string;
+    onNavigate: (value: string) => void;
+    onClose: () => void;
+  }) =>
+    open ? (
+      <div data-testid="settings-dialog" data-category={category}>
+        <button type="button" onClick={() => onNavigate("account")}>
+          Account category
+        </button>
+        <button type="button" onClick={() => onNavigate("connections")}>
+          Connections category
+        </button>
+        <button type="button" onClick={onClose}>
+          Close Settings
+        </button>
+      </div>
+    ) : null,
+}));
 // @tanstack/react-virtual mock
 vi.mock("@tanstack/react-virtual", () => import("../../__mocks__/@tanstack/react-virtual"));
 
 describe("FileBrowser — URL Routing (Phase 3)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
-    authSession.setAuthenticated({ access_token: "fake-token", token_type: "bearer" }, false);
+    authSession.setAuthenticated(createMockAuthToken({ access_token: "fake-token", token_type: "bearer" }), false);
     localStorage.removeItem("selectedConnectionId");
     localStorage.removeItem("dual-pane-mode");
     localStorage.removeItem("active-pane");
+    localStorage.removeItem("companion_secret");
 
     setupSuccessfulApiMocks(api as unknown as ApiMock);
   });
@@ -58,6 +108,52 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
   // --------------------------------------------------------------------------
 
   describe("URL query param constants", () => {
+    it.each(["", "&mode=view", "&mode=edit"])("normalizes legacy text mode without changing other route state: %s", (mode) => {
+      const route = parseBrowseRoute({
+        targetType: "smb",
+        targetId: "demo",
+        searchParams: new URLSearchParams(`file=smb%2Fdemo%2Fnotes.txt&viewer=text${mode}&q=keep`),
+      });
+      expect(route.viewer).toMatchObject({ viewerId: "text", mode: "view" });
+      const serialized = new URL(serializeBrowseRoute(route), "http://localhost");
+      expect(serialized.searchParams.has("mode")).toBe(false);
+      expect(serialized.searchParams.get("q")).toBe("keep");
+    });
+
+    it("round trips independent viewer targets, edit intent, settings, and unrelated query state", () => {
+      const route: BrowseRouteState = {
+        left: { kind: "smb", targetId: "test-server-1", path: "Documents" },
+        right: { kind: "local", targetId: "drive %", path: "" },
+        activePaneId: "right",
+        viewer: {
+          file: {
+            kind: "smb",
+            targetId: "other server",
+            path: "archive.zip/notes/100% #.md",
+            virtualLocation: { providerId: "zip", sourcePath: "archive.zip", virtualPath: "notes/100% #.md" },
+          },
+          paneId: "right",
+          viewerId: "markdown",
+          mode: "edit",
+        },
+        settings: "admin-users",
+        extraSearch: "q=someone&page=2",
+      };
+      const url = new URL(serializeBrowseRoute(route), "http://localhost");
+      expect(parseBrowseRoute({ targetType: "smb", targetId: "test-server-1", path: "Documents", searchParams: url.searchParams })).toEqual(
+        route
+      );
+    });
+
+    it.each([
+      "file=smb%2Fdemo%2Ffile.txt&viewer=unknown",
+      "file=smb%2Fdemo%2Ffile.txt&viewer=text&pane=2",
+      "file=smb%2Fdemo%2Fimage.png&viewer=image&mode=edit",
+      "file=smb%2Fdemo%2F%25broken&viewer=text&virtual=invalid",
+    ])("ignores invalid workspace descriptors: %s", (search) => {
+      expect(parseBrowseRoute({ searchParams: new URLSearchParams(search) }).viewer).toBeUndefined();
+    });
+
     it("RIGHT_PANE_QUERY_KEY is 'p2'", () => {
       expect(RIGHT_PANE_QUERY_KEY).toBe("p2");
     });
@@ -103,8 +199,76 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
   });
 
   describe("settings dialog routing", () => {
+    it("commits category navigation synchronously while retaining category history", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?settings=appearance");
+      await screen.findByTestId("settings-dialog");
+      const navigate = vi.spyOn(router, "navigate");
+      await user.click(screen.getByRole("button", { name: "Account category" }));
+      expect(navigate).toHaveBeenCalledWith(
+        expect.objectContaining({ search: "?settings=account" }),
+        expect.objectContaining({ flushSync: true })
+      );
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", "appearance");
+      await act(() => router.navigate(1));
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+    });
+
+    it("uses observed mobile category history even when the main view was a direct link", async () => {
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches: query.includes("max-width"),
+          media: query,
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        }))
+      );
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?settings=main");
+      const drawer = await screen.findByRole("dialog");
+      await user.click(within(drawer).getByText("Account", { exact: true }));
+      expect(router.state.location.search).toContain("settings=account");
+      await user.click(screen.getByRole("button", { name: "Go back" }));
+      await waitFor(() => expect(router.state.location.search).toContain("settings=main"));
+      await act(() => router.navigate(1));
+      await waitFor(() => expect(router.state.location.search).toContain("settings=account"));
+    });
+    it("records settings Close and retraces category history with Back and Forward", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1");
+      await user.click(await screen.findByRole("button", { name: /open settings/i }));
+      const initialCategory = (await screen.findByTestId("settings-dialog")).getAttribute("data-category");
+      await user.click(await screen.findByRole("button", { name: "Account category" }));
+      await user.click(screen.getByRole("button", { name: "Connections category" }));
+      expect(router.state.location.search).toContain("settings=connections");
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+      await user.click(screen.getByRole("button", { name: "Close Settings" }));
+      await waitFor(() => expect(router.state.location.search).not.toContain("settings="));
+      await act(() => router.navigate(-1));
+      expect(await screen.findByTestId("settings-dialog")).toBeInTheDocument();
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("settings-dialog")).toHaveAttribute("data-category", initialCategory);
+      await act(() => router.navigate(2));
+      await waitFor(() => expect(screen.queryByTestId("settings-dialog")).not.toBeInTheDocument());
+    });
+
+    it("dismisses a direct category link without leaving the workspace", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?settings=account");
+      await user.click(await screen.findByRole("button", { name: "Close Settings" }));
+      expect(router.state.location.pathname).toBe("/browse/smb/test-server-1");
+      expect(router.state.location.search).not.toContain("settings=");
+    });
     it("opens the requested settings category from the settings query parameter", async () => {
-      renderBrowser("/browse/smb/test-server-1?settings=admin-authentication#flow=test-flow");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?settings=admin-authentication#flow=test-flow");
 
       const dialog = await screen.findByTestId("settings-dialog");
 
@@ -112,7 +276,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("opens the File Search settings category from the settings query parameter", async () => {
-      renderBrowser("/browse/smb/test-server-1?settings=admin-file-search");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?settings=admin-file-search");
 
       const dialog = await screen.findByTestId("settings-dialog");
 
@@ -120,13 +284,424 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
   });
 
+  describe("viewer history", () => {
+    beforeEach(() => {
+      vi.mocked(api.listDirectory).mockResolvedValue({
+        ...mockDirectoryListing,
+        items: [
+          ...mockDirectoryListing.items,
+          {
+            name: "readme.md",
+            path: "readme.md",
+            type: FileType.FILE,
+            mime_type: "text/markdown",
+            size: 20,
+            is_readable: true,
+            is_hidden: false,
+          },
+        ],
+      });
+      vi.mocked(api.getFileInfo).mockResolvedValue({ type: FileType.FILE, size: 20, mime_type: "text/markdown" } as never);
+    });
+    it("pushes a viewer location and restores it with Back and Forward", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1");
+      await user.click(await screen.findByRole("button", { name: /file: readme\.md/i }));
+      expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+      expect(new URLSearchParams(router.state.location.search).get("viewer")).toBe("markdown");
+      await act(() => router.navigate(-1));
+      await waitFor(() => expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument());
+      expect(router.state.location.pathname).toBe("/browse/smb/test-server-1");
+      await act(() => router.navigate(1));
+      expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+    });
+
+    it.each([false, true])("records viewer Close and restores the file with Back (direct link: %s)", async (direct) => {
+      const user = userEvent.setup();
+      const directory = "/browse/smb/test-server-1/Documents";
+      const viewer = `${directory}?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown&keep=1#anchor`;
+      const { router } = await renderBrowserAndFlush(direct ? viewer : `${directory}?keep=1#anchor`);
+      if (!direct) await user.click(await screen.findByRole("button", { name: /file: readme\.md/i }));
+      await user.click(await screen.findByRole("button", { name: "Close Viewer" }));
+      await waitFor(() => expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument());
+      expect(router.state.location.pathname).toBe(directory);
+      expect(router.state.location.search).toBe("?keep=1");
+      expect(router.state.location.hash).toBe("#anchor");
+
+      await act(() => router.navigate(-1));
+      expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+      if (!direct) {
+        await act(() => router.navigate(-1));
+        await waitFor(() => expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument());
+        expect(router.state.location.pathname).toBe(directory);
+        await act(() => router.navigate(1));
+        expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+      }
+      await act(() => router.navigate(1));
+      await waitFor(() => expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument());
+    });
+
+    it("records edit exit without overwriting the prior editor entry", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown");
+      await user.click(await screen.findByRole("button", { name: "Enter editor" }));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "edit"));
+      await user.click(screen.getByRole("button", { name: "Leave editor" }));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "view"));
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "edit");
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "view");
+      await act(() => router.navigate(2));
+      expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "view");
+    });
+
+    it("records settings Close while preserving its underlying viewer", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush(
+        "/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown&settings=account&keep=1#anchor"
+      );
+      await screen.findByTestId("markdown-viewer");
+      await user.click(await screen.findByRole("button", { name: "Close Settings" }));
+      await waitFor(() => expect(screen.queryByTestId("settings-dialog")).not.toBeInTheDocument());
+      expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
+      expect(router.state.location.search).toContain("keep=1");
+      expect(router.state.location.hash).toBe("#anchor");
+      await act(() => router.navigate(-1));
+      expect(await screen.findByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+      await act(() => router.navigate(1));
+      await waitFor(() => expect(screen.queryByTestId("settings-dialog")).not.toBeInTheDocument());
+      expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
+    });
+
+    it("opens a fresh viewer URL without a file-row click", async () => {
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown");
+      expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+      expect(router.state.location.search).toContain("viewer=markdown");
+      expect(api.getFileInfo).toHaveBeenCalled();
+    });
+
+    it("keeps the same viewer mounted through delayed file navigation and Back", async () => {
+      const first = "/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown";
+      const second = "/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Fother.md&viewer=markdown";
+      const { router } = await renderBrowserAndFlush(first);
+      const outgoing = await screen.findByTestId("markdown-viewer");
+      let finishMetadata!: (metadata: never) => void;
+      vi.mocked(api.getFileInfo).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishMetadata = resolve;
+          })
+      );
+      await act(() => router.navigate(second));
+      expect(screen.getByTestId("markdown-viewer")).toBe(outgoing);
+      expect(outgoing).toHaveAttribute("data-path", "readme.md");
+      expect(outgoing).toHaveAttribute("data-pending", "true");
+      expect(screen.queryByRole("dialog", { name: /^loading$/i })).not.toBeInTheDocument();
+      await act(async () => finishMetadata({ type: FileType.FILE, size: 20, mime_type: "text/markdown" } as never));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-path", "other.md"));
+      const incoming = screen.getByTestId("markdown-viewer");
+      vi.mocked(api.getFileInfo).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishMetadata = resolve;
+          })
+      );
+      await act(() => router.navigate(-1));
+      expect(screen.getByTestId("markdown-viewer")).toBe(incoming);
+      expect(incoming).toHaveAttribute("data-path", "other.md");
+      await act(async () => finishMetadata({ type: FileType.FILE, size: 20, mime_type: "text/markdown" } as never));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-path", "readme.md"));
+    });
+
+    it("preserves the outgoing viewer after failed replacement and retries the failed identity", async () => {
+      const user = userEvent.setup();
+      const directory = "/browse/smb/test-server-1?p2=smb%2Ftest-server-1%2FDocuments";
+      const { router } = await renderBrowserAndFlush(`${directory}&file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown`);
+      const outgoing = await screen.findByTestId("markdown-viewer");
+      vi.mocked(api.getFileInfo).mockRejectedValueOnce({
+        response: { status: 403, data: { detail: { code: "file_access_denied", message: "private server detail" } } },
+      });
+      await act(() => router.navigate(`${directory}&file=smb%2Ftest-server-1%2Fother.md&viewer=markdown`));
+      await screen.findByRole("button", { name: /^retry$/i });
+      expect(screen.getByTestId("markdown-viewer")).toBe(outgoing);
+      expect(outgoing).toHaveAttribute("data-path", "readme.md");
+      expect(screen.queryByText(/private server detail/)).not.toBeInTheDocument();
+      expect(new URLSearchParams(router.state.location.search).get("p2")).toBe("smb/test-server-1/Documents");
+      await user.click(screen.getByRole("button", { name: /^retry$/i }));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-path", "other.md"));
+      expect(api.getFileInfo).toHaveBeenLastCalledWith("conn-1", "other.md", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    });
+
+    it("cancels a pending file change on Escape and ignores its late metadata", async () => {
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown");
+      await screen.findByTestId("markdown-viewer");
+      let finishMetadata!: (metadata: never) => void;
+      vi.mocked(api.getFileInfo).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishMetadata = resolve;
+          })
+      );
+      await act(() => router.navigate("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Fother.md&viewer=markdown"));
+      const user = userEvent.setup();
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(router.state.location.search).not.toContain("viewer="));
+      await act(async () => finishMetadata({ type: FileType.FILE, size: 20, mime_type: "text/markdown" } as never));
+      expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument();
+    });
+
+    it("offers retry for an unavailable file and closes a direct link safely", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.getFileInfo).mockRejectedValueOnce(new Error("File unavailable"));
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown");
+      await waitFor(() => expect(screen.getByText("The file could not be opened. Check the connection and retry.")).toBeInTheDocument());
+      await user.click(screen.getByRole("button", { name: /retry/i }));
+      expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Close Viewer" }));
+      await waitFor(() => expect(router.state.location.search).not.toContain("viewer="));
+      expect(router.state.location.pathname).toBe("/browse/smb/test-server-1");
+    });
+
+    it.each([1, 2])("reuses resolved viewer metadata after %s failed attempts", async (failures) => {
+      const user = userEvent.setup();
+      for (let attempt = 0; attempt < failures; attempt += 1) {
+        vi.mocked(api.getFileInfo).mockRejectedValueOnce(new Error("File unavailable"));
+      }
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=smb%2Ftest-server-1%2Freadme.md&viewer=markdown");
+      for (let attempt = 0; attempt < failures; attempt += 1) {
+        await screen.findByText("The file could not be opened. Check the connection and retry.");
+        await user.click(screen.getByRole("button", { name: /retry/i }));
+      }
+      await screen.findByTestId("markdown-viewer");
+      expect(api.getFileInfo).toHaveBeenCalledTimes(failures + 1);
+      await user.click(screen.getByRole("button", { name: "Enter editor" }));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "edit"));
+      await user.click(screen.getByRole("button", { name: "Leave editor" }));
+      await waitFor(() => expect(screen.getByTestId("markdown-viewer")).toHaveAttribute("data-mode", "view"));
+      await act(() => router.navigate(`${router.state.location.pathname}${router.state.location.search}&settings=account`));
+      expect(await screen.findByTestId("settings-dialog")).toHaveAttribute("data-category", "account");
+      await act(() => router.navigate(-1));
+      await act(() => router.navigate(1));
+      expect(api.getFileInfo).toHaveBeenCalledTimes(failures + 1);
+    });
+
+    it("normalizes an invalid workspace descriptor while preserving unrelated query and hash", async () => {
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1?file=bad&viewer=unknown&settings=unknown&keep=1#anchor");
+      await waitFor(() => expect(router.state.location.search).toBe("?keep=1"));
+      expect(router.state.location.hash).toBe("#anchor");
+      expect(router.state.location.pathname).toBe("/browse/smb/test-server-1");
+    });
+  });
+
   // --------------------------------------------------------------------------
   // Single-pane backward compatibility
   // --------------------------------------------------------------------------
 
+  describe("location commands", () => {
+    it.each(["left", "right"] as const)("opens only the %s pane location in a new tab", async (activePaneId) => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      const user = userEvent.setup();
+      const left = { kind: "smb" as const, targetId: "test-server-1", path: "Reports # ready" };
+      const right = { kind: "local" as const, targetId: "c", path: "100% # ready" };
+      const initialUrl = serializeBrowseRoute({ left, right, activePaneId, extraSearch: "keep=1" });
+      const { router } = await renderBrowserAndFlush(initialUrl);
+      await waitFor(() => {
+        expectDirectoryLoad("conn-1", left.path);
+        expectDirectoryLoad("local-drive:c", right.path);
+      });
+
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}");
+
+      expect(open).toHaveBeenCalledExactlyOnceWith(
+        serializeBrowseRoute({ left: activePaneId === "left" ? left : right, right: null, activePaneId: "left" }),
+        "_blank",
+        "noopener,noreferrer"
+      );
+      expect(router.state.location.pathname + router.state.location.search).toBe(initialUrl);
+    });
+
+    it.each(["left", "right"] as const)("opens the captured %s pane location from command search", async (activePaneId) => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      const user = userEvent.setup();
+      await renderBrowserAndFlush(
+        `/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Pictures&active=${activePaneId === "right" ? "2" : "1"}`
+      );
+      await waitFor(() => {
+        expectDirectoryLoad("conn-1", "Documents");
+        expectDirectoryLoad("conn-2", "Pictures");
+      });
+      await user.keyboard("{Control>}p{/Control}");
+      await user.click(await screen.findByText("Open Current Location In New Tab"));
+      expect(open).toHaveBeenCalledExactlyOnceWith(
+        activePaneId === "right" ? "/browse/smb/test-server-2/Pictures" : "/browse/smb/test-server-1/Documents",
+        "_blank",
+        "noopener,noreferrer"
+      );
+    });
+
+    it("does not repeat new tabs or handle location shortcuts in an input", async () => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
+      await waitFor(() => expectDirectoryLoad("conn-1", "Documents"));
+      fireEvent.keyDown(document, { key: "t", ctrlKey: true, altKey: true, repeat: true });
+      expect(open).not.toHaveBeenCalled();
+
+      const user = userEvent.setup();
+      await user.keyboard("{Control>}k{/Control}");
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}");
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["left", "ArrowLeft"],
+      ["left", "ArrowRight"],
+      ["right", "ArrowLeft"],
+      ["right", "ArrowRight"],
+    ] as const)("matches locations with %s active and %s, preserving focus and history", async (activePaneId, key) => {
+      const user = userEvent.setup();
+      const left = { kind: "smb" as const, targetId: "test-server-1", path: "Documents" };
+      const right = { kind: "smb" as const, targetId: "test-server-2", path: "Pictures" };
+      const initialUrl = serializeBrowseRoute({ left, right, activePaneId, extraSearch: "keep=1" });
+      const { router } = await renderBrowserAndFlush(initialUrl);
+      await waitFor(() => {
+        expectDirectoryLoad("conn-1", left.path);
+        expectDirectoryLoad("conn-2", right.path);
+      });
+      const lists = screen.getAllByTestId("file-list-container");
+      const activeList = lists[activePaneId === "left" ? 0 : 1]!;
+      act(() => activeList.focus());
+      const source = key === "ArrowLeft" ? right : left;
+
+      await user.keyboard(`{Control>}{${key}}{/Control}`);
+
+      await waitFor(() =>
+        expect(router.state.location.pathname + router.state.location.search).toBe(
+          serializeBrowseRoute({ left: source, right: source, activePaneId, extraSearch: "keep=1" })
+        )
+      );
+      await waitFor(() => expect(screen.getAllByTestId("file-list-container")[activePaneId === "left" ? 0 : 1]).toHaveFocus());
+      const matchedKey = router.state.location.key;
+      await user.keyboard(`{Control>}{${key}}{/Control}`);
+      expect(router.state.location.key).toBe(matchedKey);
+
+      await act(() => router.navigate(-1));
+      await waitFor(() => expect(router.state.location.pathname + router.state.location.search).toBe(initialUrl));
+    });
+
+    it("matches a local-drive root even when the file lists are empty", async () => {
+      vi.mocked(api.listDirectory).mockImplementation(async (_connectionId, path = "") => ({ path, items: [], total: 0 }));
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=local/c&active=2");
+      await waitFor(() => {
+        expectDirectoryLoad("conn-1", "Documents");
+        expectDirectoryLoad("local-drive:c", "");
+      });
+      await user.keyboard("{Control>}{ArrowLeft}{/Control}");
+      await waitFor(() => expect(router.state.location.pathname).toBe("/browse/local/c"));
+      expect(new URLSearchParams(router.state.location.search).get("p2")).toBe("local/c");
+      expect(new URLSearchParams(router.state.location.search).get("active")).toBe("2");
+    });
+
+    it("does not match locations in single-pane mode or while an input has focus", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
+      await waitFor(() => expectDirectoryLoad("conn-1", "Documents"));
+      const initialKey = router.state.location.key;
+      await user.keyboard("{Control>}{ArrowLeft}{/Control}");
+      expect(router.state.location.key).toBe(initialKey);
+
+      await act(() => router.navigate("/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Pictures"));
+      await waitFor(() => expectDirectoryLoad("conn-2", "Pictures"));
+      const dualKey = router.state.location.key;
+      await user.keyboard("{Control>}k{/Control}");
+      await user.keyboard("{Control>}{ArrowRight}{/Control}");
+      expect(router.state.location.key).toBe(dualKey);
+    });
+
+    it("does not add history when matching locations with a noncanonical query order", async () => {
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?active=2&p2=smb/test-server-1/Documents");
+      await waitFor(() => expectDirectoryLoad("conn-1", "Documents"));
+      const initialKey = router.state.location.key;
+      await user.keyboard("{Control>}{ArrowLeft}{/Control}{Control>}{ArrowRight}{/Control}");
+      expect(router.state.location.key).toBe(initialKey);
+    });
+
+    it("keeps archive subdirectories when opening a tab and matching the other pane", async () => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      vi.mocked(api.listArchiveDirectory).mockImplementation(async (_connectionId, archivePath, virtualPath = "") => ({
+        archive: { path: archivePath, size: 1 },
+        path: virtualPath,
+        items:
+          virtualPath === "" ? [{ name: "nested", path: "nested", type: FileType.DIRECTORY, state: "readable", is_hidden: false }] : [],
+        total: virtualPath === "" ? 1 : 0,
+        page_size: 100,
+      }));
+      vi.mocked(api.getFileInfo).mockImplementation(
+        async (_connectionId, path) => ({ type: path === "Archives/backup.zip" ? FileType.FILE : FileType.DIRECTORY }) as never
+      );
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush(
+        "/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Archives/backup.zip/nested&active=2"
+      );
+      await waitFor(() => {
+        expect(api.listArchiveDirectory).toHaveBeenCalledWith("conn-2", "Archives/backup.zip", "nested", {
+          pageSize: 100,
+          signal: expect.any(AbortSignal),
+        });
+      });
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}");
+      expect(open).toHaveBeenCalledExactlyOnceWith("/browse/smb/test-server-2/Archives/backup.zip/nested", "_blank", "noopener,noreferrer");
+      await user.keyboard("{Control>}{ArrowLeft}{/Control}");
+      await waitFor(() => expect(router.state.location.pathname).toBe("/browse/smb/test-server-2/Archives/backup.zip/nested"));
+      expect(new URLSearchParams(router.state.location.search).get("p2")).toBe("smb/test-server-2/Archives/backup.zip/nested");
+      await waitFor(() =>
+        expect(
+          vi.mocked(api.listArchiveDirectory).mock.calls.filter(([, , path, options]) => path === "nested" && options?.signal)
+        ).toHaveLength(2)
+      );
+    });
+
+    it("blocks commands while a pane location is loading", async () => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      let finishLoading!: (value: typeof mockDirectoryListing) => void;
+      const pendingListing = new Promise<typeof mockDirectoryListing>((resolve) => {
+        finishLoading = resolve;
+      });
+      vi.mocked(api.listDirectory).mockImplementation(async (connectionId) =>
+        connectionId === "conn-2" ? pendingListing : mockDirectoryListing
+      );
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Pictures&active=2");
+      await waitFor(() => expectDirectoryLoad("conn-2", "Pictures"));
+      const initialKey = router.state.location.key;
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}{Control>}{ArrowLeft}{/Control}");
+      expect(open).not.toHaveBeenCalled();
+      expect(router.state.location.key).toBe(initialKey);
+      await act(async () => finishLoading(mockDirectoryListing));
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}");
+      expect(open).toHaveBeenCalledExactlyOnceWith("/browse/smb/test-server-2/Pictures", "_blank", "noopener,noreferrer");
+    });
+  });
+
   describe("single-pane typed routes", () => {
+    it("opens the current location in a new tab without changing the route", async () => {
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      const user = userEvent.setup();
+      const { router } = await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?keep=1");
+      await waitFor(() => expectDirectoryLoad("conn-1", "Documents"));
+
+      await user.keyboard("{Control>}{Alt>}t{/Alt}{/Control}");
+
+      expect(open).toHaveBeenCalledWith("/browse/smb/test-server-1/Documents", "_blank", "noopener,noreferrer");
+      expect(router.state.location.pathname).toBe("/browse/smb/test-server-1/Documents");
+      expect(router.state.location.search).toBe("?keep=1");
+      open.mockRestore();
+    });
+
     it("loads single-pane mode from a clean URL without query params", async () => {
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // Should load and display files in single pane
       await waitFor(() => {
@@ -145,7 +720,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("loads single-pane mode with a subpath", async () => {
-      renderBrowser("/browse/smb/test-server-1/Documents");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
 
       await waitFor(() => {
         expectDirectoryLoad("conn-1", "Documents");
@@ -153,7 +728,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("serializes archive navigation and restores a virtual archive deep link", async () => {
-      vi.mocked(api.listDirectory).mockImplementation(async (_connectionId, path) => ({
+      vi.mocked(api.listDirectory).mockImplementation(async (_connectionId, path = "") => ({
         path,
         items:
           path === "Archives"
@@ -169,7 +744,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
             : [],
         total: path === "Archives" ? 1 : 0,
       }));
-      vi.mocked(api.listArchiveDirectory).mockImplementation(async (_connectionId, archivePath, virtualPath) => ({
+      vi.mocked(api.listArchiveDirectory).mockImplementation(async (_connectionId, archivePath, virtualPath = "") => ({
         archive: { path: archivePath, size: 1 },
         path: virtualPath,
         items:
@@ -187,7 +762,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
       );
 
       const user = userEvent.setup();
-      renderBrowser("/browse/smb/test-server-1/Archives");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Archives");
 
       await user.click(await screen.findByRole("button", { name: /file: backup\.zip/i }));
       await waitFor(() => {
@@ -207,7 +782,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("hydrates an archive deep link through its virtual provider", async () => {
-      vi.mocked(api.listArchiveDirectory).mockImplementation(async (_connectionId, archivePath, virtualPath) => ({
+      vi.mocked(api.listArchiveDirectory).mockImplementation(async (_connectionId, archivePath, virtualPath = "") => ({
         archive: { path: archivePath, size: 1 },
         path: virtualPath,
         items:
@@ -224,7 +799,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
           }) as never
       );
 
-      renderBrowser("/browse/smb/test-server-1/Archives/backup.zip/nested");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Archives/backup.zip/nested");
       await waitFor(() => {
         expect(api.listArchiveDirectory).toHaveBeenCalledWith("conn-1", "Archives/backup.zip", "nested", {
           pageSize: 100,
@@ -237,7 +812,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     it("keeps physical directory semantics for a directory named with an archive extension", async () => {
       vi.mocked(api.getFileInfo).mockResolvedValue({ type: FileType.DIRECTORY } as never);
 
-      renderBrowser("/browse/smb/test-server-1/folder.zip/child");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/folder.zip/child");
 
       await waitFor(() => {
         expectDirectoryLoad("conn-1", "folder.zip/child");
@@ -253,7 +828,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
         return { type: FileType.DIRECTORY } as never;
       });
 
-      renderBrowser("/browse/smb/test-server-1/Existing/missing.zip");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Existing/missing.zip");
 
       await waitFor(() => {
         expect(screen.getByTestId("router-location")).toHaveTextContent("/browse/smb/test-server-1/Existing");
@@ -270,7 +845,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
       );
       vi.mocked(api.listArchiveDirectory).mockRejectedValue({ isAxiosError: true, response: { status: 422 } });
 
-      renderBrowser("/browse/smb/test-server-1/Archives/broken.zip/nested");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Archives/broken.zip/nested");
 
       await waitFor(() => {
         expect(screen.getByTestId("router-location")).toHaveTextContent("/browse/smb/test-server-1/Archives");
@@ -285,7 +860,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
 
   describe("dual-pane restoration from URL", () => {
     it("activates dual-pane mode when ?p2= is present", async () => {
-      renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -302,7 +877,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("restores right pane path from ?p2=type/id/path/segments", async () => {
-      renderBrowser("/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Pictures");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=smb/test-server-2/Pictures");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -320,7 +895,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("restores both panes to the same connection", async () => {
-      renderBrowser("/browse/smb/test-server-1/Documents?p2=smb/test-server-1/Pictures");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=smb/test-server-1/Pictures");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -337,7 +912,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("persists dual-pane mode through the current-user settings store when restored from URL", async () => {
-      renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -358,7 +933,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
 
   describe("active pane restoration from URL", () => {
     it("defaults to left pane when ?active is absent", async () => {
-      renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -370,7 +945,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("restores right pane as active when ?active=2", async () => {
-      renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2&active=2");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2&active=2");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -387,8 +962,27 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
   // --------------------------------------------------------------------------
 
   describe("edge cases", () => {
+    it("ignores malformed encoded right-pane paths without breaking the left pane", async () => {
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb%2Ftest-server-2%2Fbad%25name&active=2");
+
+      await waitFor(() => expectDirectoryLoad("conn-1", ""));
+      expect(vi.mocked(api.listDirectory).mock.calls.some(([connectionId]) => connectionId === "conn-2")).toBe(false);
+    });
+
+    it("preserves valid encoded percent signs in right-pane paths", () => {
+      const route = serializeBrowseRoute({
+        left: { kind: "smb", targetId: "test-server-1", path: "" },
+        right: { kind: "smb", targetId: "test-server-2", path: "100% ready" },
+        activePaneId: "right",
+      });
+      const url = new URL(route, "http://localhost");
+      expect(parseBrowseRoute({ targetType: "smb", targetId: "test-server-1", searchParams: url.searchParams }).right?.path).toBe(
+        "100% ready"
+      );
+    });
+
     it("ignores invalid SMB p2 targets gracefully", async () => {
-      renderBrowser("/browse/smb/test-server-1?p2=smb/nonexistent-server/photos");
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/nonexistent-server/photos");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -407,7 +1001,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("handles p2 with no path (root of connection)", async () => {
-      renderBrowser("/browse/smb/test-server-1/Documents?p2=smb/test-server-2");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=smb/test-server-2");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -420,7 +1014,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("loads local drives from typed left-pane URLs", async () => {
-      renderBrowser("/browse/local/c/Users");
+      await renderBrowserAndFlush("/browse/local/c/Users");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -432,7 +1026,7 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
     });
 
     it("restores a local drive in the right pane from p2", async () => {
-      renderBrowser("/browse/smb/test-server-1/Documents?p2=local/c/Users");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents?p2=local/c/Users");
 
       await waitFor(() => {
         expect(api.getConnections).toHaveBeenCalled();
@@ -445,6 +1039,99 @@ describe("FileBrowser — URL Routing (Phase 3)", () => {
       await waitFor(() => {
         expectDirectoryLoad("local-drive:c", "Users");
       });
+    });
+
+    it("opens local-drive recovery rather than retrying a rejected left-pane signature", async () => {
+      vi.mocked(api.listDirectory).mockRejectedValue({
+        response: { status: 403, data: { code: "companion_auth_signature_mismatch", detail: "Invalid authentication" } },
+      });
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      await waitFor(() => expect(screen.getByText(/Sambee Companion rejected this browser's pairing/i)).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Reload Sambee" })).toBeInTheDocument();
+      await userEvent.setup().click(screen.getByRole("button", { name: "Local Drives" }));
+      expect(await screen.findByTestId("settings-dialog")).toHaveAttribute("data-category", "local-drives");
+    });
+
+    it("identifies the failing pane when a local drive rejects a signature in dual-pane mode", async () => {
+      vi.mocked(api.listDirectory).mockImplementation(async (connectionId) => {
+        if (connectionId === "local-drive:c") {
+          throw { response: { status: 403, data: { code: "companion_auth_signature_mismatch", detail: "Invalid authentication" } } };
+        }
+        return mockDirectoryListing;
+      });
+
+      await renderBrowserAndFlush("/browse/smb/test-server-1?p2=local/c/Users");
+
+      const alert = (await screen.findByText(/Sambee Companion rejected this browser's pairing/i)).closest("[role='alert']");
+      expect(alert?.closest("[data-pane-id]")).toHaveAttribute("data-pane-id", "right");
+      expect(alert).not.toHaveTextContent("Right pane:");
+      expect(alert).toHaveTextContent(/Sambee Companion rejected this browser's pairing/i);
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    });
+
+    it("recognizes the old browser signing protocol without presenting Retry", async () => {
+      vi.mocked(api.listDirectory).mockRejectedValue({
+        response: {
+          status: 403,
+          data: { code: "companion_browser_update_required", detail: "Sambee browser is out of date. Reload the page." },
+        },
+      });
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      await waitFor(() => expect(screen.getByText(/Sambee Companion rejected this browser's pairing/i)).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Reload Sambee" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    });
+
+    it("opens pairing settings when Companion has removed this origin's pairing", async () => {
+      localStorage.setItem("companion_secret", "old-secret");
+      vi.mocked(api.listDirectory).mockRejectedValue({
+        response: { status: 403, data: { code: "companion_pairing_not_found", detail: "Not paired with this origin" } },
+      });
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      await waitFor(() => expect(screen.getByText(/This browser is not paired with Sambee Companion/i)).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Reload Sambee" })).not.toBeInTheDocument();
+      await userEvent.setup().click(screen.getByRole("button", { name: "Local Drives" }));
+      expect(await screen.findByTestId("settings-dialog")).toHaveAttribute("data-category", "local-drives");
+    });
+
+    it("opens pairing settings when the browser secret is missing", async () => {
+      vi.mocked(api.listDirectory).mockRejectedValue(new Error("Not paired with companion"));
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      await waitFor(() => expect(screen.getByText(/This browser is not paired with Sambee Companion/i)).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Reload Sambee" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Local Drives" })).toBeInTheDocument();
+    });
+
+    it("keeps Retry for unrelated local-drive permission errors", async () => {
+      localStorage.setItem("companion_secret", "valid-secret");
+      vi.mocked(api.listDirectory).mockRejectedValue({ response: { status: 403, data: { detail: "Permission denied" } } });
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      await waitFor(() => expect(screen.getByText("You do not have permission to open this folder.")).toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Local Drives" })).not.toBeInTheDocument();
+    });
+
+    it("keeps Retry for a temporary local-drive network failure", async () => {
+      localStorage.setItem("companion_secret", "valid-secret");
+      vi.mocked(api.listDirectory).mockRejectedValue(new Error("Network Error"));
+
+      await renderBrowserAndFlush("/browse/local/c/Users");
+
+      expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Local Drives" })).not.toBeInTheDocument();
     });
   });
 });

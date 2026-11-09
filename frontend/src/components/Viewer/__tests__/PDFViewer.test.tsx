@@ -1,12 +1,12 @@
 import { act, fireEvent, render as renderBase, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { type ReactNode, useCallback, useEffect, useRef } from "react";
+import { type ComponentProps, type ReactNode, useCallback, useEffect, useRef } from "react";
 import type { Mock } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ContentProviderRegistryContext } from "../../../pages/FileBrowser/contentProviders";
 import apiService from "../../../services/api";
 import * as logger from "../../../services/logger";
-import { createStorageBackedTestContentProviderRegistry } from "../../../test/helpers";
+import { createStorageBackedTestContentProviderRegistry, readBlobAsText } from "../../../test/helpers";
 import { SambeeThemeProvider } from "../../../theme";
 import { DOM_TEXT_SEARCH_CURRENT_MATCH_ATTRIBUTE, DOM_TEXT_SEARCH_HIGHLIGHT_SELECTOR } from "../../../utils/domTextSearch";
 import PDFViewer from "../PDFViewer";
@@ -63,6 +63,7 @@ vi.mock("react-pdf", () => ({
     };
   }) => {
     const loadedFileRef = useRef<string | null>(null);
+    capturedDocumentPasswordHandler = onPassword;
 
     capturedInitialDocumentItemClick ??= onItemClick;
 
@@ -114,39 +115,43 @@ vi.mock("react-pdf", () => ({
 
     useEffect(() => {
       const nextLoadError = mockDocumentLoadErrors.shift();
+      const resolveDocument = () => {
+        const mockPdf = {
+          numPages: 5,
+          getPage: (pageNum: number) =>
+            Promise.resolve({
+              rotate: mockIntrinsicPageRotations.get(pageNum) ?? 0,
+              getViewport: () => ({ width: 612, height: 792 }),
+              getTextContent: async () => {
+                if (mockTextExtractionDelayMs > 0) {
+                  await new Promise<void>((resolve) => {
+                    window.setTimeout(resolve, mockTextExtractionDelayMs);
+                  });
+                }
+                return { items: getPageItems(pageNum) };
+              },
+            }),
+        };
+        onLoadSuccess?.(mockPdf);
+      };
       if (mockPasswordRequest && onPassword) {
         mockPasswordRequest = false;
-        queueMicrotask(() => {
-          onPassword((password) => {
-            submittedPdfPassword = password;
-          });
-        });
+        loadedFileRef.current = file;
+        const submitPassword = (password: string | null) => {
+          submittedPdfPassword = password;
+          if (password === null || password === "wrong") {
+            queueMicrotask(() => onPassword(submitPassword));
+          } else {
+            queueMicrotask(resolveDocument);
+          }
+        };
+        queueMicrotask(() => onPassword(submitPassword));
       } else if (nextLoadError) {
-        queueMicrotask(() => {
-          onLoadError?.(nextLoadError);
-        });
+        loadedFileRef.current = file;
+        queueMicrotask(() => onLoadError?.(nextLoadError));
       } else if (file && loadedFileRef.current !== file) {
         loadedFileRef.current = file;
-
-        queueMicrotask(() => {
-          const mockPdf = {
-            numPages: 5,
-            getPage: (pageNum: number) =>
-              Promise.resolve({
-                rotate: mockIntrinsicPageRotations.get(pageNum) ?? 0,
-                getViewport: () => ({ width: 612, height: 792 }),
-                getTextContent: async () => {
-                  if (mockTextExtractionDelayMs > 0) {
-                    await new Promise<void>((resolve) => {
-                      window.setTimeout(resolve, mockTextExtractionDelayMs);
-                    });
-                  }
-                  return { items: getPageItems(pageNum) };
-                },
-              }),
-          };
-          onLoadSuccess?.(mockPdf);
-        });
+        queueMicrotask(resolveDocument);
       }
     }, [file, getPageItems, onLoadError, onLoadSuccess, onPassword]);
 
@@ -199,14 +204,18 @@ vi.mock("react-pdf", () => ({
     const intrinsicRotation = mockIntrinsicPageRotations.get(pageNumber) ?? 0;
     const effectiveRotation = rotate ?? intrinsicRotation;
     const onRenderSuccessRef = useRef(onRenderSuccess);
+    const onLoadSuccessRef = useRef(onLoadSuccess);
+    const onRenderTextLayerSuccessRef = useRef(onRenderTextLayerSuccess);
     mockPageRenderCounts.set(pageNumber, (mockPageRenderCounts.get(pageNumber) ?? 0) + 1);
 
     useEffect(() => {
       onRenderSuccessRef.current = onRenderSuccess;
-    }, [onRenderSuccess]);
+      onLoadSuccessRef.current = onLoadSuccess;
+      onRenderTextLayerSuccessRef.current = onRenderTextLayerSuccess;
+    }, [onLoadSuccess, onRenderSuccess, onRenderTextLayerSuccess]);
 
     useEffect(() => {
-      onLoadSuccess?.({
+      onLoadSuccessRef.current?.({
         rotate: intrinsicRotation,
         getViewport: ({ rotation: viewportRotation }) =>
           (viewportRotation ?? intrinsicRotation) % 180 !== 0
@@ -219,9 +228,9 @@ vi.mock("react-pdf", () => ({
       }
       onRenderSuccessRef.current?.();
       if (renderTextLayer && pageNumber !== mockMissingTextLayerPage) {
-        onRenderTextLayerSuccess?.();
+        onRenderTextLayerSuccessRef.current?.();
       }
-    }, [intrinsicRotation, onLoadSuccess, onRenderTextLayerSuccess, pageNumber, pageWidth, renderTextLayer]);
+    }, [intrinsicRotation, pageNumber, pageWidth, renderTextLayer]);
 
     const textLayerSpans =
       pageNumber === 1
@@ -259,8 +268,8 @@ vi.mock("../../../services/logger", () => ({
 // Mock URL.createObjectURL and revokeObjectURL
 const mockCreateObjectURL = vi.fn(() => "blob:mock-url");
 const mockRevokeObjectURL = vi.fn();
-global.URL.createObjectURL = mockCreateObjectURL;
-global.URL.revokeObjectURL = mockRevokeObjectURL;
+globalThis.URL.createObjectURL = mockCreateObjectURL;
+globalThis.URL.revokeObjectURL = mockRevokeObjectURL;
 
 let capturedInitialDocumentItemClick: ((args: { dest?: unknown; pageIndex?: number; pageNumber?: number }) => void) | undefined;
 let mockBlobUrlCounter = 0;
@@ -269,16 +278,17 @@ let mockPageRenderCounts = new Map<number, number>();
 let mockIntrinsicPageRotations = new Map<number, number>();
 let mockDocumentLoadErrors: Error[] = [];
 let mockPasswordRequest = false;
+let capturedDocumentPasswordHandler: ((callback: (password: string | null) => void) => void) | undefined;
 let submittedPdfPassword: string | null = null;
 let mockTextExtractionDelayMs = 0;
 let mockPageRenderDelayMs = 0;
 
-function mockMatchMedia(matches: boolean) {
+function mockMatchMedia(matches: boolean, reducedMotion = false) {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     configurable: true,
     value: vi.fn().mockImplementation((query: string) => ({
-      matches,
+      matches: query === "(prefers-reduced-motion: reduce)" ? reducedMotion : matches,
       media: query,
       onchange: null,
       addListener: vi.fn(),
@@ -291,7 +301,7 @@ function mockMatchMedia(matches: boolean) {
 }
 
 // Mock ResizeObserver
-global.ResizeObserver = class MockResizeObserver {
+globalThis.ResizeObserver = class MockResizeObserver {
   callback: ResizeObserverCallback;
 
   constructor(callback: ResizeObserverCallback) {
@@ -385,6 +395,7 @@ describe("PDFViewer", () => {
     mockIntrinsicPageRotations = new Map();
     mockDocumentLoadErrors = [];
     mockPasswordRequest = false;
+    capturedDocumentPasswordHandler = undefined;
     submittedPdfPassword = null;
     mockTextExtractionDelayMs = 0;
     mockPageRenderDelayMs = 0;
@@ -399,15 +410,16 @@ describe("PDFViewer", () => {
 
     // Mock successful API response by default
     (apiService.getPdfBlob as Mock).mockResolvedValue(new Blob(["mock pdf content"], { type: "application/pdf" }));
+    vi.mocked(apiService.getFileInfo).mockResolvedValue({ type: "file" } as never);
 
     // Reset AbortController to default
-    global.AbortController = class MockAbortController {
+    globalThis.AbortController = class MockAbortController {
       signal = { aborted: false } as AbortSignal;
       abort = vi.fn();
     } as unknown as typeof AbortController;
   });
 
-  const renderPDFViewer = (props = defaultProps) => {
+  const renderPDFViewer = (props: ComponentProps<typeof PDFViewer> = defaultProps) => {
     return render(
       <SambeeThemeProvider>
         <PDFViewer {...props} />
@@ -468,9 +480,10 @@ describe("PDFViewer", () => {
   });
 
   describe("Rendering States", () => {
-    it("renders loading state initially", () => {
+    it("delays the loading indicator initially", async () => {
       renderPDFViewer();
-      expect(screen.getByRole("progressbar")).toBeInTheDocument();
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      await waitForPageNavigationReady();
     });
 
     it("renders PDF document when loaded successfully", async () => {
@@ -507,24 +520,30 @@ describe("PDFViewer", () => {
       );
     });
 
-    it("shows CircularProgress while loading", () => {
-      renderPDFViewer();
-      expect(screen.getByRole("progressbar")).toBeInTheDocument();
-    });
-
-    it("does not show loading text for a promptly rendered PDF", async () => {
-      renderPDFViewer();
-
-      await waitFor(() => {
-        expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+    it("does not show a loading indicator for a promptly rendered PDF", async () => {
+      const loadingIndicators: Element[] = [];
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (node instanceof Element) {
+              loadingIndicators.push(...node.querySelectorAll('[role="progressbar"]'));
+              if (node.matches('[role="progressbar"]')) loadingIndicators.push(node);
+            }
+          }
+        }
       });
-
+      observer.observe(document.body, { childList: true, subtree: true });
+      renderPDFViewer();
+      await waitForPageNavigationReady();
+      observer.disconnect();
+      expect(loadingIndicators).toHaveLength(0);
       expect(screen.queryByTestId("pdf-loading-status")).not.toBeInTheDocument();
     });
 
-    it("keeps users informed until the first page has rendered", async () => {
+    it.each([false, true])("reveals only the rendered page with reduced motion %s", async (reducedMotion) => {
       vi.useFakeTimers();
-      mockPageRenderDelayMs = 6000;
+      mockMatchMedia(false, reducedMotion);
+      mockPageRenderDelayMs = 1000;
 
       try {
         renderPDFViewer();
@@ -533,7 +552,90 @@ describe("PDFViewer", () => {
           await Promise.resolve();
         });
 
-        expect(screen.getByTestId("pdf-loading-overlay")).toBeInTheDocument();
+        const presentation = screen.getByTestId("pdf-document-presentation");
+        expect(screen.getByTestId("pdf-page")).toBeInTheDocument();
+        expect(presentation).toHaveStyle({ opacity: "0", visibility: "hidden", transition: "none" });
+        expect(presentation).toHaveAttribute("aria-hidden", "true");
+        expect(presentation).toHaveAttribute("inert");
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(500);
+        });
+        expect(screen.getByRole("progressbar")).toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(500);
+        });
+
+        expect(presentation).toHaveStyle({
+          opacity: "1",
+          visibility: "visible",
+          transition: `opacity ${reducedMotion ? 0 : 160}ms ease-in-out`,
+        });
+        expect(presentation).toHaveAttribute("aria-hidden", "false");
+        expect(presentation).not.toHaveAttribute("inert");
+        expect(screen.getByLabelText("Next page")).toBeEnabled();
+
+        if (!reducedMotion) {
+          const overlay = screen.getByTestId("pdf-loading-overlay");
+          expect(overlay).toHaveStyle({ opacity: "0", pointerEvents: "none" });
+          expect(overlay).toHaveAttribute("aria-hidden", "true");
+          expect(overlay).toHaveAttribute("inert");
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(159);
+          });
+          expect(overlay).toBeInTheDocument();
+        }
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByLabelText("Next page"));
+        expect(getActivePdfPage()).toHaveAttribute("data-page", "2");
+        expect(presentation).toHaveStyle({ opacity: "1", visibility: "visible" });
+        expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    });
+
+    it("conceals a replacement document until its first page renders", async () => {
+      const { rerender } = renderPDFViewer();
+      await waitForPageNavigationReady();
+      mockPageRenderDelayMs = 1000;
+
+      rerender(
+        <SambeeThemeProvider>
+          <PDFViewer {...defaultProps} path="/test/replacement.pdf" />
+        </SambeeThemeProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId("pdf-document")).toHaveAttribute("data-file", "blob:mock-url-2");
+      });
+      expect(screen.getByTestId("pdf-document-presentation")).toHaveStyle({ opacity: "0", visibility: "hidden", transition: "none" });
+      expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Zoom in")).toBeDisabled();
+    });
+
+    it("keeps users informed until the first page has rendered", async () => {
+      vi.useFakeTimers();
+      mockPageRenderDelayMs = 6000;
+      const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+        expect(this.download).toBe("document.pdf");
+        expect(this.href).toBe("blob:mock-url-1");
+      });
+
+      try {
+        renderPDFViewer();
+        await act(async () => {
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+
+        expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
         expect(screen.queryByTestId("pdf-loading-status")).not.toBeInTheDocument();
         expect(screen.getByLabelText("Zoom in")).toBeDisabled();
         expect(screen.getByLabelText("Rotate right")).toBeDisabled();
@@ -541,9 +643,15 @@ describe("PDFViewer", () => {
         expect(screen.getByLabelText("Download")).toBeDisabled();
 
         await act(async () => {
-          await vi.advanceTimersByTimeAsync(500);
+          await vi.advanceTimersByTimeAsync(499);
         });
+        expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(screen.getByRole("progressbar")).toBeInTheDocument();
         expect(screen.getByText("Loading PDF")).toBeInTheDocument();
+        expect(screen.getByTestId("pdf-loading-status")).toHaveStyle({ position: "absolute", top: "calc(50% + 20px)" });
 
         await act(async () => {
           await vi.advanceTimersByTimeAsync(1500);
@@ -567,12 +675,14 @@ describe("PDFViewer", () => {
           await Promise.resolve();
         });
         expect(apiService.getOriginalFileBlob).toHaveBeenCalledWith("test-conn-id", "/test/document.pdf", { download: true });
+        expect(downloadClick).toHaveBeenCalledOnce();
 
         await act(async () => {
           await vi.advanceTimersByTimeAsync(6000);
         });
         expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
       } finally {
+        downloadClick.mockRestore();
         vi.clearAllTimers();
         vi.useRealTimers();
       }
@@ -603,6 +713,8 @@ describe("PDFViewer", () => {
         expect(screen.getByRole("button", { name: "Try compatibility mode" })).toBeInTheDocument();
       });
 
+      expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+      mockPageRenderDelayMs = 1000;
       await userEvent.click(screen.getByRole("button", { name: "Try compatibility mode" }));
 
       await waitFor(() => {
@@ -612,6 +724,98 @@ describe("PDFViewer", () => {
           expect.objectContaining({ pdfVariant: "normalized" })
         );
       });
+      expect(screen.getByTestId("pdf-document-presentation")).toHaveStyle({ opacity: "0", visibility: "hidden" });
+      expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+    });
+
+    it.each([false, true])("focuses the password and uses the shared filename display on mobile %s", async (mobile) => {
+      mockMatchMedia(mobile);
+      mockPasswordRequest = true;
+      const user = userEvent.setup();
+      renderPDFViewer();
+      const password = await screen.findByLabelText("PDF password");
+      expect(screen.getByRole("heading", { name: "Unlock PDF" })).toBeVisible();
+      expect(screen.getByText("File:", { selector: "dt" })).toBeInTheDocument();
+      expect(screen.queryByText("Source item:")).not.toBeInTheDocument();
+      const filename = screen.getByLabelText("document.pdf", { selector: "bdi" });
+      expect(filename.querySelector("code")).toHaveStyle({ fontFamily: "monospace" });
+      if (!mobile) {
+        act(() => screen.getByRole("button", { name: "Show password" }).focus());
+      }
+      await waitFor(() => expect(password).toHaveFocus());
+      await user.type(password, "secret");
+      await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      await waitForPageNavigationReady();
+      expect(submittedPdfPassword).toBe("secret");
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [false, "Escape"],
+      [false, "Cancel"],
+      [true, "Escape"],
+      [true, "Go back"],
+    ])("cancels the password load once on mobile %s with %s", async (mobile, action) => {
+      mockMatchMedia(mobile as boolean);
+      mockPasswordRequest = true;
+      const user = userEvent.setup();
+      renderPDFViewer();
+      await screen.findByLabelText("PDF password");
+      const stalePasswordHandler = capturedDocumentPasswordHandler;
+
+      if (action === "Escape") {
+        await user.keyboard("{Escape}");
+      } else {
+        await user.click(screen.getByRole("button", { name: action as string }));
+      }
+
+      expect(screen.queryByRole("dialog", { name: "Unlock PDF" })).not.toBeInTheDocument();
+      expect(screen.getByText(/PDF unlocking was canceled/)).toBeInTheDocument();
+      expect(screen.queryByTestId("pdf-document")).not.toBeInTheDocument();
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      if (!mobile) expect(screen.getByLabelText("Download")).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Try compatibility mode" })).not.toBeInTheDocument();
+      expect(mockRevokeObjectURL).toHaveBeenCalledWith("blob:mock-url-1");
+      expect(mockOnClose).not.toHaveBeenCalled();
+
+      await act(async () => stalePasswordHandler?.(vi.fn()));
+      expect(screen.queryByLabelText("PDF password")).not.toBeInTheDocument();
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
+
+      mockPasswordRequest = true;
+      await user.click(screen.getByRole("button", { name: "Retry" }));
+      await user.type(await screen.findByLabelText("PDF password"), "secret");
+      await act(async () => stalePasswordHandler?.(vi.fn()));
+      expect(screen.getByLabelText("PDF password")).toHaveValue("secret");
+      await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      await waitForPageNavigationReady();
+      expect(submittedPdfPassword).toBe("secret");
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(2);
+    });
+
+    it("allows another password attempt after an incorrect password", async () => {
+      mockPasswordRequest = true;
+      const user = userEvent.setup();
+      renderPDFViewer();
+      await user.type(await screen.findByLabelText("PDF password"), "wrong");
+      await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      await user.type(await screen.findByLabelText("PDF password"), "secret");
+      await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      await waitForPageNavigationReady();
+      expect(submittedPdfPassword).toBe("secret");
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the PDF password decision accessible", async () => {
+      mockPasswordRequest = true;
+      const user = userEvent.setup();
+      renderPDFViewer();
+      const password = await screen.findByLabelText("PDF password");
+      expect(screen.getByRole("dialog", { name: "Unlock PDF" })).toBeVisible();
+      await user.type(password, "secret");
+      await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      expect(submittedPdfPassword).toBe("secret");
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
     });
 
     it("submits an encrypted PDF password without requesting compatibility mode", async () => {
@@ -622,7 +826,10 @@ describe("PDFViewer", () => {
 
       await user.type(await screen.findByLabelText("PDF password"), "secret");
       expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("pdf-loading-overlay")).not.toBeInTheDocument();
+      expect(screen.getByTestId("pdf-document-presentation")).toHaveAttribute("inert");
       await user.click(screen.getByRole("button", { name: "Open PDF" }));
+      await waitForPageNavigationReady();
 
       expect(submittedPdfPassword).toBe("secret");
       expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
@@ -670,7 +877,7 @@ describe("PDFViewer", () => {
 
       await waitFor(
         () => {
-          expect(screen.getByText("Access denied")).toBeInTheDocument();
+          expect(screen.getByText("Access to this file was denied. Check your permissions and retry.")).toBeInTheDocument();
         },
         { timeout: 2000 }
       );
@@ -686,7 +893,7 @@ describe("PDFViewer", () => {
       renderPDFViewer();
 
       await waitFor(() => {
-        expect(screen.getByText("PDF request timed out")).toBeInTheDocument();
+        expect(screen.getByText("The file request timed out. Check the connection and retry.")).toBeInTheDocument();
       });
 
       await userEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -698,10 +905,16 @@ describe("PDFViewer", () => {
       expect(apiService.getPdfBlob).toHaveBeenCalledTimes(2);
     });
 
-    it("reuses the loaded PDF blob for mobile share", async () => {
+    it.each(["original", "normalized"] as const)("reuses the loaded %s PDF bytes for mobile share", async (variant) => {
       mockMatchMedia(true);
-      const share = vi.fn().mockResolvedValue(undefined);
+      const share = vi.fn().mockRejectedValue(new DOMException("blocked", "NotAllowedError"));
       const canShare = vi.fn().mockReturnValue(true);
+      const originalContent = "complete original PDF";
+      const normalizedContent = "complete normalized PDF with compatible structure";
+      (apiService.getPdfBlob as Mock).mockImplementation((_connectionId, _path, options) =>
+        Promise.resolve(new Blob([options?.pdfVariant === "normalized" ? normalizedContent : originalContent], { type: "application/pdf" }))
+      );
+      if (variant === "normalized") mockDocumentLoadErrors = [new Error("InvalidPDFException: Invalid PDF structure")];
 
       Object.defineProperty(globalThis, "navigator", {
         configurable: true,
@@ -719,7 +932,7 @@ describe("PDFViewer", () => {
       });
 
       await waitForPageNavigationReady();
-      fireEvent.click(screen.getByLabelText("Share"));
+      await act(async () => fireEvent.click(screen.getByLabelText("Share")));
 
       await waitFor(() => {
         expect(share).toHaveBeenCalledWith({
@@ -728,7 +941,98 @@ describe("PDFViewer", () => {
         });
       });
 
-      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(1);
+      const attachment = share.mock.calls[0]?.[0]?.files[0];
+      expect(await readBlobAsText(attachment)).toBe(variant === "normalized" ? normalizedContent : originalContent);
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(variant === "normalized" ? 2 : 1);
+      await userEvent.click(await screen.findByRole("button", { name: "Details" }));
+      await screen.findByText(/"reason": "NotAllowedError"/);
+      await userEvent.keyboard("{Escape}");
+      const details = await screen.findByRole("button", { name: "Details" });
+      await waitFor(() => expect(details).toHaveFocus());
+      expect(mockOnClose).not.toHaveBeenCalled();
+      mockCreateObjectURL.mockClear();
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+      try {
+        await userEvent.click(screen.getByRole("button", { name: "Download" }));
+        expect(mockCreateObjectURL).toHaveBeenCalledExactlyOnceWith(attachment);
+        expect(click).toHaveBeenCalledTimes(1);
+        expect(apiService.getOriginalFileBlob).not.toHaveBeenCalled();
+        expect(share).toHaveBeenCalledTimes(1);
+      } finally {
+        click.mockRestore();
+      }
+    });
+
+    it("invalidates a loaded PDF immediately and ignores a late replaced document", async () => {
+      mockMatchMedia(true);
+      const share = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "share", { configurable: true, value: share });
+      Object.defineProperty(navigator, "canShare", { configurable: true, value: () => true });
+      let resolveStale: (blob: Blob) => void = () => {};
+      (apiService.getPdfBlob as Mock)
+        .mockResolvedValueOnce(new Blob(["first document"], { type: "application/pdf" }))
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveStale = resolve;
+            })
+        )
+        .mockResolvedValueOnce(new Blob(["active replacement document"], { type: "application/pdf" }));
+      const { rerender } = renderPDFViewer();
+      await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+      fireEvent.click(screen.getByRole("button", { name: "Share" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+      const firstAttachment = share.mock.calls[0]?.[0]?.files[0];
+      rerender(
+        <SambeeThemeProvider>
+          <PDFViewer {...defaultProps} path="/test/stale.pdf" />
+        </SambeeThemeProvider>
+      );
+      expect(screen.getByRole("button", { name: "Share" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Share" }));
+      expect(share).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(apiService.getPdfBlob).toHaveBeenCalledTimes(2));
+      rerender(
+        <SambeeThemeProvider>
+          <PDFViewer {...defaultProps} path="/test/active.pdf" />
+        </SambeeThemeProvider>
+      );
+      await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+      await act(async () => resolveStale(new Blob(["late stale document"], { type: "application/pdf" })));
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Share" }));
+        expect(await readBlobAsText(share.mock.calls[1]?.[0]?.files[0])).toBe("active replacement document");
+        expect(await readBlobAsText(firstAttachment)).toBe("first document");
+      });
+      expect(apiService.getPdfBlob).toHaveBeenCalledTimes(3);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+    });
+
+    it("never shares the failed original while PDF normalization is pending or failed", async () => {
+      mockMatchMedia(true);
+      const share = vi.fn();
+      Object.defineProperty(navigator, "share", { configurable: true, value: share });
+      let rejectNormalization: (error: Error) => void = () => {};
+      (apiService.getPdfBlob as Mock)
+        .mockResolvedValueOnce(new Blob(["incompatible original"], { type: "application/pdf" }))
+        .mockImplementationOnce(
+          () =>
+            new Promise((_resolve, reject) => {
+              rejectNormalization = reject;
+            })
+        );
+      mockDocumentLoadErrors = [new Error("InvalidPDFException: Invalid PDF structure")];
+      renderPDFViewer();
+      await waitFor(() => expect(apiService.getPdfBlob).toHaveBeenCalledTimes(2));
+      const button = screen.getByRole("button", { name: "Share" });
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+      await act(async () => rejectNormalization(Object.assign(new Error("normalization failed"), { response: { status: 403 } })));
+      expect(await screen.findByText(/PDF compatibility processing could not make this file viewable/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Share" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Share" }));
+      expect(share).not.toHaveBeenCalled();
+      expect(apiService.getOriginalFileBlob).not.toHaveBeenCalled();
     });
   });
 
@@ -796,7 +1100,7 @@ describe("PDFViewer", () => {
         abort = abortSpy;
       }
 
-      global.AbortController = TestAbortController as unknown as typeof AbortController;
+      globalThis.AbortController = TestAbortController as unknown as typeof AbortController;
 
       const { unmount } = renderPDFViewer();
 
@@ -1003,7 +1307,9 @@ describe("PDFViewer", () => {
         expect(getActivePdfPage()).toHaveAttribute("data-page", "4");
       });
 
-      await new Promise((resolve) => window.setTimeout(resolve, SWIPE_SETTLE_WAIT_MS));
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, SWIPE_SETTLE_WAIT_MS));
+      });
       expect(getActivePdfPage()).toHaveAttribute("data-page", "4");
     });
 
@@ -1032,7 +1338,9 @@ describe("PDFViewer", () => {
         expect(getActivePdfPage()).toHaveAttribute("data-page", "1");
       });
 
-      await new Promise((resolve) => window.setTimeout(resolve, SWIPE_SETTLE_WAIT_MS));
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, SWIPE_SETTLE_WAIT_MS));
+      });
       expect(getActivePdfPage()).toHaveAttribute("data-page", "1");
 
       dragCarousel(screen.getByTestId("pdf-viewer-content"), 300, 200, 50, 200);
@@ -1342,16 +1650,17 @@ describe("PDFViewer", () => {
       });
     });
 
-    it("closes viewer on Escape", async () => {
+    it.each(["document", "viewer"])("closes viewer exactly once on Escape from %s", async (target) => {
       renderPDFViewer();
 
       await waitFor(() => {
         expect(screen.getByTestId("pdf-page")).toBeInTheDocument();
       });
 
-      fireEvent.keyDown(document, { key: "Escape" });
+      const eventTarget = target === "document" ? document : screen.getByTestId("pdf-viewer-content");
+      fireEvent.keyDown(eventTarget, { key: "Escape" });
 
-      expect(mockOnClose).toHaveBeenCalled();
+      expect(mockOnClose).toHaveBeenCalledTimes(1);
     });
 
     it("closes search instead of the viewer when Escape is pressed in the search input", async () => {
@@ -1540,7 +1849,9 @@ describe("PDFViewer", () => {
       });
 
       const settledRenderCount = mockPageRenderCounts.get(3);
-      await new Promise((resolve) => window.setTimeout(resolve, 150));
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+      });
       expect(mockPageRenderCounts.get(3)).toBe(settledRenderCount);
     });
 
@@ -1565,7 +1876,9 @@ describe("PDFViewer", () => {
       });
 
       const settledRenderCount = mockPageRenderCounts.get(3);
-      await new Promise((resolve) => window.setTimeout(resolve, 150));
+      await act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+      });
       expect(mockPageRenderCounts.get(3)).toBe(settledRenderCount);
     });
 
@@ -1629,13 +1942,13 @@ describe("PDFViewer", () => {
 
       await waitFor(
         () => {
-          expect(screen.getByText("Custom error message")).toBeInTheDocument();
+          expect(screen.getByText("The file could not be opened. Check the connection and retry.")).toBeInTheDocument();
         },
         { timeout: 2000 }
       );
     });
 
-    it("extracts detail field from API errors", async () => {
+    it("does not expose raw API detail or infer absence from an unclassified 404", async () => {
       const error = {
         response: { data: { detail: "File not found" }, status: 404 },
         message: "Request failed with status code 404",
@@ -1646,7 +1959,7 @@ describe("PDFViewer", () => {
 
       await waitFor(
         () => {
-          expect(screen.getByText("File not found")).toBeInTheDocument();
+          expect(screen.getByText("The file could not be opened. Check the connection and retry.")).toBeInTheDocument();
         },
         { timeout: 2000 }
       );
@@ -1678,7 +1991,7 @@ describe("PDFViewer", () => {
             "Failed to fetch PDF",
             expect.objectContaining({
               path: "/test/document.pdf",
-              error,
+              error: expect.objectContaining({ cause: error }),
             })
           );
         },

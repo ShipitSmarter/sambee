@@ -5,8 +5,8 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly BACKEND_DIR="${REPO_ROOT}/backend"
-readonly EXPECTED_PYTHON_MINOR="3.13"
-readonly PIP_TOOLS_VERSION="7.5.3"
+readonly EXPECTED_PYTHON_MINOR="3.14"
+readonly PIP_TOOLS_VERSION="7.6.1"
 readonly LOCKFILE_REFRESH_LOCALE="C.UTF-8"
 readonly REQUIREMENTS_LOCKFILE_NAME="requirements.lock.txt"
 readonly REQUIREMENTS_DEV_LOCKFILE_NAME="requirements-dev.lock.txt"
@@ -18,21 +18,22 @@ export LC_ALL="${LOCKFILE_REFRESH_LOCALE}"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/refresh-backend-lockfiles [--check]
+Usage: scripts/refresh-backend-lockfiles [--check] [--keep-existing]
 
 Regenerate backend lockfiles from the reviewed requirements sources.
 
 Options:
-  --check    Verify that committed lockfiles match regenerated output.
-  -h, --help Show this help message.
+    --check          Verify that committed lockfiles match regenerated output.
+    --keep-existing  Keep existing versions where compatible with the sources.
+    -h, --help       Show this help message.
 EOF
 }
 
 find_python() {
     local candidate
-    for candidate in python3.13 python3 python; do
+    for candidate in python3.14 python3 python; do
         if command -v "$candidate" >/dev/null 2>&1; then
-            if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 1)' >/dev/null 2>&1; then
+            if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 14) else 1)' >/dev/null 2>&1; then
                 printf '%s\n' "$candidate"
                 return 0
             fi
@@ -57,28 +58,32 @@ create_temp_env() {
     trap 'rm -rf "${TEMP_DIR}"' EXIT
 
     "$python_bin" -m venv "${TEMP_DIR}/venv"
-    # shellcheck disable=SC1091
-    source "${TEMP_DIR}/venv/bin/activate"
 
     # Use the interpreter's bundled pip so lockfile refresh matches the
     # repo's normal Python setup more closely than an independently pinned pip.
-    python -m pip install --quiet "pip-tools==${PIP_TOOLS_VERSION}"
+    "${TEMP_DIR}/venv/bin/python" -m pip install --quiet "pip-tools==${PIP_TOOLS_VERSION}"
 }
 
 compile_lockfiles() {
     local output_dir="$1"
+    local keep_existing="$2"
 
     mkdir -p "$output_dir"
 
+    if [[ "$keep_existing" == "true" ]]; then
+        cp "${BACKEND_DIR}/${REQUIREMENTS_LOCKFILE_NAME}" "${output_dir}/${REQUIREMENTS_LOCKFILE_NAME}"
+        cp "${BACKEND_DIR}/${REQUIREMENTS_DEV_LOCKFILE_NAME}" "${output_dir}/${REQUIREMENTS_DEV_LOCKFILE_NAME}"
+    fi
+
     (
         cd "${BACKEND_DIR}"
-        pip-compile \
+        "${TEMP_DIR}/venv/bin/python" -m piptools compile \
             --allow-unsafe \
             --generate-hashes \
             --output-file="${output_dir}/${REQUIREMENTS_LOCKFILE_NAME}" \
             requirements.txt
 
-        pip-compile \
+        "${TEMP_DIR}/venv/bin/python" -m piptools compile \
             --allow-unsafe \
             --generate-hashes \
             --output-file="${output_dir}/${REQUIREMENTS_DEV_LOCKFILE_NAME}" \
@@ -143,31 +148,36 @@ check_lockfiles() {
 
 main() {
     local mode="update"
+    local keep_existing="false"
     local python_bin
+    local argument
 
-    case "${1:-}" in
-        "")
-            ;;
-        --check)
-            mode="check"
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Error: unknown argument '${1}'." >&2
-            usage >&2
-            exit 1
-            ;;
-    esac
+    for argument in "$@"; do
+        case "$argument" in
+            --check)
+                mode="check"
+                ;;
+            --keep-existing)
+                keep_existing="true"
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Error: unknown argument '${argument}'." >&2
+                usage >&2
+                exit 1
+                ;;
+        esac
+    done
 
     check_repo_layout
     python_bin="$(find_python)"
 
     echo "Using ${python_bin} to refresh backend lockfiles."
     create_temp_env "$python_bin"
-    compile_lockfiles "${TEMP_DIR}/generated"
+    compile_lockfiles "${TEMP_DIR}/generated" "$keep_existing"
 
     if [[ "$mode" == "check" ]]; then
         check_lockfiles "${TEMP_DIR}/generated"

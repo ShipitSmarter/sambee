@@ -43,6 +43,7 @@ ui_screenshot:
   enabled: true
   preview_image:
     src: images/home/sambee-screenshot.png
+    dark_src: images/home/sambee-screenshot-dark.png
     alt: Screenshot of the Sambee main web interface
 
 benefits:
@@ -158,6 +159,8 @@ features:
           body: Take care of common file and folder operations from one browser interface.
         - title: Copy and move across storage locations
           body: Move files and folders between local drives and SMB shares.
+        - title: Inspect, create, and extract ZIP archives
+          body: Archives are virtual folders you can move around in. Files from within archives can be viewed directly without a need to extract them first.
     - id: desktop_app_editing
       icon: open_in_new
       title: Edit in desktop apps
@@ -193,9 +196,9 @@ features:
 preview_support:
   enabled: true
   eyebrow: Broad file type support
-  title: Viewers
+  title: Viewers & Editors
   body: >-
-    Sambee supports in-browser previewing for a broad range of file types,
+    Sambee supports in-browser previewing and/or editing for a broad range of file types,
     including images, PDFs, and Markdown.
   supporting_link:
     id: preview-support
@@ -300,7 +303,7 @@ companion:
     target:
       type: docs
       book: user-guide
-      section: companion-app
+      section: use-local-drives-and-desktop-apps
       page: install-and-pair-the-companion-app
 
 deployment:

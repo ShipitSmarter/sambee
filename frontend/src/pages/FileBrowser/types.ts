@@ -7,6 +7,7 @@ import type React from "react";
 import type { SearchProvider } from "../../components/FileBrowser/search/types";
 import type { BrowserHistoryService } from "../../services/browserHistoryService";
 import type { BrowserLinkTargetService } from "../../services/browserLinkTargetService";
+import type { CompanionPairingErrorKind } from "../../services/localDrivePairing";
 import type { StorageBackendRegistry } from "../../services/storageContracts";
 import type { Connection, FileEntry, FileType } from "../../types";
 import type { ViewerId } from "../../utils/FileTypeRegistry";
@@ -152,6 +153,7 @@ export interface UseFileBrowserPaneConfig {
 
   /** Recent-history and directory-navigation service composed at the page boundary. */
   history?: BrowserHistoryService;
+  sourceRevision?: number;
 
   /** Link-target metadata service composed at the page boundary. */
   linkTargets?: BrowserLinkTargetService;
@@ -186,6 +188,7 @@ export interface UseFileBrowserPaneConfig {
 
   /** Called when an incoming route resolves to a canonical existing location. */
   onResolveRouteLocation?: (path: string, archiveLocation: ArchiveLocation | null) => void;
+  onOpenViewer?: (info: ViewInfo) => void;
 }
 
 /** Everything returned by useFileBrowserPane for use by the parent and pane component. */
@@ -203,7 +206,14 @@ export interface UseFileBrowserPaneReturn {
   files: FileEntry[];
   loading: boolean;
   error: string | null;
+  errorOccurrence?: number;
+  notification?: import("../../components/OperationNotifications").OperationNotice | null;
+  dismissNotification?: () => void;
+  monitoredLocation?: { connectionId: string; path: string } | null;
+  handleDirectorySubscribed?: (change: { connectionId: string; path: string }) => void;
+  directoryUnavailable?: boolean;
   setError: React.Dispatch<React.SetStateAction<string | null>>;
+  companionPairingError: CompanionPairingErrorKind | null;
 
   // ── UI Preferences ─────────────────────────────────────────────────────
   sortBy: SortField;
@@ -211,7 +221,7 @@ export interface UseFileBrowserPaneReturn {
   sortDirection: "asc" | "desc";
   setSortDirection: React.Dispatch<React.SetStateAction<"asc" | "desc">>;
   viewMode: ViewMode;
-  setViewMode: React.Dispatch<React.SetStateAction<ViewMode>>;
+  setViewMode: (viewMode: ViewMode) => void;
   focusedIndex: number;
 
   // ── Selection State (multi-select) ────────────────────────────────────
@@ -223,6 +233,7 @@ export interface UseFileBrowserPaneReturn {
   handleSelectDown: (e?: KeyboardEvent) => void;
   /** Select the focused file and move focus up (Alt+ArrowUp). */
   handleSelectUp: (e?: KeyboardEvent) => void;
+  handleSelectToBoundary: (boundary: "first" | "last") => void;
   /** Select all files in the current directory (Ctrl+A). */
   handleSelectAll: () => void;
   /** Clear all selections. */
@@ -233,6 +244,7 @@ export interface UseFileBrowserPaneReturn {
   selectItem: (file: FileEntry, index: number) => void;
   /** Toggle one file without requiring list focus. */
   toggleItemSelection: (file: FileEntry, index: number) => void;
+  selectItemFromIcon: (file: FileEntry, index: number, extend: boolean, additive: boolean) => void;
   /** Resolves canonical file paths to the current operation handles. */
   getItemsByPaths: (paths: readonly string[]) => BrowserItem[];
   /**
@@ -266,8 +278,8 @@ export interface UseFileBrowserPaneReturn {
   openInAppLoading: boolean;
 
   // ── Refs (needed by parent for WebSocket wiring / shortcut checks) ────
-  parentRef: React.RefObject<HTMLDivElement>;
-  searchInputRef: React.RefObject<HTMLInputElement>;
+  parentRef: React.RefObject<HTMLDivElement | null>;
+  searchInputRef: React.RefObject<HTMLInputElement | null>;
   listContainerRef: (node: HTMLDivElement | null) => void;
   listContainerEl: HTMLDivElement | null;
   /** Always-current mirror of sortedFiles for use in callbacks. */
@@ -336,7 +348,11 @@ export interface UseFileBrowserPaneReturn {
    * `directory_changed` event is received.  Invalidates the cache entry
    * and triggers a reload if this pane is viewing the affected directory.
    */
-  handleDirectoryChanged: (change: DirectoryChange) => void;
+  handleDirectoryChanged: (change: DirectoryChange, options?: { invalidateOnly?: boolean }) => void;
+  handleDirectorySubscriptionError?: (change: DirectoryChange, code?: string) => void;
+  directoryMonitorError?: string | null;
+  directoryMonitorErrorSummary?: string;
+  directoryMonitorErrorOccurrence?: number;
 
   // ── Cache Management ───────────────────────────────────────────────────
   /** Clear all directory and navigation caches (e.g. on connection switch). */

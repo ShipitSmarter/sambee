@@ -1,4 +1,8 @@
-import api, { type ArchiveLiveExtractionStatus, type LocalArchiveRelayExtractionStatus } from "../../services/api";
+import api, {
+  type ArchiveLiveExtractionStatus,
+  type LocalArchiveExecution,
+  type LocalArchiveRelayExtractionStatus,
+} from "../../services/api";
 import { isLocalDrive } from "../../services/backendRouter";
 import {
   beginForegroundLocalArchiveRequest,
@@ -20,6 +24,17 @@ function nonNegativeCounter(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+function skippedMemberReasons(
+  aggregate?: object
+): Pick<ArchiveExtractionSummary, "encryptedMembersSkipped" | "unsupportedCompressionMembersSkipped"> {
+  const encrypted = nonNegativeCounter(aggregate && Reflect.get(aggregate, "encrypted_members_skipped"));
+  const unsupportedCompression = nonNegativeCounter(aggregate && Reflect.get(aggregate, "unsupported_compression_members_skipped"));
+  return {
+    ...(encrypted > 0 ? { encryptedMembersSkipped: encrypted } : {}),
+    ...(unsupportedCompression > 0 ? { unsupportedCompressionMembersSkipped: unsupportedCompression } : {}),
+  };
+}
+
 function archiveExtractionSummary(checkpointJson: string | undefined): ArchiveExtractionSummary {
   try {
     const checkpoint: unknown = JSON.parse(checkpointJson ?? "{}");
@@ -31,12 +46,13 @@ function archiveExtractionSummary(checkpointJson: string | undefined): ArchiveEx
       throw new Error("Archive extraction aggregate is invalid");
     }
     return {
-      filesExtracted: nonNegativeCounter(aggregate.files_extracted),
-      directoriesCreated: nonNegativeCounter(aggregate.directories_created),
-      extractedBytes: nonNegativeCounter(aggregate.extracted_bytes),
-      membersProcessed: nonNegativeCounter(aggregate.members_processed),
-      filesSkipped: nonNegativeCounter(aggregate.members_skipped),
-      filesReplaced: nonNegativeCounter(aggregate.files_replaced),
+      filesExtracted: nonNegativeCounter(Reflect.get(aggregate, "files_extracted")),
+      directoriesCreated: nonNegativeCounter(Reflect.get(aggregate, "directories_created")),
+      extractedBytes: nonNegativeCounter(Reflect.get(aggregate, "extracted_bytes")),
+      membersProcessed: nonNegativeCounter(Reflect.get(aggregate, "members_processed")),
+      filesSkipped: nonNegativeCounter(Reflect.get(aggregate, "members_skipped")),
+      filesReplaced: nonNegativeCounter(Reflect.get(aggregate, "files_replaced")),
+      ...skippedMemberReasons(aggregate),
       partialMembers: 0,
     };
   } catch {
@@ -70,6 +86,7 @@ function responseExtractionSummary(result: {
     membersProcessed: nonNegativeCounter(aggregate?.members_processed),
     filesSkipped: nonNegativeCounter(aggregate?.members_skipped),
     filesReplaced: nonNegativeCounter(aggregate?.files_replaced),
+    ...skippedMemberReasons(aggregate),
     partialMembers: 0,
   };
 }
@@ -158,7 +175,7 @@ export function startZipArchiveExtraction(request: ArchiveExtractionRequest): Ar
 
   let operationId: string | null = null;
   let localSignal: AbortSignal | null = null;
-  let localExecution: { executionId: string; revision: number } | null = null;
+  let localExecution: { executionId: string; revision: number; pendingDecision?: LocalArchiveExecution["pendingDecision"] } | null = null;
   let localCancellation: Promise<void> | null = null;
   let awaitingDecision = false;
   let cancellationRequested = false;

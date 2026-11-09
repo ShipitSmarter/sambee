@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.3.4/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
   "root": false,
   "vcs": {
     "enabled": true,
@@ -18,18 +18,60 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "preset": "recommended",
       "complexity": {
         "useLiteralKeys": "off"
       },
       "style": {
-        "noNonNullAssertion": "off"
+        "noNonNullAssertion": "off",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "@mui/material": {
+                "importNames": [
+                  "Chip"
+                ],
+                "message": "Use CompactBadge to enforce the 18-character badge-label limit."
+              },
+              "@mui/material/Chip": "Use CompactBadge to enforce the 18-character badge-label limit."
+            }
+          }
+        }
       },
       "suspicious": {
         "noExplicitAny": "warn"
       }
     }
   },
+  "overrides": [
+    {
+      "includes": [
+        "src/**/__tests__/**",
+        "src/test/**"
+      ],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noComponentHookFactories": "off",
+            "noPlaywrightMissingAwait": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "src/components/CompactBadge.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": "off"
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "quoteStyle": "double",

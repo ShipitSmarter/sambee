@@ -1,3 +1,4 @@
+import companionThemes from "../../../shared/companion-themes.json" with { type: "json" };
 import type { ThemeConfig } from "./types";
 
 //
@@ -10,12 +11,12 @@ import type { ThemeConfig } from "./types";
 export const builtInThemes: ThemeConfig[] = [
   // Sambee default light theme
   {
-    id: "sambee-light",
+    id: companionThemes["sambee-light"].id,
     name: "Sambee light",
     description: "Application default light theme",
-    mode: "light",
+    mode: companionThemes["sambee-light"].mode as "light",
     primary: {
-      main: "#F4C430", // Golden yellow
+      main: companionThemes["sambee-light"].primary.main,
       light: "#F6E58D",
       dark: "#D4A020",
       contrastText: "#1F262B", // Dark text for contrast
@@ -23,6 +24,7 @@ export const builtInThemes: ThemeConfig[] = [
     background: {
       default: "#FBF9F4", // Warm off-white
       paper: "#FFFFFF",
+      chrome: "#1F262B",
     },
     text: {
       primary: "#1F262B",
@@ -30,9 +32,18 @@ export const builtInThemes: ThemeConfig[] = [
     },
     action: {
       selected: "#F4C43029", // 16% opacity
-      focus: "#1F262B91", // High-contrast focus ring on golden controls
     },
     components: {
+      syntax: {
+        keyword: "#A62640",
+        string: "#216A35",
+        number: "#805400",
+        comment: "#626A73",
+        type: "#6851A5",
+        function: "#005C99",
+        operator: "#8F3540",
+        punctuation: "#525960",
+      },
       link: {
         main: "#C24400", // Dark for readability
         hover: "#FF5900", // Lighter on hover for visual feedback
@@ -57,6 +68,22 @@ export const builtInThemes: ThemeConfig[] = [
         toolbarBackground: "#1F262B", // Dark mode background
         toolbarText: "#F6F1E8", // Dark mode primary text
         secondaryToolbarSelected: "#D4A02042", // Selected background for the markdown editor secondary toolbar
+        document: {
+          blockBackground: "#F0EEE9",
+          inlineBackground: "#F0EEE9",
+          blockBorder: "#D4C4AE",
+          inlineBorder: "#D4C4AE",
+          codeText: "#1F262B",
+          activeLineGutterBackground: "#D4C4AE59",
+          tableBackground: "#FBF9F4",
+          alternateRowBackground: "#F5F3EE",
+          headerBackground: "#EAE8E3",
+          headerText: "#1F262B",
+          tableBorder: "#D4C4AE",
+          blockquoteBorder: "#DFE2E5",
+          blockquoteText: "#6A737D",
+          headingBorder: "#EAECEF",
+        },
       },
       alert: {
         info: {
@@ -84,12 +111,12 @@ export const builtInThemes: ThemeConfig[] = [
   },
   // Sambee default dark theme
   {
-    id: "sambee-dark",
+    id: companionThemes["sambee-dark"].id,
     name: "Sambee dark",
     description: "Application default dark theme",
-    mode: "dark",
+    mode: companionThemes["sambee-dark"].mode as "dark",
     primary: {
-      main: "#D4A020", // Muted golden yellow for default dark-mode controls
+      main: companionThemes["sambee-dark"].primary.main,
       light: "#F4C430", // Brighter hover and high-emphasis shade
       dark: "#B8860B", // Pressed and low-emphasis shade
       contrastText: "#1F262B",
@@ -97,6 +124,7 @@ export const builtInThemes: ThemeConfig[] = [
     background: {
       default: "#1F262B", // Dark charcoal
       paper: "#1F262B",
+      chrome: "#382C0A",
     },
     text: {
       primary: "#F6F1E8",
@@ -104,9 +132,18 @@ export const builtInThemes: ThemeConfig[] = [
     },
     action: {
       selected: "#D4A02038", // 22% opacity
-      focus: "#F6F1E8F0", // High-contrast focus ring on golden controls
     },
     components: {
+      syntax: {
+        keyword: "#FF8999",
+        string: "#A3D99B",
+        number: "#EDC47C",
+        comment: "#A2A9B1",
+        type: "#D1B3F0",
+        function: "#8FC8F5",
+        operator: "#F2A6B0",
+        punctuation: "#BCC3CB",
+      },
       link: {
         main: "#D4A020", // Default dark-mode primary shade
         hover: "#F4C430", // Brighter hover shade
@@ -131,6 +168,22 @@ export const builtInThemes: ThemeConfig[] = [
         toolbarBackground: "#2A3239", // App bar background
         toolbarText: "#F6F1E8", // Primary text
         secondaryToolbarSelected: "#D4A02042", // Selected background for the markdown editor secondary toolbar
+        document: {
+          blockBackground: "#1F1914",
+          inlineBackground: "#2B2925",
+          blockBorder: "#504535",
+          inlineBorder: "#3B3935",
+          codeText: "#EBE8E2",
+          activeLineGutterBackground: "#3D3D3D",
+          tableBackground: "#1B1C19",
+          alternateRowBackground: "#24231F",
+          headerBackground: "#302E2A",
+          headerText: "#EBE8E2",
+          tableBorder: "#3B3935",
+          blockquoteBorder: "#DFE2E5",
+          blockquoteText: "#6A737D",
+          headingBorder: "#EAECEF",
+        },
       },
       alert: {
         info: {

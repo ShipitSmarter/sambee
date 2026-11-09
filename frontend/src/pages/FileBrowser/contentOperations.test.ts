@@ -1,8 +1,15 @@
+import { act, renderHook } from "@testing-library/react";
+import type { TFunction } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import api from "../../services/api";
 import { browserHistoryService } from "../../services/browserHistoryService";
+import { StorageArchiveOperationCoordinator } from "../../services/storageArchiveOperations";
+import type { StorageBackendRegistry } from "../../services/storageContracts";
+import { requireTestValue } from "../../test/helpers/assertions";
+import { FileType } from "../../types";
 import {
   createContentItem,
+  downloadContentSelection,
   executeTransfer,
   executeTransferTree,
   getCreateContainerAvailability,
@@ -12,8 +19,8 @@ import {
   openContentInNativeApp,
   startCreateContainer,
 } from "./contentOperations";
-
-import { physicalItemHandle, physicalLocation, virtualItemHandle, virtualLocation } from "./contentProviders";
+import { physicalItem, physicalItemHandle, physicalLocation, virtualItem, virtualItemHandle, virtualLocation } from "./contentProviders";
+import { useBrowserDownload } from "./useBrowserDownload";
 
 vi.mock("../../services/api", () => ({
   default: {
@@ -28,6 +35,10 @@ vi.mock("../../services/api", () => ({
     recordRecentFile: vi.fn(),
     removeRecentFile: vi.fn(),
     transferAcrossBackends: vi.fn(),
+    downloadFile: vi.fn(),
+    downloadArchiveMember: vi.fn(),
+    downloadSelectionArchive: vi.fn(),
+    downloadZipSelectionArchive: vi.fn(),
   },
 }));
 
@@ -44,6 +55,150 @@ describe("content operations", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("keeps one download active until its request settles, including after cancellation", async () => {
+    const location = physicalLocation("source", "parent");
+    const file = physicalItem(location, {
+      name: "report.txt",
+      path: "parent/report.txt",
+      type: FileType.FILE,
+      is_readable: true,
+      is_hidden: false,
+    });
+    let finishDownload: (() => void) | undefined;
+    vi.mocked(api.downloadFile).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDownload = resolve;
+        })
+    );
+    const { result } = renderHook(() => useBrowserDownload({} as never, ((key: string) => key) as TFunction, vi.fn()));
+
+    let firstDownload: Promise<void> | undefined;
+    await act(async () => {
+      firstDownload = result.current.startDownload([file]);
+    });
+    expect(result.current.isDownloading).toBe(true);
+    await act(async () => {
+      await result.current.startDownload([file]);
+    });
+    expect(api.downloadFile).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.cancelDownload());
+    await act(async () => {
+      await result.current.startDownload([file]);
+    });
+    expect(api.downloadFile).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishDownload?.();
+      await firstDownload;
+    });
+    expect(result.current.isDownloading).toBe(false);
+    await act(async () => {
+      await result.current.startDownload([file]);
+    });
+    expect(api.downloadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows preparation only when a single-file handoff remains pending", async () => {
+    vi.useFakeTimers();
+    try {
+      const file = physicalItem(physicalLocation("source", "parent"), {
+        name: "report.txt",
+        path: "parent/report.txt",
+        type: FileType.FILE,
+        is_readable: true,
+        is_hidden: false,
+      });
+      let finishDownload: (() => void) | undefined;
+      vi.mocked(api.downloadFile).mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishDownload = resolve;
+          })
+      );
+      const { result } = renderHook(() => useBrowserDownload({} as never, ((key: string) => key) as TFunction, vi.fn()));
+
+      let download: Promise<void> | undefined;
+      act(() => {
+        download = result.current.startDownload([file]);
+      });
+      act(() => {
+        vi.advanceTimersByTime(299);
+      });
+      expect(result.current.showDownloadNotice).toBe(false);
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(result.current.showDownloadNotice).toBe(true);
+      await act(async () => {
+        finishDownload?.();
+        await vi.advanceTimersByTimeAsync(599);
+      });
+      expect(result.current.showDownloadNotice).toBe(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+        await download;
+      });
+      expect(result.current.showDownloadNotice).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes a regular file directly and a directory through selected-root ZIP creation", async () => {
+    const location = physicalLocation("source", "parent");
+    const file = physicalItem(location, {
+      name: "report.txt",
+      path: "parent/report.txt",
+      type: FileType.FILE,
+      is_readable: true,
+      is_hidden: false,
+    });
+    const directory = physicalItem(location, {
+      name: "folder",
+      path: "parent/folder",
+      type: FileType.DIRECTORY,
+      is_readable: true,
+      is_hidden: false,
+    });
+    const signal = new AbortController().signal;
+
+    await downloadContentSelection([file], {} as never, signal);
+    await downloadContentSelection([directory], {} as never, signal);
+
+    expect(api.downloadFile).toHaveBeenCalledWith("source", "parent/report.txt", "report.txt", signal);
+    expect(api.downloadSelectionArchive).toHaveBeenCalledWith("source", ["parent/folder"], signal);
+  });
+
+  it("routes ZIP virtual directories to their owning archive", async () => {
+    const location = virtualLocation("zip", "source", physicalLocation("source", "files.zip"), "inner");
+    const directory = virtualItem(location, {
+      name: "folder",
+      path: "inner/folder",
+      type: FileType.DIRECTORY,
+      is_readable: true,
+      is_hidden: false,
+    });
+    const signal = new AbortController().signal;
+    await downloadContentSelection([directory], {} as never, signal);
+    expect(api.downloadZipSelectionArchive).toHaveBeenCalledWith("source", "files.zip", ["inner/folder"], signal);
+  });
+
+  it("routes a single ZIP member to the native download transport", async () => {
+    const location = virtualLocation("zip", "source", physicalLocation("source", "files.zip"), "inner");
+    const member = virtualItem(location, {
+      name: "report.txt",
+      path: "inner/report.txt",
+      type: FileType.FILE,
+      is_readable: true,
+      is_hidden: false,
+    });
+    const signal = new AbortController().signal;
+    await downloadContentSelection([member], {} as never, signal);
+    expect(api.downloadArchiveMember).toHaveBeenCalledWith("source", "files.zip", "inner/report.txt", "report.txt", signal);
   });
 
   it("rejects virtual transfer and container destinations before invoking physical transport", async () => {
@@ -111,14 +266,48 @@ describe("content operations", () => {
       getCapabilities: vi.fn(() => ({ writable: true })),
       getBackend: vi.fn(() => ({ copyWithinBackend })),
     };
+    const onAttemptStart = vi.fn();
+    const onAttemptSettled = vi.fn();
 
-    await executeTransfer({ kind: "copy", source: physicalSource, destination: physicalLocation("source", "output") }, {
-      ...environment,
-      storageRegistry,
-    } as never);
+    await executeTransfer(
+      { kind: "copy", source: physicalSource, destination: physicalLocation("source", "output"), onAttemptStart, onAttemptSettled },
+      {
+        ...environment,
+        storageRegistry,
+      } as never
+    );
 
-    expect(copyWithinBackend).toHaveBeenCalledWith(expect.objectContaining({ targetName: undefined, targetResolutionPolicy: "ask" }));
+    expect(copyWithinBackend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetName: undefined,
+        targetResolutionPolicy: "ask",
+        transferAttemptId: requireTestValue(onAttemptStart.mock.calls[0])[0],
+      })
+    );
+    expect(onAttemptSettled).toHaveBeenCalledWith(requireTestValue(onAttemptStart.mock.calls[0])[0]);
     expect(api.copyItem).not.toHaveBeenCalled();
+  });
+
+  it("creates a transfer idempotency key when randomUUID is unavailable", async () => {
+    const copyWithinBackend = vi.fn().mockResolvedValue({ status: "completed" });
+    const resolvedTarget = { kind: "smb", connectionId: "source" };
+    const storageRegistry = {
+      resolveItem: vi.fn(() => ({ target: resolvedTarget, path: "report.txt" })),
+      resolveDirectory: vi.fn(() => ({ target: resolvedTarget, path: "output" })),
+      getCapabilities: vi.fn(() => ({ writable: true })),
+      getBackend: vi.fn(() => ({ copyWithinBackend })),
+    };
+    vi.stubGlobal("crypto", { getRandomValues: (bytes: Uint8Array) => bytes.fill(0) });
+    try {
+      await executeTransfer({ kind: "copy", source: physicalSource, destination: physicalLocation("source", "output") }, {
+        ...environment,
+        storageRegistry,
+      } as never);
+
+      expect(copyWithinBackend).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: "00000000-0000-4000-8000-000000000000" }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("allows and dispatches a writable same-provider move", async () => {
@@ -584,7 +773,7 @@ describe("content operations", () => {
       list: vi.fn().mockResolvedValue({ items: [{ name: "report.txt", path: "root/report.txt", type: "file" }] }),
       moveWithinBackend: vi.fn().mockResolvedValue({
         status: "completed",
-        replaced: false,
+        replaced: true,
         effects: { source: "mutated", destination: "mutated" },
       }),
       removeEmptyDirectory: vi.fn().mockResolvedValue({ status: "not_empty" }),
@@ -610,14 +799,75 @@ describe("content operations", () => {
         },
         { ...environment, storageRegistry } as never
       )
-    ).resolves.toMatchObject({ status: "completed_with_source_retained", effects: { source: "mutated", destination: "mutated" } });
+    ).resolves.toMatchObject({
+      status: "completed_with_source_retained",
+      replaced: true,
+      effects: { source: "mutated", destination: "mutated" },
+    });
   });
+
+  it.each(["outcome_unknown", "failed", "cancelled"] as const)(
+    "preserves previous mutations and replacement when a child is %s",
+    async (status) => {
+      const root = { name: "root", path: "root", type: "directory" };
+      const sourceBackend = {
+        getInfo: vi.fn(async () => root),
+        list: vi.fn().mockResolvedValue({
+          items: [
+            { name: "first.txt", path: "root/first.txt", type: "file" },
+            { name: "second.txt", path: "root/second.txt", type: "file" },
+          ],
+        }),
+        moveWithinBackend: vi
+          .fn()
+          .mockResolvedValueOnce({ status: "completed", replaced: true, effects: { source: "mutated", destination: "mutated" } })
+          .mockResolvedValueOnce({
+            status,
+            replaced: false,
+            effects: { source: "unknown", destination: "unknown" },
+            ...(status === "failed" ? { error: { code: "transport", detail: "connection lost" } } : {}),
+          }),
+        removeEmptyDirectory: vi.fn(),
+      };
+      const destinationBackend = {
+        getInfo: vi.fn(async ({ path }: { path: string }) => (path === "output/root" ? root : null)),
+        list: vi.fn().mockResolvedValue({ items: [] }),
+      };
+      const storageRegistry = {
+        resolveItem: vi.fn(({ connectionId, path }) => ({ target: { connectionId }, path })),
+        resolveDirectory: vi.fn(({ connectionId, path }) => ({ target: { connectionId }, path })),
+        getCapabilities: vi.fn(() => ({ writable: true })),
+        getBackend: vi.fn((target: { connectionId: string }) => (target.connectionId === "source" ? sourceBackend : destinationBackend)),
+      };
+      await expect(
+        executeTransferTree(
+          {
+            kind: "move",
+            source: physicalItemHandle("source", "root"),
+            destination: physicalLocation("destination", "output"),
+            onConflict: vi.fn(),
+          },
+          { ...environment, storageRegistry } as never
+        )
+      ).resolves.toMatchObject({
+        status,
+        replaced: true,
+        effects: { source: "mutated", destination: "mutated" },
+      });
+      expect(sourceBackend.removeEmptyDirectory).not.toHaveBeenCalled();
+    }
+  );
 
   it("leaves destination-only merge entries untouched", async () => {
     const root = { name: "root", path: "root", type: "directory" };
     const sourceBackend = {
       getInfo: vi.fn(async () => root),
-      list: vi.fn().mockResolvedValue({ items: [{ name: "source-only.txt", path: "root/source-only.txt", type: "file" }] }),
+      list: vi.fn().mockResolvedValue({
+        items: [
+          { name: "source-only.txt", path: "root/source-only.txt", type: "file" },
+          { name: "another.txt", path: "root/another.txt", type: "file" },
+        ],
+      }),
       copyWithinBackend: vi.fn().mockResolvedValue({
         status: "completed",
         replaced: false,
@@ -648,7 +898,10 @@ describe("content operations", () => {
       { ...environment, storageRegistry } as never
     );
 
-    expect(sourceBackend.copyWithinBackend).toHaveBeenCalledOnce();
+    expect(sourceBackend.copyWithinBackend).toHaveBeenCalledTimes(2);
+    expect(requireTestValue(sourceBackend.copyWithinBackend.mock.calls[0])[0].transferAttemptId).not.toBe(
+      requireTestValue(sourceBackend.copyWithinBackend.mock.calls[1])[0].transferAttemptId
+    );
     expect(destinationBackend.remove).not.toHaveBeenCalled();
   });
 
@@ -732,7 +985,7 @@ describe("content operations", () => {
   it("retries refreshed leaf conflicts without restarting the directory traversal", async () => {
     const root = { name: "root", path: "root", type: "directory" };
     const existing = { name: "report.txt", path: "output/root/report.txt", type: "file" };
-    const conflict = (target: typeof existing) => ({
+    const conflict = (target: typeof existing & { modified_at?: string }) => ({
       response: {
         status: 409,
         data: { detail: { incoming_file: { name: "report.txt", path: "root/report.txt", type: "file" }, existing_file: target } },
@@ -779,6 +1032,7 @@ describe("content operations", () => {
 
     expect(sourceBackend.list).toHaveBeenCalledTimes(1);
     expect(sourceBackend.copyWithinBackend).toHaveBeenCalledTimes(3);
+    expect(new Set(sourceBackend.copyWithinBackend.mock.calls.map(([transfer]) => transfer.transferAttemptId)).size).toBe(3);
     expect(onConflict).toHaveBeenCalledTimes(2);
     expect(onPolicyChange).toHaveBeenCalledWith("replace");
   });
@@ -1029,6 +1283,74 @@ describe("content operations", () => {
     expect(api.prepareArchiveOperation).not.toHaveBeenCalled();
   });
 
+  it("creates a same-SMB archive from selected ZIP members and rejects other destinations", async () => {
+    const zipLocation = virtualLocation("zip", "source", physicalLocation("source", "files.zip"), "inner");
+    const sources = [virtualItemHandle(zipLocation, "inner/one.txt"), virtualItemHandle(zipLocation, "inner/two.txt")];
+    const destination = physicalLocation("source", "output");
+    const target = { kind: "smb" as const, connectionId: "source" };
+    const resolvedTarget = {
+      target,
+      connection: null,
+      capabilitySnapshot: {
+        capabilityRevision: 1,
+        connections: [],
+        companion: { status: "unpaired" as const, revision: 0, drives: [], error: null },
+      },
+    };
+    const storageRegistry: StorageBackendRegistry = {
+      resolveItem: vi.fn(({ path }) => ({ target, path, resolvedTarget })),
+      resolveDirectory: vi.fn(({ path }) => ({ target, path, resolvedTarget })),
+      getBackend: vi.fn(() => {
+        throw new Error("Archive creation should use the coordinator, not resolve a backend directly");
+      }),
+      getCapabilities: vi.fn(() => ({
+        readable: true,
+        writable: true,
+        canEditText: true,
+        canList: true,
+        canReadArchive: true,
+        preview: { imageConversion: true, imageResizing: true, pdfNormalization: true },
+        canWriteFile: true,
+        canResolveActivation: true,
+        canOpenInNativeApp: true,
+      })),
+    };
+    const archiveOperations = new StorageArchiveOperationCoordinator(storageRegistry);
+    const startArchive = vi.spyOn(archiveOperations, "start").mockReturnValue({
+      result: Promise.resolve({ status: "completed", effects: { source: "unchanged", destination: "mutated" } }),
+      recoveryReady: Promise.resolve(null),
+      cancel: vi.fn(),
+      isCancellationRequested: () => false,
+    });
+    const context = { ...environment, storageRegistry, archiveOperations };
+
+    expect(getCreateContainerAvailability({ sources, destination }, context)).toEqual({ available: true });
+    await expect(startCreateContainer({ sources, destination, name: "selected.zip" }, context).result).resolves.toBeUndefined();
+    expect(startArchive).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sources: [expect.objectContaining({ path: "files.zip" })],
+        selectedMemberPaths: ["inner/one.txt", "inner/two.txt"],
+      })
+    );
+    expect(getCreateContainerAvailability({ sources, destination: physicalLocation("other", "output") }, context)).toEqual({
+      available: false,
+      reason: "unsupported-source",
+    });
+    const localTarget = { kind: "local" as const, driveId: "c" };
+    expect(
+      getCreateContainerAvailability(
+        { sources, destination },
+        {
+          ...context,
+          storageRegistry: {
+            ...storageRegistry,
+            resolveDirectory: ({ path }) => ({ target: localTarget, path, resolvedTarget: { ...resolvedTarget, target: localTarget } }),
+          },
+        }
+      )
+    ).toEqual({ available: false, reason: "unsupported-source" });
+  });
+
   it("delegates container creation failures to the archive coordinator", async () => {
     const resolvedTarget = {
       target: { kind: "smb", connectionId: "source" },
@@ -1061,7 +1383,7 @@ describe("content operations", () => {
     expect(archiveOperations.start).toHaveBeenCalledWith(expect.objectContaining({ name: "archive.zip" }));
   });
 
-  it("removes permanently invalid recent records when local native launch fails", async () => {
+  it("retains recent records when local native launch fails without confirmed absence", async () => {
     const nativeLaunchError = { response: { data: { code: "recent_file_native_launch_failed" } } };
     const resolvedTarget = {
       target: { kind: "local", driveId: "c" },
@@ -1087,6 +1409,6 @@ describe("content operations", () => {
       )
     ).rejects.toEqual(nativeLaunchError);
 
-    expect(api.removeRecentFile).toHaveBeenCalledWith("recent-1");
+    expect(api.removeRecentFile).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,4 @@
+import { createMockAuthToken } from "../../test/fixtures/users";
 /**
  * Browser Component - Rendering Tests
  * Tests for basic rendering, loading states, errors, and empty states
@@ -11,15 +12,17 @@ import { authSession } from "../../services/authSession";
 import { markBackendAvailable, markBackendReconnecting, resetBackendAvailabilityForTests } from "../../services/backendAvailability";
 import { emitBackendRecoveryConfirmed } from "../../services/backendRecoveryEvents";
 import { saveBrowserRecoverySnapshot } from "../../services/browserRecoverySnapshot";
+import { logger } from "../../services/logger";
 import {
   type ApiMock,
+  createForbiddenError,
   createMarkdownViewerMock,
   createSettingsDialogMock,
   createTimeoutError,
   setupSuccessfulApiMocks,
 } from "../../test/helpers";
 import { SambeeThemeProvider } from "../../theme/ThemeContext";
-import { mockConnections, mockDirectoryListing, renderBrowser } from "./FileBrowser.test.utils";
+import { mockConnections, mockDirectoryListing, renderBrowser, renderBrowserAndFlush } from "./FileBrowser.test.utils";
 
 const expectDirectoryLoad = (connectionId: string, path: string) => {
   expect(api.listDirectory).toHaveBeenCalledWith(
@@ -44,7 +47,7 @@ describe("Browser Component - Rendering", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetBackendAvailabilityForTests();
-    authSession.setAuthenticated({ access_token: "fake-token", token_type: "bearer" }, false);
+    authSession.setAuthenticated(createMockAuthToken({ access_token: "fake-token", token_type: "bearer" }), false);
     localStorage.removeItem("selectedConnectionId");
     sessionStorage.clear();
 
@@ -75,13 +78,48 @@ describe("Browser Component - Rendering", () => {
       right: null,
     });
 
-    renderBrowser("/browse");
+    renderBrowser("/browse/smb/test-server-1");
 
     expect((await screen.findAllByText("Documents")).length).toBeGreaterThan(0);
     expect(screen.queryByText(/Loading connections/i)).not.toBeInTheDocument();
   });
 
-  it("preserves a recovered viewer while synchronizing a different initial route", async () => {
+  it.each([new Error("offline"), createForbiddenError()])(
+    "keeps a recovered listing visible when background connections fail: %s",
+    async (failure) => {
+      saveBrowserRecoverySnapshot({
+        savedAt: Date.now(),
+        routeUrl: "/browse/smb/test-server-1",
+        activePaneId: "left",
+        paneMode: "single",
+        connections: mockConnections,
+        left: {
+          connectionId: "conn-1",
+          path: "",
+          items: mockDirectoryListing.items,
+          sortBy: "name",
+          sortDirection: "asc",
+          viewMode: "details",
+          focusedIndex: 0,
+          focusedFileName: "Documents",
+          selectedFileNames: [],
+          viewInfo: null,
+          scrollOffset: 0,
+        },
+        right: null,
+      });
+      vi.mocked(api.getConnections).mockRejectedValueOnce(failure);
+      const logSpy = vi.spyOn(logger, "error");
+
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
+      await waitFor(() => expect(logSpy).toHaveBeenCalledWith("Error loading connections", { error: failure }, "browser"));
+      expect((await screen.findAllByText("Documents")).length).toBeGreaterThan(0);
+      expect(screen.queryByText(/Failed to load connections|Access denied/i)).not.toBeInTheDocument();
+      logSpy.mockRestore();
+    }
+  );
+
+  it("ignores stale recovery navigation and legacy viewer state for an explicit URL", async () => {
     saveBrowserRecoverySnapshot({
       savedAt: Date.now(),
       routeUrl: "/browse/smb/test-server-1",
@@ -109,23 +147,17 @@ describe("Browser Component - Rendering", () => {
       right: null,
     });
 
-    renderBrowser("/browse");
+    await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
 
     await waitFor(() => {
-      expect(screen.getByTestId("router-location")).toHaveTextContent("/browse/smb/test-server-1");
+      expectDirectoryLoad("conn-1", "Documents");
     });
-    expect(await screen.findByTestId("markdown-viewer")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /documents/i }));
-
-    await waitFor(() => {
-      expect(screen.getByTestId("router-location")).toHaveTextContent("/browse/smb/test-server-1/Documents");
-    });
+    expect(screen.getByTestId("router-location")).toHaveTextContent("/browse/smb/test-server-1/Documents");
     expect(screen.queryByTestId("markdown-viewer")).not.toBeInTheDocument();
   });
 
   it("displays connection selector with available connections", async () => {
-    renderBrowser();
+    await renderBrowserAndFlush();
 
     // Optimized: Use findByRole instead of waitFor + getByRole
     const combobox = await screen.findByRole("combobox");
@@ -133,7 +165,7 @@ describe("Browser Component - Rendering", () => {
   });
 
   it("shows breadcrumb navigation", async () => {
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     // Now shows connection name in breadcrumb instead of "Root"
     // Use getAllByText and filter to avoid collision with connection selector combobox
@@ -143,7 +175,7 @@ describe("Browser Component - Rendering", () => {
   });
 
   it("renders file and folder list", async () => {
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     // Wait for connections to load first
     await waitFor(() => {
@@ -166,7 +198,7 @@ describe("Browser Component - Rendering", () => {
   });
 
   it("renders one toolbar without cross-pane commands in single-pane mode", async () => {
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     await screen.findAllByText("Documents");
 
@@ -178,7 +210,7 @@ describe("Browser Component - Rendering", () => {
   });
 
   it("renders one toolbar with transfer commands and an aligned status bar for each dual pane", async () => {
-    renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2");
 
     await waitFor(() => {
       expectDirectoryLoad("conn-1", "");
@@ -194,7 +226,7 @@ describe("Browser Component - Rendering", () => {
   it("keeps permitted creation and refresh commands available in an empty directory", async () => {
     vi.mocked(api.listDirectory).mockResolvedValue({ items: [], path: "", total: 0 });
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     expect(await screen.findByText(/This directory is empty/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "New folder" })).toBeEnabled();
@@ -205,7 +237,7 @@ describe("Browser Component - Rendering", () => {
   it("keeps the toolbar visible while mutation commands are disabled on a read-only connection", async () => {
     vi.mocked(api.getConnections).mockResolvedValue([{ ...mockConnections[0], access_mode: "read_only" }]);
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     await screen.findAllByText("Documents");
     expect(screen.getByRole("button", { name: "New folder" })).toBeDisabled();
@@ -227,7 +259,7 @@ describe("Browser Component - Rendering", () => {
     }));
 
     try {
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       await screen.findAllByText("Documents");
       expect(screen.queryByTestId("file-operations-toolbar")).not.toBeInTheDocument();
@@ -255,7 +287,7 @@ describe("Browser Component - Rendering", () => {
     }));
 
     try {
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       await screen.findByRole("button", { name: "More actions for readme.txt" });
       fireEvent.click(screen.getByRole("button", { name: "More actions for readme.txt" }));
@@ -293,7 +325,7 @@ describe("Browser Component - Rendering", () => {
     } as never);
 
     try {
-      renderBrowser("/browse/smb/test-server-1/archive.zip");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/archive.zip");
 
       await screen.findByRole("button", { name: /file: inside\.txt/i });
       expect(screen.getByText("archive.zip")).toBeInTheDocument();
@@ -315,37 +347,41 @@ describe("Browser Component - Rendering", () => {
     });
   });
 
-  it("shows reconnecting banner while backend realtime connection is recovering", () => {
-    render(
-      <SambeeThemeProvider>
-        <FileBrowserAlerts
-          error={null}
-          companionLifecycleStatus={null}
-          loadingConnections={false}
-          connectionsCount={1}
-          backendAvailabilityStatus="reconnecting"
-        />
-      </SambeeThemeProvider>
-    );
+  it("shows reconnecting banner while backend realtime connection is recovering", async () => {
+    await act(async () => {
+      render(
+        <SambeeThemeProvider>
+          <FileBrowserAlerts
+            error={null}
+            companionLifecycleStatus={null}
+            loadingConnections={false}
+            connectionsCount={1}
+            backendAvailabilityStatus="reconnecting"
+          />
+        </SambeeThemeProvider>
+      );
+    });
 
     expect(screen.getByText(/reconnecting to backend/i)).toBeInTheDocument();
   });
 
-  it("gives a standard user the linked connection onboarding when no connections are available", () => {
+  it("gives a standard user the linked connection onboarding when no connections are available", async () => {
     const openConnectionsSettings = vi.fn();
 
-    render(
-      <SambeeThemeProvider>
-        <FileBrowserAlerts
-          error={null}
-          companionLifecycleStatus={null}
-          loadingConnections={false}
-          connectionsCount={0}
-          backendAvailabilityStatus="available"
-          onOpenConnectionsSettings={openConnectionsSettings}
-        />
-      </SambeeThemeProvider>
-    );
+    await act(async () => {
+      render(
+        <SambeeThemeProvider>
+          <FileBrowserAlerts
+            error={null}
+            companionLifecycleStatus={null}
+            loadingConnections={false}
+            connectionsCount={0}
+            backendAvailabilityStatus="available"
+            onOpenConnectionsSettings={openConnectionsSettings}
+          />
+        </SambeeThemeProvider>
+      );
+    });
 
     const connectionLink = screen.getByRole("button", { name: "adding your first SMB network share" });
     fireEvent.click(connectionLink);
@@ -359,33 +395,34 @@ describe("Browser Component - Rendering", () => {
       response: { data: { detail: "Connection failed" } },
     });
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
-    // Optimized: Use findByText instead of waitFor + getByText
-    expect(await screen.findByText(/Connection failed/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Failed to load directory contents. Please try again.")).toBeInTheDocument());
     expect(screen.queryByText(/This directory is empty/i)).not.toBeInTheDocument();
   });
 
   it("shows a typed companion lifecycle alert from the route query", async () => {
-    renderBrowser("/browse/smb/test-server-1?companion_status=renewal_required");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?companion_status=renewal_required");
 
-    expect(await screen.findByText(/The companion edit session expired before the file could be finished/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByText(/The companion edit session expired before the file could be finished/i)).toBeInTheDocument()
+    );
   });
 
   it("shows the auth-failed companion lifecycle alert from the route query", async () => {
-    renderBrowser("/browse/smb/test-server-1?companion_status=auth_failed");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?companion_status=auth_failed");
 
-    expect(await screen.findByText(/The companion could not finish signing in to the Sambee backend/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/The companion could not finish signing in to the Sambee backend/i)).toBeInTheDocument());
   });
 
   it("shows the recovery-required companion lifecycle alert from the route query", async () => {
-    renderBrowser("/browse/smb/test-server-1?companion_status=recovery_required");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?companion_status=recovery_required");
 
-    expect(await screen.findByText(/The companion has an unfinished recovery item for this file/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/The companion has an unfinished recovery item for this file/i)).toBeInTheDocument());
   });
 
   it("ignores unknown companion lifecycle statuses in the route query", async () => {
-    renderBrowser("/browse/smb/test-server-1?companion_status=not_real");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?companion_status=not_real");
 
     await waitFor(() => {
       expect(api.listDirectory).toHaveBeenCalled();
@@ -394,20 +431,21 @@ describe("Browser Component - Rendering", () => {
     expect(screen.queryByText(/The companion /i)).not.toBeInTheDocument();
   });
 
-  it("dismisses the typed companion lifecycle alert and clears the query state", async () => {
-    renderBrowser("/browse/smb/test-server-1?companion_status=lock_lost");
+  it("dismisses the typed companion lifecycle alert while retaining recovery access", async () => {
+    await renderBrowserAndFlush("/browse/smb/test-server-1?companion_status=lock_lost");
 
-    expect(await screen.findByText(/The companion lost the active edit lock for this file/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/The companion lost the active edit lock for this file/i)).toBeInTheDocument());
 
-    screen.getByRole("button", { name: "Close" }).click();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
     await waitFor(() => {
       expect(screen.queryByText(/The companion lost the active edit lock for this file/i)).not.toBeInTheDocument();
     });
+    expect(screen.getByRole("button", { name: "Companion recovery" })).toBeInTheDocument();
   });
 
   it("refreshes the visible pane automatically when backend availability recovers", async () => {
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     await waitFor(() => {
       expect(api.listDirectory).toHaveBeenCalledTimes(1);
@@ -430,7 +468,7 @@ describe("Browser Component - Rendering", () => {
   it("keeps the previous file list visible if the recovery refresh times out", async () => {
     vi.mocked(api.listDirectory).mockResolvedValueOnce(mockDirectoryListing).mockRejectedValueOnce(createTimeoutError());
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     expect((await screen.findAllByText("Documents")).length).toBeGreaterThan(0);
 
@@ -444,12 +482,14 @@ describe("Browser Component - Rendering", () => {
 
     expect(screen.getAllByText("Documents").length).toBeGreaterThan(0);
     expect(screen.queryByText(/This directory is empty/i)).not.toBeInTheDocument();
-    expect(await screen.findByText(/Directory listing timed out. The remote share took too long to respond/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByText(/Directory listing timed out. The remote share took too long to respond/i)).toBeInTheDocument()
+    );
     expect(screen.getAllByText("Documents").length).toBeGreaterThan(0);
   });
 
   it("refreshes both visible panes automatically when dual-pane backend availability recovers", async () => {
-    renderBrowser("/browse/smb/test-server-1?p2=smb/test-server-2&active=2");
+    await renderBrowserAndFlush("/browse/smb/test-server-1?p2=smb/test-server-2&active=2");
 
     await waitFor(() => {
       expect(api.listDirectory).toHaveBeenCalledTimes(2);
@@ -473,7 +513,7 @@ describe("Browser Component - Rendering", () => {
   });
 
   it("refreshes the visible pane when a proactive recovery probe succeeds without a status transition", async () => {
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     await waitFor(() => {
       expect(api.listDirectory).toHaveBeenCalledTimes(1);
@@ -492,12 +532,14 @@ describe("Browser Component - Rendering", () => {
   it("shows retryable timeout state when directory loading times out", async () => {
     vi.mocked(api.listDirectory).mockRejectedValueOnce(createTimeoutError()).mockResolvedValueOnce(mockDirectoryListing);
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
-    expect(await screen.findByText(/Directory listing timed out. The remote share took too long to respond/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByText(/Directory listing timed out. The remote share took too long to respond/i)).toBeInTheDocument()
+    );
 
     const retryButton = screen.getByRole("button", { name: "Retry" });
-    retryButton.click();
+    fireEvent.click(retryButton);
 
     expect((await screen.findAllByText("Documents")).length).toBeGreaterThan(0);
     expect(api.listDirectory).toHaveBeenCalledTimes(2);
@@ -506,7 +548,7 @@ describe("Browser Component - Rendering", () => {
   it("shows message when no connections are configured", async () => {
     vi.mocked(api.getConnections).mockResolvedValue([]);
 
-    renderBrowser();
+    await renderBrowserAndFlush();
 
     // Optimized: Use findByText instead of waitFor + getByText
     expect(await screen.findByText(/adding your first SMB network share/i)).toBeInTheDocument();
@@ -519,7 +561,7 @@ describe("Browser Component - Rendering", () => {
       total: 0,
     });
 
-    renderBrowser("/browse/smb/test-server-1");
+    await renderBrowserAndFlush("/browse/smb/test-server-1");
 
     // Optimized: Use findByText instead of waitFor + getByText
     expect(await screen.findByText(/This directory is empty/i)).toBeInTheDocument();

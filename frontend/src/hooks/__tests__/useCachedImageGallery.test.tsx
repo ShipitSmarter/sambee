@@ -1,9 +1,9 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import apiService from "../../services/api";
 import { logger } from "../../services/logger";
 import { PreviewUnavailableError } from "../../services/previewPolicy";
+import { uninitializedTestCallback } from "../../test/helpers/assertions";
 import { IMAGE_LOAD_CANCELED_MESSAGE, IMAGE_LOAD_FAILED_MESSAGE, useCachedImageGallery } from "../useCachedImageGallery";
 
 vi.mock("../../services/api", () => ({
@@ -51,6 +51,75 @@ describe("useCachedImageGallery", () => {
       createObjectURL: vi.fn(() => "blob:gallery-image"),
       revokeObjectURL: vi.fn(),
     });
+  });
+
+  it("notifies local index changes without echoing callback replacement or routed index updates", async () => {
+    vi.mocked(apiService.getImageBlob).mockResolvedValue(new Blob(["image"], { type: "image/jpeg" }));
+    const onIndexChange = vi.fn();
+    const replacement = vi.fn();
+    const images = ["/0.jpg", "/1.jpg", "/2.jpg"];
+    const { result, rerender } = renderHook(
+      ({ initialIndex, callback }) =>
+        useCachedImageGallery({
+          connectionId: "conn-1",
+          images,
+          initialIndex,
+          onIndexChange: callback,
+          loadImageBlob: loadMockImageBlob,
+          preloadRange: 0,
+        }),
+      { initialProps: { initialIndex: 0, callback: onIndexChange } }
+    );
+    await waitFor(() => expect(result.current.currentImageLoadPhase).toBe("decoding"));
+    expect(onIndexChange).not.toHaveBeenCalled();
+
+    rerender({ initialIndex: 0, callback: replacement });
+    expect(replacement).not.toHaveBeenCalled();
+    act(() => result.current.setCurrentIndex(1));
+    expect(replacement).toHaveBeenCalledExactlyOnceWith(1);
+
+    rerender({ initialIndex: 1, callback: onIndexChange });
+    rerender({ initialIndex: 2, callback: replacement });
+    expect(result.current.currentIndex).toBe(2);
+    expect(replacement).toHaveBeenCalledTimes(1);
+    expect(onIndexChange).not.toHaveBeenCalled();
+
+    act(() => result.current.setCurrentIndex(0));
+    expect(replacement).toHaveBeenLastCalledWith(0);
+    expect(replacement).toHaveBeenCalledTimes(2);
+  });
+
+  it("reapplies an unchanged routed index after an optimistic move without dropping cached images", async () => {
+    vi.mocked(apiService.getImageBlob).mockResolvedValue(new Blob(["image"], { type: "image/jpeg" }));
+    const onIndexChange = vi.fn();
+    const images = ["/0.jpg", "/1.jpg"];
+    const { result, rerender } = renderHook(
+      ({ selectionKey }) =>
+        useCachedImageGallery({
+          connectionId: "conn-1",
+          images,
+          initialIndex: 0,
+          selectionKey,
+          onIndexChange,
+          loadImageBlob: loadMockImageBlob,
+          preloadRange: 0,
+        }),
+      { initialProps: { selectionKey: "opening" } }
+    );
+    await waitFor(() => expect(result.current.getCachedImageSrc(0)).toBeDefined());
+    act(() => result.current.setCurrentIndex(1));
+    await waitFor(() => expect(result.current.getCachedImageSrc(1)).toBeDefined());
+    expect(onIndexChange).toHaveBeenCalledExactlyOnceWith(1);
+    const originalImage = result.current.getCachedImageSrc(0);
+    const fetches = vi.mocked(apiService.getImageBlob).mock.calls.length;
+
+    rerender({ selectionKey: "back" });
+
+    expect(result.current.currentIndex).toBe(0);
+    expect(result.current.getCachedImageSrc(0)).toBe(originalImage);
+    expect(apiService.getImageBlob).toHaveBeenCalledTimes(fetches);
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    expect(onIndexChange).toHaveBeenCalledTimes(1);
   });
 
   it("waits for native image decoding before marking the current image ready", async () => {
@@ -122,6 +191,26 @@ describe("useCachedImageGallery", () => {
     });
 
     expect(decodeResult.current.errorStates.get(0)).toBe(IMAGE_LOAD_FAILED_MESSAGE);
+  });
+
+  it("fetches fresh bytes after a locally cached image fails decoding and Retry is selected", async () => {
+    const invalid = new Blob(["invalid"], { type: "image/jpeg" });
+    const replacement = new Blob(["replacement"], { type: "image/jpeg" });
+    vi.mocked(apiService.getImageBlob).mockResolvedValueOnce(invalid).mockResolvedValueOnce(replacement);
+    const { result } = renderHook(() =>
+      useCachedImageGallery({
+        connectionId: "conn-1",
+        loadImageBlob: loadMockImageBlob,
+        images: ["/0.jpg"],
+        preloadRange: 0,
+      })
+    );
+    await waitFor(() => expect(result.current.currentImageLoadPhase).toBe("decoding"));
+    act(() => result.current.markImageDecodeFailed(0, "blob:gallery-image"));
+    act(() => result.current.retryCurrentImage());
+    await waitFor(() => expect(result.current.getCachedImageBlob(0)).toBe(replacement));
+    expect(apiService.getImageBlob).toHaveBeenCalledTimes(2);
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:gallery-image");
   });
 
   it("keeps unrecognized API errors generic", async () => {
@@ -337,7 +426,7 @@ describe("useCachedImageGallery", () => {
 
   it("retries an in-flight preload once after it is promoted to the current image", async () => {
     const requestedPaths: string[] = [];
-    let rejectFirstPreloadAttempt: ((error: unknown) => void) | null = null;
+    let rejectFirstPreloadAttempt: (error: unknown) => void = uninitializedTestCallback;
     let preloadAttempts = 0;
 
     vi.mocked(apiService.getImageBlob).mockImplementation((_connectionId: string, path: string, options?: { signal?: AbortSignal }) => {
@@ -465,7 +554,7 @@ describe("useCachedImageGallery", () => {
 
   it("does not retry a request after it is demoted from current to overlap", async () => {
     const requestedPaths: string[] = [];
-    let rejectCurrentAttempt: ((error: unknown) => void) | null = null;
+    let rejectCurrentAttempt: (error: unknown) => void = uninitializedTestCallback;
     let firstPathAttempts = 0;
 
     vi.mocked(apiService.getImageBlob).mockImplementation((_connectionId: string, path: string, _options?: { signal?: AbortSignal }) => {
@@ -643,7 +732,7 @@ describe("useCachedImageGallery", () => {
 
   it("does not relaunch a request that fails after being demoted from current to overlap", async () => {
     const requestedPaths: string[] = [];
-    let rejectDemotedAttempt: ((error: unknown) => void) | null = null;
+    let rejectDemotedAttempt: (error: unknown) => void = uninitializedTestCallback;
 
     vi.mocked(apiService.getImageBlob).mockImplementation((_connectionId: string, path: string) => {
       requestedPaths.push(path);
@@ -726,7 +815,7 @@ describe("useCachedImageGallery", () => {
     });
 
     const { rerender } = renderHook(
-      ({ connectionId, images }) =>
+      ({ connectionId, images }: { connectionId: string; images: string[] }) =>
         useCachedImageGallery({
           connectionId,
           loadImageBlob: loadMockImageBlob,
@@ -737,7 +826,6 @@ describe("useCachedImageGallery", () => {
       {
         initialProps: {
           connectionId: "conn-1",
-          loadImageBlob: (path, options) => apiService.getImageBlob("conn-1", path, options),
           images: ["/a0.jpg", "/shared.jpg", "/a2.jpg"],
         },
       }
@@ -749,7 +837,6 @@ describe("useCachedImageGallery", () => {
 
     rerender({
       connectionId: "conn-1",
-      loadImageBlob: (path, options) => apiService.getImageBlob("conn-1", path, options),
       images: ["/b0.jpg", "/shared.jpg", "/b2.jpg"],
     });
 
@@ -794,6 +881,7 @@ describe("useCachedImageGallery", () => {
     expect(result.current.currentIndex).toBe(1);
     expect(result.current.getCachedImageSrc(1)).toBeUndefined();
     expect(result.current.imageCacheRef.current.has(1)).toBe(false);
+    await waitFor(() => expect(result.current.loadingStates.get(1)).toBe(true));
   });
 
   it("does not expose the previous gallery loading state at the same index on the first render after a gallery switch", async () => {
@@ -831,6 +919,7 @@ describe("useCachedImageGallery", () => {
 
     expect(result.current.currentIndex).toBe(1);
     expect(result.current.loadingStates.get(1)).toBeUndefined();
+    await waitFor(() => expect(result.current.loadingStates.get(1)).toBe(true));
   });
 
   it("does not expose the previous gallery error state at the same index on the first render after a gallery switch", async () => {
@@ -878,6 +967,7 @@ describe("useCachedImageGallery", () => {
 
     expect(result.current.currentIndex).toBe(1);
     expect(result.current.errorStates.get(1)).toBeUndefined();
+    await waitFor(() => expect(result.current.loadingStates.get(1)).toBe(true));
   });
 
   it("does not immediately relaunch a non-transient current-image failure before the retry gate opens", async () => {
@@ -1113,7 +1203,7 @@ describe("useCachedImageGallery", () => {
   });
 
   it("does not let a previous gallery request populate the new gallery cache when it resolves late", async () => {
-    let resolveOldGalleryCurrent: ((blob: Blob) => void) | null = null;
+    let resolveOldGalleryCurrent: (blob: Blob) => void = uninitializedTestCallback;
     const requestedPaths: string[] = [];
 
     vi.mocked(apiService.getImageBlob).mockImplementation((_connectionId: string, path: string) => {
@@ -1179,7 +1269,7 @@ describe("useCachedImageGallery", () => {
     expect(result.current.imageCacheRef.current.has(0)).toBe(false);
   });
 
-  it("does not emit a stale carried index when a gallery switch resets to the new initialIndex", async () => {
+  it("does not echo an external gallery switch or its stale carried index", async () => {
     const onIndexChange = vi.fn();
 
     vi.mocked(apiService.getImageBlob).mockImplementation((_connectionId: string, path: string) => {
@@ -1212,7 +1302,7 @@ describe("useCachedImageGallery", () => {
       expect(result.current.currentIndex).toBe(2);
     });
 
-    const callbackCountBeforeSwitch = onIndexChange.mock.calls.length;
+    expect(onIndexChange).toHaveBeenCalledExactlyOnceWith(2);
 
     rerender({
       images: ["/b0.jpg", "/b1.jpg", "/b2.jpg"],
@@ -1223,6 +1313,6 @@ describe("useCachedImageGallery", () => {
       expect(result.current.currentIndex).toBe(1);
     });
 
-    expect(onIndexChange.mock.calls.slice(callbackCountBeforeSwitch)).toEqual([[1]]);
+    expect(onIndexChange).toHaveBeenCalledTimes(1);
   });
 });

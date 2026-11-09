@@ -1,5 +1,6 @@
 import type { AxiosResponse } from "axios";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMockAuthToken } from "../../test/fixtures/users";
 import type {
   AdvancedSystemSettings,
   AuthToken,
@@ -12,6 +13,7 @@ import type {
   User,
 } from "../../types";
 import { FileType } from "../../types";
+import { randomUuid } from "../../utils/randomUuid";
 
 // Mock axios before importing the API service - use factory function
 // The factory needs to define the mock instance inside
@@ -46,9 +48,16 @@ vi.mock("axios", () => {
 // Get reference to the mocked functions for assertions
 import axios from "axios";
 // Now import the API service (it will use the mocked axios.create)
-import apiService, { ExpiredEditLockError, OIDC_FINALIZATION_REQUEST_TIMEOUT_MS } from "../api";
-import { authSession } from "../authSession";
+import apiService, {
+  ExpiredEditLockError,
+  OIDC_FINALIZATION_REQUEST_TIMEOUT_MS,
+  setOidcExchangePending,
+  startControlledReauthentication,
+} from "../api";
+import { AuthSessionError, authSession } from "../authSession";
 import { getBackendAvailabilitySnapshot, markBackendUnavailable, resetBackendAvailabilityForTests } from "../backendAvailability";
+import * as backendRouter from "../backendRouter";
+import { companionSession } from "../companionSession";
 import * as draftRecovery from "../draftRecovery";
 import { logger } from "../logger";
 
@@ -62,7 +71,10 @@ const mockAxiosInstance = mockedAxios.create() as ReturnType<typeof mockedAxios.
 };
 const requestInterceptorUse = vi.mocked(mockAxiosInstance.interceptors.request.use);
 const requestInterceptorHandlers = requestInterceptorUse.mock.calls[0] as
-  | [((config: { url?: string; headers: Record<string, string> }) => Promise<unknown>)?, ((error: unknown) => Promise<never>)?]
+  | [
+      ((config: { url?: string; method?: string; headers: Record<string, string> }) => Promise<unknown>)?,
+      ((error: unknown) => Promise<never>)?,
+    ]
   | undefined;
 const requestHandler = requestInterceptorHandlers?.[0];
 const responseInterceptorUse = vi.mocked(mockAxiosInstance.interceptors.response.use);
@@ -74,25 +86,168 @@ const responseErrorHandler = responseInterceptorHandlers?.[1];
 
 describe("API Service", () => {
   const fetchMock = vi.fn();
+  const uploadRequests: MockUploadRequest[] = [];
+
+  class MockUploadRequest {
+    upload = { onprogress: null as ((event: ProgressEvent) => void) | null, onload: null as (() => void) | null };
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    ontimeout: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    status = 200;
+    statusText = "OK";
+    responseText = JSON.stringify({ status: "completed", replaced: false, effects: { source: "unchanged", destination: "mutated" } });
+    url = "";
+    headers: Record<string, string> = {};
+    body: File | null = null;
+    open(_method: string, url: string) {
+      this.url = url;
+    }
+    setRequestHeader(name: string, value: string) {
+      this.headers[name] = value;
+    }
+    send(file: File) {
+      this.body = file;
+      uploadRequests.push(this);
+    }
+    abort() {
+      this.onabort?.();
+    }
+  }
 
   beforeEach(() => {
+    setOidcExchangePending(false);
     // Clear localStorage
     localStorage.clear();
     authSession.clear();
     resetBackendAvailabilityForTests();
 
     vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("XMLHttpRequest", MockUploadRequest);
+    uploadRequests.length = 0;
 
     // Reset all mock function calls
     vi.clearAllMocks();
   });
 
   afterEach(() => {
+    setOidcExchangePending(false);
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
   describe("OIDC request classification", () => {
+    it.each(["oidc_reauthentication_required", undefined])("ignores obsolete token 401s (%s)", async (code) => {
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-a", token_type: "bearer", user_id: "same-user" }), true);
+      const request = (await requestHandler?.({ url: "/themes", method: "get", headers: {} })) as { headers: Record<string, string> };
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-b", token_type: "bearer", user_id: "same-user" }), true);
+      markBackendUnavailable("Recovery in progress");
+      const availabilityBeforeFailure = getBackendAvailabilitySnapshot();
+      const refresh = vi.spyOn(authSession, "requestRefresh");
+      const snapshot = vi.spyOn(draftRecovery, "snapshotRegisteredDrafts");
+      const error = {
+        response: { status: 401, data: code ? { detail: { code } } : {}, headers: {} },
+        message: "Unauthorized",
+        config: { url: "/themes", method: "get", headers: request.headers },
+      };
+
+      await expect(responseErrorHandler?.(error as never)).rejects.toBe(error);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(snapshot).not.toHaveBeenCalled();
+      expect(window.location.assign).not.toHaveBeenCalled();
+      expect(getBackendAvailabilitySnapshot()).toBe(availabilityBeforeFailure);
+      const currentRequest = (await requestHandler?.({ url: "/themes", method: "get", headers: {} })) as {
+        headers: Record<string, string>;
+      };
+      expect(currentRequest.headers["Authorization"]).toBe("Bearer session-b");
+      responseSuccessHandler?.({ config: { method: "get", url: "/themes" }, status: 200, statusText: "OK" } as never);
+      expect(window.location.assign).not.toHaveBeenCalled();
+    });
+
+    it("keeps current-token 401 handling and never replays a write", async () => {
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-b", token_type: "bearer" }), true);
+      const refresh = vi
+        .spyOn(authSession, "requestRefresh")
+        .mockResolvedValue(createMockAuthToken({ access_token: "renewed", token_type: "bearer" }));
+      const error = {
+        response: { status: 401, headers: {} },
+        message: "Unauthorized",
+        config: { url: "/themes", method: "get", headers: { Authorization: "Bearer session-b" } },
+      };
+      mockAxiosInstance.request.mockResolvedValue({ data: {} });
+      await expect(responseErrorHandler?.(error as never)).resolves.toEqual({ data: {} });
+      expect(refresh).toHaveBeenCalledOnce();
+
+      const writeError = { ...error, config: { url: "/settings", method: "post", headers: { Authorization: "Bearer session-b" } } };
+      await expect(responseErrorHandler?.(writeError as never)).rejects.toBe(writeError);
+      expect(mockAxiosInstance.request).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["success", "failure"])("does not act on A's 401 when its refresh settles after B (%s)", async (outcome) => {
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-a", token_type: "bearer" }), true);
+      let finishRefresh!: (response: AuthToken) => void;
+      let failRefresh!: (reason: Error) => void;
+      const refresh = new Promise<AuthToken>((resolve, reject) => {
+        finishRefresh = resolve;
+        failRefresh = reject;
+      });
+      vi.spyOn(authSession, "requestRefresh").mockReturnValue(refresh);
+      const snapshot = vi.spyOn(draftRecovery, "snapshotRegisteredDrafts");
+      const error = {
+        response: { status: 401, headers: {} },
+        message: "Unauthorized",
+        config: { url: "/themes", method: "get", headers: { Authorization: "Bearer session-a" } },
+      };
+      const pending = responseErrorHandler?.(error as never);
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-b", token_type: "bearer" }), true);
+      if (outcome === "success") finishRefresh(createMockAuthToken({ access_token: "old-refresh", token_type: "bearer" }));
+      else failRefresh(new Error("Refresh failed"));
+
+      await expect(pending).rejects.toBe(error);
+      expect(authSession.getAccessToken()).toBe("session-b");
+      expect(mockAxiosInstance.request).not.toHaveBeenCalled();
+      expect(snapshot).not.toHaveBeenCalled();
+      expect(window.location.assign).not.toHaveBeenCalled();
+    });
+
+    it("does not redirect for a request-time refresh failure after B arrives", async () => {
+      let failRefresh!: (reason: Error) => void;
+      const refreshIfNeeded = vi.spyOn(authSession, "refreshIfNeeded").mockReturnValue(
+        new Promise((_, reject) => {
+          failRefresh = reject;
+        })
+      );
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-a", token_type: "bearer" }), true);
+      const request = requestHandler?.({ url: "/themes", method: "get", headers: {} });
+      authSession.setAuthenticated(createMockAuthToken({ access_token: "session-b", token_type: "bearer" }), true);
+      failRefresh(new AuthSessionError("reauthentication-required", "Session expired"));
+      await expect(request).rejects.toMatchObject({ code: "reauthentication-required" });
+      expect(window.location.assign).not.toHaveBeenCalled();
+      refreshIfNeeded.mockRestore();
+    });
+
+    it("suppresses exchange-time 401s even when they arrive after a failed exchange", async () => {
+      setOidcExchangePending(true);
+      const refresh = vi.spyOn(authSession, "requestRefresh");
+      const config = await requestHandler?.({ url: "/themes", method: "get", headers: {} });
+      expect(refresh).not.toHaveBeenCalled();
+      const error = {
+        response: { status: 401, data: { detail: { code: "oidc_reauthentication_required" } }, headers: {} },
+        message: "Unauthorized",
+        config,
+      };
+      await expect(responseErrorHandler?.(error as never)).rejects.toBe(error);
+      expect(window.location.assign).not.toHaveBeenCalled();
+      setOidcExchangePending(false);
+      await expect(responseErrorHandler?.(error as never)).rejects.toBe(error);
+      expect(window.location.assign).not.toHaveBeenCalled();
+      const currentRequest = await requestHandler?.({ url: "/themes", method: "get", headers: {} });
+      await expect(responseErrorHandler?.({ ...error, config: currentRequest } as never)).rejects.toMatchObject({
+        response: error.response,
+      });
+      expect(window.location.assign).toHaveBeenCalledOnce();
+    });
+
     it("refreshes before authenticated OIDC session-control requests", async () => {
       const refreshIfNeeded = vi.spyOn(authSession, "refreshIfNeeded").mockResolvedValue();
 
@@ -140,6 +295,55 @@ describe("API Service", () => {
       expect(window.location.assign).toHaveBeenCalledWith("/login?return_path=%2F");
       expect(authSession.requestRefresh).not.toHaveBeenCalled();
     });
+
+    it("attempts a synchronous snapshot before sign-in without requiring a storage acknowledgement", () => {
+      const snapshot = vi.fn(() => {
+        expect(window.location.assign).not.toHaveBeenCalled();
+        return { saved: false as const, reason: "storage-unavailable" as const };
+      });
+      const unregister = draftRecovery.registerDraftSnapshot(snapshot);
+      try {
+        startControlledReauthentication();
+        expect(snapshot).toHaveBeenCalledOnce();
+        expect(window.location.assign).toHaveBeenCalledOnce();
+      } finally {
+        unregister();
+      }
+    });
+
+    it("preserves drafts and the browse return path at a no-refresh deadline", async () => {
+      vi.spyOn(authSession, "refreshIfNeeded").mockRestore();
+      const originalPathname = window.location.pathname;
+      const originalSearch = window.location.search;
+      const deadline = Date.now() + 30_000;
+      authSession.setAuthenticated(
+        createMockAuthToken({
+          access_token: "expiring-token",
+          token_type: "bearer",
+          user_id: "user-1",
+          oidc_session_capability: "reauthorization_only",
+          oidc_session_expires_at: new Date(deadline).toISOString(),
+          access_token_expires_at: new Date(deadline).toISOString(),
+        }),
+        true
+      );
+      const snapshotDrafts = vi.spyOn(draftRecovery, "snapshotRegisteredDrafts");
+      window.location.pathname = "/browse/smb/demo";
+      window.location.search = "?path=notes";
+      const clock = vi.spyOn(Date, "now").mockReturnValue(deadline);
+      try {
+        await expect(requestHandler?.({ url: "/settings", method: "post", headers: {} })).rejects.toMatchObject({
+          code: "reauthentication-required",
+        });
+        expect(snapshotDrafts).toHaveBeenCalled();
+        expect(window.location.assign).toHaveBeenCalledWith("/login?return_path=%2Fbrowse%2Fsmb%2Fdemo%3Fpath%3Dnotes");
+        expect(mockAxiosInstance.request).not.toHaveBeenCalled();
+      } finally {
+        clock.mockRestore();
+        window.location.pathname = originalPathname;
+        window.location.search = originalSearch;
+      }
+    });
   });
 
   it("uses a bounded timeout for OIDC finalization", async () => {
@@ -150,6 +354,7 @@ describe("API Service", () => {
     await apiService.finalizeOidcConfiguration(
       "flow-id",
       {
+        no_refresh_session_limit_hours: 8,
         sign_in_mode: "oidc_only",
         interactive_reauthentication_max_age_days: 30,
         admission_mode: "selected_groups",
@@ -157,6 +362,7 @@ describe("API Service", () => {
         role_assignment_mode: "uniform",
         uniform_role: "editor",
         role_mappings: { admin: ["admins"], editor: [], viewer: [] },
+        auto_link_by_username: true,
       },
       [],
       1,
@@ -170,11 +376,13 @@ describe("API Service", () => {
         reviewed_policy: {
           sign_in_mode: "oidc_only",
           interactive_reauthentication_max_age_days: 30,
+          no_refresh_session_limit_hours: 8,
           admission_mode: "selected_groups",
           admission_groups: ["users"],
           role_assignment_mode: "uniform",
           uniform_role: "editor",
           role_mappings: { admin: ["admins"], editor: [], viewer: [] },
+          auto_link_by_username: true,
         },
         replacement_mappings: [],
         expected_identity_mapping_revision: 1,
@@ -210,6 +418,23 @@ describe("API Service", () => {
       expect.objectContaining({ idempotency_key: "00000000-0000-4000-8000-000000000004" }),
       expect.anything()
     );
+  });
+
+  it("generates secure v4 IDs for copy and move without randomUUID", async () => {
+    const getRandomValues = vi.fn((bytes: Uint8Array) => bytes.fill(0xff));
+    vi.stubGlobal("crypto", { getRandomValues });
+    mockAxiosInstance.post.mockResolvedValue({
+      data: { status: "completed", replaced: false, effects: { source: "unchanged", destination: "mutated" } },
+    } as AxiosResponse);
+
+    expect(randomUuid()).toBe("ffffffff-ffff-4fff-bfff-ffffffffffff");
+    await apiService.copyItem("connection", "source.txt", "destination.txt", "copy-key");
+    await apiService.moveItem("connection", "source.txt", "destination.txt", "move-key");
+
+    expect(getRandomValues).toHaveBeenCalledTimes(3);
+    for (const [, body] of mockAxiosInstance.post.mock.calls) {
+      expect(body.transfer_attempt_id).toBe("ffffffff-ffff-4fff-bfff-ffffffffffff");
+    }
   });
 
   it("forwards cancellation to a same-provider transfer request", async () => {
@@ -366,6 +591,253 @@ describe("API Service", () => {
       "http://localhost:3000/api/browse/destination/transfer-stream?path=target.txt&target_resolution_policy=ask&expected_size=0&source_modified_at=2026-09-07T12%3A00%3A00Z",
       expect.objectContaining({ body: expect.anything(), duplex: "half" })
     );
+  });
+
+  it("publishes a browser file through the staged destination endpoint", async () => {
+    const file = new File(["hello"], "report.txt", { lastModified: Date.UTC(2026, 8, 7, 12) });
+    file.stream = vi.fn(() => {
+      throw new Error("File stream must not be read");
+    });
+
+    const result = apiService.publishBrowserFile(file, "destination", "folder/report.txt", "ask");
+    await vi.waitFor(() => expect(uploadRequests).toHaveLength(1));
+    const request = uploadRequests[0]!;
+    request.onload?.();
+    await expect(result).resolves.toMatchObject({
+      status: "completed",
+    });
+
+    expect(request.url).toBe(
+      "http://localhost:3000/api/browse/destination/transfer-stream?path=folder%2Freport.txt&target_resolution_policy=ask&expected_size=5&source_modified_at=2026-09-07T12%3A00%3A00.000Z"
+    );
+    expect(request.body).toBe(file);
+    expect(file.stream).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends the same File with XHR for HTTP and HTTPS destinations", async () => {
+    const file = new File(["hello"], "report.txt");
+    file.stream = vi.fn(() => {
+      throw new Error("File stream must not be read");
+    });
+    const baseUrl = vi.spyOn(backendRouter, "getBaseUrl");
+    try {
+      for (const scheme of ["http", "https"]) {
+        baseUrl.mockReturnValue(`${scheme}://example.test/api`);
+        const result = apiService.publishBrowserFile(file, "destination", "report.txt");
+        await vi.waitFor(() => expect(uploadRequests).toHaveLength(scheme === "http" ? 1 : 2));
+        const request = uploadRequests[uploadRequests.length - 1]!;
+        expect(request.url).toMatch(new RegExp(`^${scheme}://example\\.test/api/`));
+        expect(request.body).toBe(file);
+        request.onload?.();
+        await expect(result).resolves.toMatchObject({ status: "completed" });
+      }
+      expect(file.stream).not.toHaveBeenCalled();
+    } finally {
+      baseUrl.mockRestore();
+    }
+  });
+
+  it("reports bytes sent and waits for publication confirmation", async () => {
+    const file = new File(["hello"], "report.txt");
+    const onProgress = vi.fn();
+    const onUploadSent = vi.fn();
+    const result = apiService.publishBrowserFile(file, "destination", "report.txt", "ask", { onProgress, onUploadSent });
+    let settled = false;
+    void result.then(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(uploadRequests).toHaveLength(1));
+    const request = uploadRequests[0]!;
+    expect(request.headers["Content-Type"]).toBe("application/octet-stream");
+    request.upload.onprogress?.({ lengthComputable: false, loaded: 2 } as ProgressEvent);
+    request.upload.onprogress?.({ lengthComputable: true, loaded: 2 } as ProgressEvent);
+    request.upload.onprogress?.({ lengthComputable: true, loaded: 5 } as ProgressEvent);
+    expect(onProgress.mock.calls).toEqual([
+      [2, 5],
+      [5, 5],
+    ]);
+    request.upload.onload?.();
+    expect(onUploadSent).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+    request.onload?.();
+    await expect(result).resolves.toMatchObject({ status: "completed" });
+    expect(request.upload.onprogress).toBeNull();
+    expect(request.onload).toBeNull();
+  });
+
+  it("cancels before sending and treats a network error after sending as uncertain", async () => {
+    const file = new File(["hello"], "report.txt");
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      apiService.publishBrowserFile(file, "destination", "report.txt", "ask", { signal: controller.signal })
+    ).resolves.toMatchObject({ status: "cancelled" });
+    expect(uploadRequests).toHaveLength(0);
+
+    const result = apiService.publishBrowserFile(file, "destination", "report.txt");
+    await vi.waitFor(() => expect(uploadRequests).toHaveLength(1));
+    uploadRequests[0]!.onerror?.();
+    await expect(result).resolves.toMatchObject({ status: "outcome_unknown", effects: { destination: "unknown" } });
+  });
+
+  it("treats a timed-out or zero-status upload as uncertain", async () => {
+    for (const fail of ["timeout", "zero-status"]) {
+      const result = apiService.publishBrowserFile(new File(["hello"], "report.txt"), "destination", "report.txt");
+      await vi.waitFor(() => expect(uploadRequests).toHaveLength(fail === "timeout" ? 1 : 2));
+      const request = uploadRequests[uploadRequests.length - 1]!;
+      if (fail === "timeout") request.ontimeout?.();
+      else {
+        request.status = 0;
+        request.onload?.();
+      }
+      await expect(result).resolves.toMatchObject({ status: "outcome_unknown", effects: { destination: "unknown" } });
+    }
+  });
+
+  it("returns conflict metadata for a browser file without implicit replacement", async () => {
+    const file = new File([], "report.txt");
+    const existing = { name: "report.txt", path: "folder/report.txt", type: FileType.FILE, size: 4, is_readable: true, is_hidden: false };
+    mockAxiosInstance.get.mockResolvedValueOnce({ data: existing } as AxiosResponse);
+    const result = apiService.publishBrowserFile(file, "destination", "folder/report.txt");
+    await vi.waitFor(() => expect(uploadRequests).toHaveLength(1));
+    const request = uploadRequests[0]!;
+    request.status = 409;
+    request.responseText = "Destination already exists";
+    request.onload?.();
+
+    await expect(result).rejects.toMatchObject({
+      response: { status: 409, data: { detail: { existing_file: existing, incoming_file: { name: "report.txt", size: 0 } } } },
+    });
+    expect(request.url).toContain("target_resolution_policy=ask");
+  });
+
+  it("reports an interrupted browser-file destination request as outcome unknown", async () => {
+    const file = new File([], "report.txt");
+    const controller = new AbortController();
+    const result = apiService.publishBrowserFile(file, "destination", "report.txt", "ask", { signal: controller.signal });
+    await vi.waitFor(() => expect(uploadRequests).toHaveLength(1));
+    controller.abort();
+    await expect(result).resolves.toMatchObject({
+      status: "outcome_unknown",
+      effects: { destination: "unknown" },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("requests a selected-root ZIP without putting authentication in the URL", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(["zip"]), { status: 200 }));
+    const save = vi.spyOn(apiService, "saveDownloadBlob").mockImplementation(() => {});
+    await apiService.downloadSelectionArchive("destination", ["folder", "file.txt"]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:3000/api/browse/destination/download-selection",
+      expect.objectContaining({ method: "POST", body: '["folder","file.txt"]' })
+    );
+    expect(save).toHaveBeenCalledWith(expect.any(Blob), "Sambee-download.zip");
+  });
+
+  it("aborts preparation before handing a physical file to the browser", async () => {
+    const controller = new AbortController();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ url: "/api/viewer/download-intents/scoped-token" }), { status: 200 }));
+
+    const download = apiService.downloadFile("destination", "report.txt", "report.txt", controller.signal);
+    controller.abort();
+    await download;
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:3000/api/viewer/download-intents",
+      expect.objectContaining({ method: "POST", signal: controller.signal })
+    );
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("hands a single file to the browser without fetching its bytes", async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.href).toBe("http://localhost:3000/api/viewer/download-intents/scoped-token");
+      expect(this.download).toBe("report.txt");
+    });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ url: "/api/viewer/download-intents/scoped-token" }), { status: 200 }));
+
+    await apiService.downloadFile("destination", "report.txt", "report.txt");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("hands a ZIP member to the browser through a server download intent", async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ url: "/api/viewer/download-intents/member-token" }), { status: 200 }));
+
+    await apiService.downloadArchiveMember("destination", "files.zip", "inner/report.txt", "report.txt");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:3000/api/viewer/download-intents",
+      expect.objectContaining({
+        body: JSON.stringify({ connection_id: "destination", path: "files.zip", member_path: "inner/report.txt" }),
+      })
+    );
+    expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("issues a signed companion intent for a local ZIP member without fetching bytes", async () => {
+    const sign = vi.spyOn(companionSession, "getSigningHeaders").mockResolvedValueOnce({ "X-Companion-Secret": "signed" });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.href).toBe("http://localhost:21549/api/download-intents/local-token");
+    });
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ url: "/api/download-intents/local-token" }), { status: 200 }));
+
+    await apiService.downloadArchiveMember("local-drive:test", "files.zip", "inner/report.txt", "report.txt");
+
+    expect(sign).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:21549/api/download-intents",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ drive: "test", path: "files.zip", member_path: "inner/report.txt" }),
+      })
+    );
+    expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("authenticates local selection ZIPs with both Companion and backend sessions", async () => {
+    vi.spyOn(companionSession, "getSigningHeaders").mockResolvedValueOnce({
+      "X-Companion-Secret": "signed",
+      "X-Companion-Timestamp": "123",
+    });
+    vi.spyOn(authSession, "getAccessToken").mockReturnValueOnce("backend-token");
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(["zip"]), { status: 200 }));
+    const save = vi.spyOn(apiService, "saveDownloadBlob").mockImplementation(() => {});
+
+    await apiService.downloadSelectionArchive("local-drive:test", ["folder"]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:21549/api/browse/test/download-selection",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer backend-token", "X-Companion-Secret": "signed" }),
+      })
+    );
+    expect(save).toHaveBeenCalledWith(expect.any(Blob), "Sambee-download.zip");
+  });
+
+  it("authenticates local ZIP-member selection with both sessions", async () => {
+    vi.spyOn(companionSession, "getSigningHeaders").mockResolvedValueOnce({ "X-Companion-Secret": "signed" });
+    vi.spyOn(authSession, "getAccessToken").mockReturnValueOnce("backend-token");
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(["zip"]), { status: 200 }));
+    const save = vi.spyOn(apiService, "saveDownloadBlob").mockImplementation(() => {});
+
+    await apiService.downloadZipSelectionArchive("local-drive:test", "source.zip", ["folder"]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:21549/api/browse/test/archive/download-selection",
+      expect.objectContaining({
+        method: "POST",
+        body: '{"archive_path":"source.zip","paths":["folder"]}',
+        headers: expect.objectContaining({ Authorization: "Bearer backend-token", "X-Companion-Secret": "signed" }),
+      })
+    );
+    expect(save).toHaveBeenCalledWith(expect.any(Blob), "Sambee-download.zip");
   });
 
   it("does not begin a cross-provider relay when the source size is unknown", async () => {
@@ -666,6 +1138,23 @@ describe("API Service", () => {
     expect(mockAxiosInstance.post).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { status: "outcome_unknown", replaced: true, effects: { source: "unknown", destination: "mutated" } },
+    { status: "outcome_unknown", replaced: true, effects: { source: "mutated", destination: "mutated" } },
+    {
+      status: "failed",
+      replaced: true,
+      effects: { source: "unchanged", destination: "mutated" },
+      error: { code: "source_changed", detail: "Source changed after publication" },
+    },
+  ] as const)("preserves factual transfer response without retry: %j", async (result) => {
+    mockAxiosInstance.post.mockResolvedValueOnce({ data: result } as AxiosResponse);
+    await expect(
+      apiService.moveItem("source", "report.txt", "incoming/report.txt", "00000000-0000-4000-8000-000000000009", "destination", "replace")
+    ).resolves.toEqual(result);
+    expect(mockAxiosInstance.post).toHaveBeenCalledTimes(1);
+  });
+
   it("phase_10_stabilization_normalizes_unavailable_response", async () => {
     mockAxiosInstance.post.mockResolvedValue({
       data: {
@@ -792,6 +1281,7 @@ describe("API Service", () => {
         },
         text_editor: {
           max_file_size_bytes: 1048576,
+          word_wrap_enabled: null,
         },
       };
 
@@ -1068,12 +1558,13 @@ describe("API Service", () => {
           max_value: 16777216,
           step: 65536,
         },
+        domain_controller_primary: "",
+        domain_controller_secondary: "",
         policy: {
           authentication_mode: "negotiate",
           encryption_mode: "signing_only",
           connection_timeout_seconds: 30,
         },
-        policy_source: "default",
         require_signing: true,
         require_encryption: false,
       };
@@ -1259,7 +1750,6 @@ describe("API Service", () => {
 
       expect(result).toEqual(resolution);
       expect(mockAxiosInstance.get).toHaveBeenCalledWith("/browse/c/resolve-activation", {
-        headers: expect.any(Object),
         params: { path: "Links/report.lnk" },
       });
     });
@@ -1281,7 +1771,6 @@ describe("API Service", () => {
 
       expect(result).toEqual(listing);
       expect(mockAxiosInstance.get).toHaveBeenCalledWith("/browse/c/link-targets", {
-        headers: expect.any(Object),
         params: { path: "Links" },
         timeout: 15_000,
       });
@@ -1303,13 +1792,13 @@ describe("API Service", () => {
       expect(mockAxiosInstance.post).toHaveBeenCalledWith(
         "/browse/c/archive/v2/executions",
         { contract_version: "v2", kind: "create", source_paths: ["Documents/report.txt"], target_path: "Archives/backup.zip" },
-        { headers: expect.any(Object) }
+        {}
       );
     });
 
     it("authenticates SMB-to-local archive extraction with the browser token", async () => {
       localStorage.setItem("companion_secret", "test-companion-secret");
-      authSession.setAuthenticated({ access_token: "browser-token", token_type: "bearer" }, false);
+      authSession.setAuthenticated({ access_token: "browser-token", token_type: "bearer", username: "testuser" }, false);
       mockAxiosInstance.post.mockResolvedValueOnce({ data: { members_completed: 1 } } as AxiosResponse);
 
       await apiService.extractSmbArchiveToLocal("local-drive:c", "output", "operation-id");
@@ -1336,16 +1825,8 @@ describe("API Service", () => {
       });
 
       expect(mockAxiosInstance.post.mock.calls.slice(-2)).toEqual([
-        [
-          "/browse/c/archive/v2/executions/create-1/cancellation",
-          { contract_version: "v2", expected_revision: 1 },
-          { headers: expect.any(Object) },
-        ],
-        [
-          "/browse/c/archive/v2/executions/create-1/cancellation",
-          { contract_version: "v2", expected_revision: 2 },
-          { headers: expect.any(Object) },
-        ],
+        ["/browse/c/archive/v2/executions/create-1/cancellation", { contract_version: "v2", expected_revision: 1 }, {}],
+        ["/browse/c/archive/v2/executions/create-1/cancellation", { contract_version: "v2", expected_revision: 2 }, {}],
       ]);
     });
   });
@@ -1432,6 +1913,36 @@ describe("API Service", () => {
       );
     });
 
+    it.each(["conn1", "local-drive:c"])("preserves configured conversion-limit errors for %s", async (connectionId) => {
+      localStorage.setItem("companion_secret", "test-companion-secret");
+      const data = { detail: "PDF exceeds the configured source size limit" };
+      mockAxiosInstance.get.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 413, data: new Blob([JSON.stringify(data)]) },
+      });
+
+      await expect(apiService.getArchiveMember(connectionId, "files.zip", "large.pdf", { request: { kind: "pdf" } })).rejects.toMatchObject(
+        {
+          response: { status: 413, data },
+        }
+      );
+    });
+
+    it.each(["conn1", "local-drive:c"])("returns large archive preview content for %s", async (connectionId) => {
+      localStorage.setItem("companion_secret", "test-companion-secret");
+      const blob = new Blob([new Uint8Array(6 * 1024 * 1024)]);
+      mockAxiosInstance.get.mockResolvedValueOnce({ data: blob, headers: {} } as AxiosResponse);
+
+      await expect(apiService.getArchiveMember(connectionId, "files.zip", "large.pdf", { request: { kind: "pdf" } })).resolves.toBe(blob);
+    });
+
+    it("does not classify an archive download limit as a preview limit", async () => {
+      const error = { isAxiosError: true, response: { status: 413, data: { detail: "Download exceeds its size limit" } } };
+      mockAxiosInstance.get.mockRejectedValueOnce(error);
+
+      await expect(apiService.getArchiveMember("conn1", "files.zip", "large.pdf", { download: true })).rejects.toBe(error);
+    });
+
     it("getFileContent() fetches file content as text", async () => {
       localStorage.setItem("access_token", "content-token");
 
@@ -1473,6 +1984,25 @@ describe("API Service", () => {
       expect((uploadedFile as File).name).toBe("readme.md");
       expect((uploadedFile as File).type).toBe("text/plain;charset=utf-8");
       expect((uploadedFile as File).size).toBeGreaterThan(0);
+    });
+
+    it.each([
+      [404, { detail: { code: "item_not_found", message: "private SMB path" } }, "missing"],
+      [404, { code: "item_not_found", detail: "private OS path" }, "missing"],
+      [403, { code: "file_access_denied", detail: "private identity" }, "access_denied"],
+      [409, { code: "not_a_file", detail: "private path" }, "not_file"],
+      [504, { code: "file_timeout", detail: "private server" }, "timeout"],
+      [404, { detail: "private unknown failure" }, "unknown"],
+    ])("preserves a classified %s editor upload failure without raw details", async (status, data, kind) => {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } }));
+      const request = apiService.writeTextWithEditLock("conn1", "/notes/readme.md", "# Unsaved draft\n", {
+        lock_id: "lock-1",
+        lock_capability: "capability-1",
+        operation_id: "operation-1",
+      });
+      await expect(request).rejects.toMatchObject({ failure: { kind } });
+      await expect(request).rejects.not.toThrow(/private/);
+      await expect(request).rejects.not.toBeInstanceOf(ExpiredEditLockError);
     });
 
     it("classifies an expired edit lock upload response with a nested error code", async () => {
@@ -1535,7 +2065,9 @@ describe("API Service", () => {
         locked_by: "alice",
         locked_at: "2026-03-23T12:00:00Z",
       });
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/browse/conn1/lock", undefined, { params: { path: "/docs/readme.md" } });
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/browse/conn1/lock", undefined, {
+        params: { path: "/docs/readme.md", check_write_access: true },
+      });
     });
 
     it("heartbeatEditLock() refreshes the server-side lock heartbeat", async () => {
@@ -1561,6 +2093,42 @@ describe("API Service", () => {
           params: { path: "/docs/readme.md" },
         }
       );
+    });
+
+    it.each(["nested", "top-level"])("classifies a lost heartbeat lock with a %s code", async (shape) => {
+      const detail = { code: "edit_lock_lost" };
+      mockAxiosInstance.post.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: shape === "nested" ? { detail } : detail },
+      });
+      await expect(
+        apiService.heartbeatEditLock("conn1", "/docs/readme.md", {
+          lock_id: "lock-1",
+          lock_capability: "cap-1",
+          operation_id: "op-1",
+          file_path: "/docs/readme.md",
+          locked_by: "alice",
+          locked_at: "2026-10-19T12:00:00Z",
+        })
+      ).rejects.toBeInstanceOf(ExpiredEditLockError);
+    });
+
+    it.each([
+      { isAxiosError: true, response: { status: 404, data: { detail: "Not found" } } },
+      { isAxiosError: true, response: { status: 403, data: { detail: "Context mismatch" } } },
+      new Error("Network unavailable"),
+    ])("preserves non-expiry heartbeat failures: %j", async (error) => {
+      mockAxiosInstance.post.mockRejectedValueOnce(error);
+      await expect(
+        apiService.heartbeatEditLock("conn1", "/docs/readme.md", {
+          lock_id: "lock-1",
+          lock_capability: "cap-1",
+          operation_id: "op-1",
+          file_path: "/docs/readme.md",
+          locked_by: "alice",
+          locked_at: "2026-10-19T12:00:00Z",
+        })
+      ).rejects.toEqual(error);
     });
 
     it("releaseEditLock() releases the server-side lock", async () => {
@@ -1615,7 +2183,7 @@ describe("API Service", () => {
       expect(result).toEqual({ locked: true, locked_by: "alice" });
       expect(mockAxiosInstance.get).toHaveBeenCalledWith(
         "/browse/c/lock-status",
-        expect.objectContaining({ params: { path: "/docs/readme.md" }, headers: expect.any(Object) })
+        expect.objectContaining({ params: { path: "/docs/readme.md" } })
       );
     });
 
@@ -1639,7 +2207,7 @@ describe("API Service", () => {
       expect(mockAxiosInstance.post).toHaveBeenCalledWith(
         "/browse/c/lock",
         undefined,
-        expect.objectContaining({ params: { path: "/docs/readme.md" }, headers: expect.any(Object) })
+        expect.objectContaining({ params: { path: "/docs/readme.md", check_write_access: true } })
       );
       expect(mockAxiosInstance.post).toHaveBeenCalledWith(
         "/browse/c/lock/heartbeat",
@@ -1648,7 +2216,7 @@ describe("API Service", () => {
           lock_id: "lock-1",
           lock_capability: "cap-1",
         },
-        expect.objectContaining({ params: { path: "/docs/readme.md" }, headers: expect.any(Object) })
+        expect.objectContaining({ params: { path: "/docs/readme.md" } })
       );
       expect(mockAxiosInstance.delete).toHaveBeenCalledWith(
         "/browse/c/lock",
@@ -1659,7 +2227,6 @@ describe("API Service", () => {
             lock_id: "lock-1",
             lock_capability: "cap-1",
           },
-          headers: expect.any(Object),
         })
       );
     });

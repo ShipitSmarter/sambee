@@ -3,7 +3,7 @@
 # Shared runtime for production, development, and container validation. Normal
 # builds retain the stable default; scheduled image workflows may opt in to a
 # refresh until immutable system package inputs are introduced.
-ARG PYTHON_BASE_IMAGE=python:3.13.12-slim@sha256:f1927c75e81efd1e091dbd64b6c0ecaa5630b38635a3d1c04034ac636e1f94c8
+ARG PYTHON_BASE_IMAGE=python:3.14.7-slim@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d
 FROM ${PYTHON_BASE_IMAGE} AS runtime-base
 ENV DEBIAN_FRONTEND=noninteractive
 ARG APT_REFRESH_KEY=static
@@ -15,13 +15,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     UPGRADE_EXISTING_PACKAGES=1 bash /tmp/install-system-deps && \
     rm /tmp/install-system-deps
 
+COPY backend/build-tools/requirements.txt scripts/bootstrap-build-pip.py /tmp/build-pip/
+RUN python /tmp/build-pip/bootstrap-build-pip.py /tmp/build-pip/requirements.txt && \
+    rm -rf /tmp/build-pip
+
 # Development target: inherits the runtime contract, then adds editor and
 # companion tooling without upgrading shared runtime packages again.
 FROM runtime-base AS devcontainer
 # Keep this major aligned with the frontend builder and every setup-node CI job.
 # Node major upgrades are coordinated manually; Dependabot maintains Docker's
 # pinned builder image within the supported major line.
-ARG HUGO_VERSION=0.160.0
+ARG HUGO_VERSION=0.166.0
 ARG NODE_MAJOR=24
 ARG RUST_TOOLCHAIN=stable
 
@@ -69,7 +73,7 @@ RUN arch="$(dpkg --print-architecture)" \
         *) echo "Unsupported architecture for Hugo: $arch" >&2; exit 1 ;; \
     esac \
     && curl -fsSL \
-        "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_${hugo_arch}.tar.gz" \
+        "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_${HUGO_VERSION}_${hugo_arch}.tar.gz" \
         -o /tmp/hugo.tar.gz \
     && tar -xzf /tmp/hugo.tar.gz -C /tmp hugo \
     && install -m 0755 /tmp/hugo /usr/local/bin/hugo \
@@ -93,12 +97,13 @@ WORKDIR /workspace
 CMD ["sleep", "infinity"]
 
 # Build frontend on the native builder because the emitted assets are architecture-independent.
-FROM --platform=$BUILDPLATFORM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:24.22.2-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS frontend-builder
 WORKDIR /app
 COPY frontend/package*.json ./
 COPY frontend/scripts ./scripts
 RUN npm ci
 COPY frontend/ ./
+COPY shared/ /shared/
 COPY VERSION /VERSION
 COPY GIT_COMMIT /GIT_COMMIT
 RUN npm run build
@@ -108,7 +113,10 @@ FROM --platform=$BUILDPLATFORM ${PYTHON_BASE_IMAGE} AS pyvips-wheel-builder
 WORKDIR /tmp/pyvips-wheel-builder
 COPY backend/requirements.lock.txt ./
 COPY scripts/extract-pyvips-wheel-requirement.py /usr/local/bin/
+COPY backend/build-tools/requirements.txt scripts/bootstrap-build-pip.py /tmp/build-pip/
 RUN --mount=type=cache,target=/root/.cache/pip \
+    python /tmp/build-pip/bootstrap-build-pip.py /tmp/build-pip/requirements.txt && \
+    rm -rf /tmp/build-pip && \
     python /usr/local/bin/extract-pyvips-wheel-requirement.py \
         requirements.lock.txt /tmp/pyvips-wheel-requirement.txt && \
     pip wheel --wheel-dir /tmp/wheels --require-hashes --no-deps \
@@ -128,13 +136,15 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 vscode && \
     chown -R vscode:vscode /home/vscode
 COPY backend/requirements-dev.lock.txt /tmp/requirements-dev.lock.txt
 COPY --from=pyvips-wheel-builder /tmp/wheels /tmp/wheels
+COPY backend/build-tools/requirements.txt scripts/bootstrap-build-pip.py /tmp/build-pip/
 RUN python -m venv /workspace/backend/.venv && \
+    /workspace/backend/.venv/bin/python /tmp/build-pip/bootstrap-build-pip.py /tmp/build-pip/requirements.txt && \
     /workspace/backend/.venv/bin/python -m pip install \
         --require-hashes \
         --find-links=/tmp/wheels \
         -r /tmp/requirements-dev.lock.txt && \
     chown vscode:vscode /workspace/backend && \
-    rm -rf /tmp/wheels
+    rm -rf /tmp/wheels /tmp/build-pip
 COPY --chown=vscode:vscode archive-contract/ ./archive-contract/
 COPY --chown=vscode:vscode companion/ ./companion/
 COPY --chown=vscode:vscode backend/ ./backend/
@@ -143,6 +153,8 @@ COPY --chown=vscode:vscode shared/ ./shared/
 COPY --chown=vscode:vscode VERSION ./VERSION
 COPY --chown=vscode:vscode .github/ ./.github/
 COPY --chown=vscode:vscode scripts/ ./scripts/
+COPY --chown=vscode:vscode Dockerfile ./Dockerfile
+COPY --chown=vscode:vscode .dockerignore ./.dockerignore
 USER vscode
 ENV PYTHONPATH=/workspace/backend
 
@@ -161,6 +173,9 @@ COPY --from=pyvips-wheel-builder /tmp/wheels /tmp/wheels
 # Install Python dependencies before copying full backend (changes rarely - better layer caching)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --root-user-action=ignore --disable-pip-version-check --require-hashes --find-links=/tmp/wheels -r requirements.lock.txt && \
+    python -m pip check && \
+    python -m pip --disable-pip-version-check uninstall --yes --root-user-action=ignore pip && \
+    python -c 'import shutil, sysconfig; from pathlib import Path; shutil.rmtree(Path(sysconfig.get_path("stdlib")) / "ensurepip")' && \
     rm -rf /tmp/wheels
 
 # The production image needs only the application package and startup guards.

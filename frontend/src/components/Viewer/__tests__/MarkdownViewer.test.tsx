@@ -1,15 +1,31 @@
 import type { ViewUpdate } from "@codemirror/view";
-import { act, configure, fireEvent, render as renderBase, screen, waitFor, within } from "@testing-library/react";
+import { createTheme, ThemeProvider } from "@mui/material";
+import { act, cleanup, configure, fireEvent, render as renderBase, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryRouter, RouterProvider, useLocation, useNavigate } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type ViewerLeaveGuard, WorkspaceNavigationGuard } from "../../../hooks/useRoutedViewerEditing";
 import { ContentProviderRegistryContext } from "../../../pages/FileBrowser/contentProviders";
 import apiService from "../../../services/api";
 import { authSession } from "../../../services/authSession";
-import { createStorageBackedTestContentProviderRegistry } from "../../../test/helpers";
+import { loadDraft, snapshotRegisteredDrafts } from "../../../services/draftRecovery";
+import { logger } from "../../../services/logger";
+import { ExpiredEditLockError } from "../../../services/storageContracts";
+import { createStorageBackedTestContentProviderRegistry, readBlobAsText } from "../../../test/helpers";
+import { requireTestElement, requireTestValue, uninitializedTestCallback } from "../../../test/helpers/assertions";
 import { SambeeThemeProvider } from "../../../theme";
+import { getDefaultTheme } from "../../../theme/themes";
+import { highlightingService } from "../../../utils/highlightingService";
+import * as markdownCodePreparation from "../../../utils/markdownCodePreparation";
+import * as markdownDocumentPreview from "../../../utils/markdownDocumentPreview";
+import * as markdownSyntaxPublication from "../../../utils/markdownSyntaxPublication";
+import * as markdownSyntaxWorker from "../../../utils/markdownSyntaxWorker";
+import type { PreparedCodeBlock } from "../../../utils/syntaxHighlighting";
 import MarkdownViewer from "../MarkdownViewer";
+import { MARKDOWN_VIEWER_CONTENT_AUTOFOCUS_DELAY_MS } from "../markdownEditorConstants";
 import { normalizeMarkdownTableCellLineBreaks } from "../markdownTableCellLineBreaks";
+import { RetainedMarkdownPreview, type RetainedMarkdownPreviewProps } from "../RetainedMarkdownPreview";
 import { createViewerSearchTestDriver } from "./viewerSearchTestUtils";
 
 const contentProviders = createStorageBackedTestContentProviderRegistry();
@@ -20,6 +36,33 @@ function ContentProviderTestWrapper({ children }: { children: ReactNode }) {
 
 function render(ui: ReactNode) {
   return renderBase(ui, { wrapper: ContentProviderTestWrapper });
+}
+
+function RoutedMarkdownViewer() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [guard, setGuard] = useState<ViewerLeaveGuard | null>(null);
+  return (
+    <>
+      {guard ? <WorkspaceNavigationGuard guard={guard} /> : null}
+      <MarkdownViewer
+        connectionId="conn1"
+        path="/docs/readme.md"
+        onClose={() => void navigate("/browse")}
+        navigation={{
+          mode: new URLSearchParams(location.search).get("mode") === "edit" ? "edit" : "view",
+          onGuardChange: setGuard,
+          onModeChange: (mode, replace) => {
+            const search = new URLSearchParams(location.search);
+            if (mode === "edit") search.set("mode", "edit");
+            else search.delete("mode");
+            if (search.toString() !== new URLSearchParams(location.search).toString())
+              void navigate({ search: search.toString() }, { replace });
+          },
+        }}
+      />
+    </>
+  );
 }
 
 const { mockLoadMarkdownRichEditor } = vi.hoisted(() => ({
@@ -44,12 +87,14 @@ const mockMarkdownEditorBehavior = {
   focusCurrentSearchResultCalls: 0,
   focusResetsScrollPosition: false,
   flushRejectError: null as Error | null,
+  pendingSnapshot: null as Promise<void> | null,
   initialNormalizedMarkdown: null as string | null,
   lastSearchAutoNavigate: true,
   lastSearchOpen: false,
   lastSearchText: "",
   lastRestoredScrollTop: null as number | null,
   moveCaretToEndOnMarkdownPropChangeWhenFocused: false,
+  onNormalizationStateChange: null as ((pending: boolean) => void) | null,
   preserveSelectionCalls: 0,
   restorePreservedSelectionCalls: 0,
   skipUserEdit: false,
@@ -82,6 +127,8 @@ const mockEditLockInfo = {
 const MockMarkdownRichEditor = forwardRef<
   {
     focus: () => void;
+    captureSnapshot: () => Promise<{ revision: number; serialize: () => string }>;
+    captureSnapshotSync: () => { revision: number; serialize: () => string };
     flushPendingEdits: () => Promise<void>;
     getCanonicalMarkdown: () => string;
     getPrimarySelectionText: () => string;
@@ -104,6 +151,7 @@ const MockMarkdownRichEditor = forwardRef<
     markdown: string;
     onChange: (markdown: string) => void;
     onUserEdit?: (viewUpdate?: ViewUpdate) => void;
+    onNormalizationStateChange?: (pending: boolean, error?: Error) => void;
     ariaLabel: string;
     autoFocus?: boolean;
     readOnly?: boolean;
@@ -131,6 +179,7 @@ const MockMarkdownRichEditor = forwardRef<
       markdown,
       onChange,
       onUserEdit,
+      onNormalizationStateChange,
       ariaLabel,
       readOnly = false,
       className,
@@ -148,6 +197,7 @@ const MockMarkdownRichEditor = forwardRef<
     mockMarkdownEditorBehavior.lastSearchOpen = searchOpen;
     mockMarkdownEditorBehavior.lastSearchText = searchText;
     mockMarkdownEditorBehavior.lastSearchAutoNavigate = searchAutoNavigate;
+    mockMarkdownEditorBehavior.onNormalizationStateChange = onNormalizationStateChange ?? null;
 
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const toolbarButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -291,6 +341,31 @@ const MockMarkdownRichEditor = forwardRef<
 
         return restored;
       },
+      captureSnapshot: async () => {
+        if (mockMarkdownEditorBehavior.flushRejectError) throw mockMarkdownEditorBehavior.flushRejectError;
+        const content = normalizeMarkdownTableCellLineBreaks(
+          mockMarkdownEditorBehavior.canonicalMarkdownOverride ?? latestMarkdownRef.current
+        );
+        await mockMarkdownEditorBehavior.pendingSnapshot;
+        return {
+          revision: 0,
+          serialize: () => {
+            if (mockMarkdownEditorBehavior.throwOnCanonicalExport) throw mockMarkdownEditorBehavior.throwOnCanonicalExport;
+            return content;
+          },
+        };
+      },
+      captureSnapshotSync: () => {
+        if (mockMarkdownEditorBehavior.flushRejectError) throw mockMarkdownEditorBehavior.flushRejectError;
+        const content = mockMarkdownEditorBehavior.canonicalMarkdownOverride ?? textareaRef.current?.value ?? latestMarkdownRef.current;
+        return {
+          revision: 0,
+          serialize: () => {
+            if (mockMarkdownEditorBehavior.throwOnCanonicalExport) throw mockMarkdownEditorBehavior.throwOnCanonicalExport;
+            return content;
+          },
+        };
+      },
       flushPendingEdits: () => {
         if (mockMarkdownEditorBehavior.flushRejectError) {
           return Promise.reject(mockMarkdownEditorBehavior.flushRejectError);
@@ -423,20 +498,210 @@ const MockMarkdownRichEditor = forwardRef<
 
 MockMarkdownRichEditor.displayName = "MockMarkdownRichEditor";
 
+describe("test-only retained Markdown host", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const props = { onExternalLink: () => {}, resolveLink: (href: string) => href };
+  const createResult = () => ({
+    syntaxSession: { dispose: vi.fn(), page: vi.fn() },
+    syntaxRanges: 0,
+    sourceChunks: 1,
+    largestSourceChunkUnits: 1,
+    sourceUnitsSent: 1,
+    models: [],
+    matches: [],
+    preparationMs: 0,
+    indexingMs: 0,
+    clientAssemblyMs: 0,
+    chunks: 1,
+    largestChunkItems: 1,
+  });
+  const createView = () => ({
+    consume: vi.fn().mockResolvedValue(undefined),
+    finish: vi.fn(),
+    dispose: vi.fn(),
+    stats: vi.fn().mockReturnValue({}),
+    search: vi.fn(),
+    jump: vi.fn(),
+  });
+
+  it("aborts its document job and disposes a syntax session that arrives after unmount", async () => {
+    const view = createView();
+    const result = createResult();
+    vi.spyOn(markdownDocumentPreview, "mountMarkdownDocument").mockResolvedValue(view);
+    let complete!: (value: typeof result) => void;
+    const prepare = vi.fn<RetainedMarkdownPreviewProps["prepareDocument"]>().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        })
+    );
+    const host = render(
+      <div>
+        <div>
+          <RetainedMarkdownPreview {...props} prepareDocument={prepare} generation={{ id: 10, source: "canonical" }} />
+        </div>
+      </div>
+    );
+    await waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    const request = requireTestValue(prepare.mock.calls[0])[0];
+    expect(request).toEqual(expect.objectContaining({ source: "canonical", generation: 10 }));
+    await request.onRecords([{ kind: "text", id: 1, parent: 0, value: "canonical", from: 0 }]);
+    expect(view.consume).toHaveBeenCalledWith([{ kind: "text", id: 1, parent: 0, value: "canonical", from: 0 }]);
+    expect(document.head.textContent).toContain("markdown-retained-10");
+    host.unmount();
+    expect(request.signal.aborted).toBe(true);
+    expect(view.dispose).toHaveBeenCalledOnce();
+    await act(async () => complete(result));
+    expect(result.syntaxSession.dispose).toHaveBeenCalledOnce();
+    expect(view.finish).not.toHaveBeenCalled();
+    expect(document.head.textContent).not.toContain("markdown-retained-10");
+  });
+
+  it("does not retain an earlier generation's failure and disposes a completed session", async () => {
+    const view = createView();
+    const result = createResult();
+    vi.spyOn(logger, "error").mockImplementation(() => {});
+    vi.spyOn(markdownDocumentPreview, "mountMarkdownDocument").mockResolvedValue(view);
+    const prepare = vi
+      .fn<RetainedMarkdownPreviewProps["prepareDocument"]>()
+      .mockRejectedValueOnce(new Error("document failed"))
+      .mockResolvedValueOnce(result);
+    const host = render(
+      <div>
+        <div>
+          <RetainedMarkdownPreview {...props} prepareDocument={prepare} generation={{ id: 11, source: "first" }} />
+        </div>
+      </div>
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("document failed");
+    host.rerender(
+      <div>
+        <div>
+          <RetainedMarkdownPreview {...props} prepareDocument={prepare} generation={{ id: 12, source: "second" }} />
+        </div>
+      </div>
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => expect(host.container.querySelector('[data-markdown-retained-state="complete"]')).not.toBeNull());
+    expect(view.finish).toHaveBeenCalledWith(expect.any(Number), 0, result.syntaxSession);
+    host.unmount();
+    expect(result.syntaxSession.dispose).toHaveBeenCalledOnce();
+  });
+});
+
 describe("MarkdownViewer", () => {
+  afterEach(async () => {
+    cleanup();
+    await act(async () => {});
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("shares canonical unsaved Markdown rather than rendered HTML or stale draft state", async () => {
+    const user = userEvent.setup();
+    const share = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(apiService, "getThemes").mockResolvedValue({ themes: [], site_default_id: "sambee-light" });
+    vi.stubGlobal("navigator", { share, canShare: () => true });
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: query.includes("max-width"),
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }))
+    );
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Saved\n");
+    const raw = vi
+      .spyOn(apiService, "getOriginalFileBlob")
+      .mockResolvedValue(new Blob(["# Saved\n"], { type: "application/octet-stream" }));
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
+    const onClose = vi.fn();
+    renderViewerWithProps({ onClose });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    mockMarkdownEditorBehavior.canonicalMarkdownOverride = "# Latest unsaved\n";
+    await user.click(screen.getByRole("button", { name: "Share" }));
+    await user.click(screen.getByRole("menuitem", { name: "Share as text" }));
+    expect(share).toHaveBeenCalledExactlyOnceWith({ text: "# Latest unsaved\n" });
+    expect(apiService.writeTextWithEditLock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("menu", { hidden: true })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Share" }));
+    const savedChoice = screen.getByRole("menuitem", { name: "Share as file" });
+    await waitFor(() => expect(savedChoice).not.toHaveAttribute("aria-disabled", "true"));
+    await user.click(savedChoice);
+    await waitFor(() => expect(screen.queryByRole("menu", { hidden: true })).not.toBeInTheDocument());
+    expect(await readBlobAsText(share.mock.calls[1]?.[0]?.files[0])).toBe("# Saved\n");
+    expect(apiService.writeTextWithEditLock).not.toHaveBeenCalled();
+    expect(raw).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Share" })).toBeEnabled());
+    raw.mockResolvedValueOnce(new Blob(["# Latest unsaved\n"], { type: "application/octet-stream" }));
+    fireEvent.change(editor, { target: { value: "# Latest unsaved\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(apiService.writeTextWithEditLock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(raw).toHaveBeenCalledTimes(2));
+    share.mockRejectedValueOnce(new DOMException("blocked", "NotAllowedError"));
+    await user.click(screen.getByRole("button", { name: "Share" }));
+    const updatedChoice = screen.getByRole("menuitem", { name: "Share as file" });
+    await waitFor(() => expect(updatedChoice).not.toHaveAttribute("aria-disabled", "true"));
+    await user.click(updatedChoice);
+    await waitFor(() => expect(screen.queryByRole("menu", { hidden: true })).not.toBeInTheDocument());
+    expect(await readBlobAsText(share.mock.calls[2]?.[0]?.files[0])).toBe("# Latest unsaved\n");
+    await user.click(await screen.findByRole("button", { name: "Details" }));
+    await screen.findByText(/"reason": "NotAllowedError"/);
+    await user.keyboard("{Escape}");
+    const details = await screen.findByRole("button", { name: "Details" });
+    await waitFor(() => expect(details).toHaveFocus());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download" })).toBeEnabled();
+  });
   const viewerSearch = createViewerSearchTestDriver({
     assertCurrentMatchActive: () => {
-      expect(document.querySelectorAll('mark[data-text-search-current="true"]').length).toBeGreaterThan(0);
+      expect(
+        [...CSS.highlights.entries()].some(
+          ([name, ranges]) => name.startsWith("markdown-search-") && name.endsWith("-current") && ranges.size === 1
+        )
+      ).toBe(true);
     },
   });
 
+  function enableSearchHighlights() {
+    vi.stubGlobal("CSS", { highlights: new Map<string, Set<Range>>() });
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        observe = vi.fn();
+        disconnect = vi.fn();
+      }
+    );
+    vi.stubGlobal(
+      "Highlight",
+      class extends Set<Range> {
+        constructor(...ranges: Range[]) {
+          super(ranges);
+        }
+      }
+    );
+  }
+
   function suppressExpectedRenderCrashNoise(message: string): () => void {
+    const consoleError = console.error;
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
       const combinedMessage = args.map((value) => (value instanceof Error ? value.message : String(value))).join(" ");
 
       if (combinedMessage.includes(message)) {
         return;
       }
+      consoleError(...args);
     });
 
     const handleWindowError = (event: ErrorEvent) => {
@@ -457,11 +722,12 @@ describe("MarkdownViewer", () => {
     localStorage.clear();
     sessionStorage.clear();
     localStorage.setItem("access_token", "mock-token");
-    vi.restoreAllMocks();
+    vi.spyOn(apiService, "getThemes").mockResolvedValue({ themes: [], site_default_id: "sambee-light" });
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
     vi.spyOn(apiService, "writeTextWithEditLock").mockImplementation(async (connectionId, path, content, _lockInfo, options) => {
       await apiService.saveTextFile(connectionId, path, content, {
         filename: path.split("/").pop() ?? path,
-        mimeType: options.mimeType,
+        mimeType: requireTestValue(options).mimeType,
       });
     });
     vi.spyOn(apiService, "acquireEditLock").mockResolvedValue(mockEditLockInfo);
@@ -478,12 +744,14 @@ describe("MarkdownViewer", () => {
     mockMarkdownEditorBehavior.focusCurrentSearchResultCalls = 0;
     mockMarkdownEditorBehavior.focusResetsScrollPosition = false;
     mockMarkdownEditorBehavior.flushRejectError = null;
+    mockMarkdownEditorBehavior.pendingSnapshot = null;
     mockMarkdownEditorBehavior.initialNormalizedMarkdown = null;
     mockMarkdownEditorBehavior.lastSearchAutoNavigate = true;
     mockMarkdownEditorBehavior.lastSearchOpen = false;
     mockMarkdownEditorBehavior.lastSearchText = "";
     mockMarkdownEditorBehavior.lastRestoredScrollTop = null;
     mockMarkdownEditorBehavior.moveCaretToEndOnMarkdownPropChangeWhenFocused = false;
+    mockMarkdownEditorBehavior.onNormalizationStateChange = null;
     mockMarkdownEditorBehavior.preserveSelectionCalls = 0;
     mockMarkdownEditorBehavior.restorePreservedSelectionCalls = 0;
     mockMarkdownEditorBehavior.skipUserEdit = false;
@@ -505,13 +773,527 @@ describe("MarkdownViewer", () => {
     return renderViewerWithProps();
   }
 
-  function renderViewerWithProps({ onClose = () => {}, isReadOnly = false }: { onClose?: () => void; isReadOnly?: boolean } = {}) {
+  function renderViewerWithProps({
+    onClose = () => {},
+    isReadOnly = false,
+    path = "/docs/readme.md",
+  }: {
+    onClose?: () => void;
+    isReadOnly?: boolean;
+    path?: string;
+  } = {}) {
     return render(
       <SambeeThemeProvider>
-        <MarkdownViewer connectionId="conn1" path="/docs/readme.md" onClose={onClose} isReadOnly={isReadOnly} />
+        <MarkdownViewer connectionId="conn1" path={path} onClose={onClose} isReadOnly={isReadOnly} />
       </SambeeThemeProvider>
     );
   }
+
+  it.each([
+    { path: "/docs/x-note-2.md", title: "x-note-2" },
+    { path: "/docs/report.v2.MD", title: "report.v2" },
+    { path: "/docs/.notes.md", title: ".notes" },
+    { path: "/docs/README", title: "README" },
+  ])("uses $title as the print title for $path and restores the previous page title", async ({ path, title }) => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Printable preview");
+    const previousTitle = document.title;
+    try {
+      document.title = "Sambee";
+      const { unmount } = renderViewerWithProps({ path });
+      await screen.findByRole("heading", { name: "Printable preview" });
+      const filename = path.split("/").pop();
+      expect(document.title).toBe(filename);
+      act(() => window.dispatchEvent(new Event("beforeprint")));
+      expect(document.title).toBe(title);
+      act(() => window.dispatchEvent(new Event("afterprint")));
+      expect(document.title).toBe(filename);
+      unmount();
+      expect(document.title).toBe("Sambee");
+    } finally {
+      document.title = previousTitle;
+    }
+  });
+
+  it("does not replace a page title set by another owner when the viewer closes", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Printable preview");
+    const previousTitle = document.title;
+    try {
+      const { unmount } = renderViewer();
+      await screen.findByRole("heading", { name: "Printable preview" });
+      document.title = "Another page";
+      unmount();
+      expect(document.title).toBe("Another page");
+    } finally {
+      document.title = previousTitle;
+    }
+  });
+
+  it("prints read-only previews and reports native dialog failures without changing content", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Printable preview");
+    const print = vi
+      .spyOn(window, "print")
+      .mockImplementationOnce(() => {
+        expect(document.title).toBe("readme");
+        throw new Error("Printing blocked");
+      })
+      .mockImplementation(() => {
+        expect(document.title).toBe("readme");
+        window.dispatchEvent(new Event("beforeprint"));
+        window.dispatchEvent(new Event("afterprint"));
+      });
+    renderViewerWithProps({ isReadOnly: true });
+    await screen.findByRole("heading", { name: "Printable preview" });
+    const button = screen.getByRole("button", { name: "Print" });
+    await userEvent.click(button);
+    expect(await screen.findByText("The print dialog couldn't open. Try Print from your browser menu.")).toBeInTheDocument();
+    expect(document.title).toBe("readme.md");
+    await userEvent.click(button);
+    expect(print).toHaveBeenCalledTimes(2);
+    expect(document.title).toBe("readme.md");
+    expect(screen.queryByText("The print dialog couldn't open. Try Print from your browser menu.")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Printable preview" })).toBeInTheDocument();
+  });
+
+  it("doesn't offer preview printing while editing", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Printable preview");
+    renderViewer();
+    await screen.findByRole("heading", { name: "Printable preview" });
+    await userEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByRole("button", { name: "Save" });
+    expect(screen.queryByRole("button", { name: "Print" })).not.toBeInTheDocument();
+  });
+
+  it("restores native print scroll and selection and releases its lifecycle listeners", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("```js\nconst printed = 1;\n```\n");
+    const { unmount } = renderViewer();
+    const code = await screen.findByText("const printed = 1;");
+    const viewport = screen.getByTestId("markdown-viewer-content");
+    const pre = code.closest("pre")!;
+    viewport.focus();
+    viewport.scrollTop = 120;
+    pre.scrollLeft = 48;
+    const selection = window.getSelection()!;
+    const range = new Range();
+    range.selectNodeContents(code);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const selected = selection.toString();
+    act(() => window.dispatchEvent(new Event("beforeprint")));
+    viewport.scrollTop = 0;
+    pre.scrollLeft = 0;
+    selection.removeAllRanges();
+    act(() => window.dispatchEvent(new Event("afterprint")));
+    await waitFor(() => {
+      expect(viewport.scrollTop).toBe(120);
+      expect(pre.scrollLeft).toBe(48);
+      expect(selection.toString()).toBe(selected);
+    });
+    unmount();
+    const frame = vi.spyOn(window, "requestAnimationFrame");
+    window.dispatchEvent(new Event("beforeprint"));
+    window.dispatchEvent(new Event("afterprint"));
+    expect(frame).not.toHaveBeenCalled();
+    selection.removeAllRanges();
+  });
+
+  it("retries a missing content read for the same Markdown file", async () => {
+    const read = vi
+      .spyOn(apiService, "getFileContent")
+      .mockRejectedValueOnce({ response: { status: 404, data: { detail: { code: "item_not_found" } } } })
+      .mockResolvedValue("# Recovered\n");
+    renderViewer();
+    await screen.findByText('File "readme.md" was not found. It may have been moved or deleted.');
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Recovered")).toBeInTheDocument();
+    expect(read).toHaveBeenLastCalledWith("conn1", "/docs/readme.md");
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(apiService.acquireEditLock).not.toHaveBeenCalled();
+  });
+
+  it("reports a local normalization failure without blaming the server", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Preview");
+    vi.spyOn(markdownCodePreparation, "normalizeMarkdownSource").mockRejectedValue(new Error("Markdown worker initialization failed"));
+    renderViewer();
+
+    expect(await screen.findByText("Failed to load markdown file: Markdown worker initialization failed")).toBeInTheDocument();
+    expect(screen.queryByText(/Server is busy/)).not.toBeInTheDocument();
+  });
+
+  it("prepares collected requests only after their semantic code blocks commit without a collection parse", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("> ```js title\n> const x=1;\n> ```\n\n```\nplain\n```\n");
+    const measure = vi.spyOn(performance, "measure");
+    const prepare = vi.spyOn(highlightingService, "prepare").mockImplementation((requests) => {
+      const code = document.querySelectorAll('[data-markdown-search-root="true"] pre code');
+      expect([...code].map((element) => element.textContent)).toEqual(["const x=1;\n", "plain\n"]);
+      expect(requests).toEqual([
+        { text: "const x=1;", label: "js" },
+        { text: "plain", label: null },
+      ]);
+      return Promise.resolve(requests.map(() => ({ ranges: [] })));
+    });
+    renderViewer();
+    await screen.findByText("const x=1;");
+    await waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(measure.mock.calls.some(([name]) => name === "sambee:preview-preparation:collection-parse")).toBe(false);
+  });
+
+  it("keeps plain text, selection and search usable when syntax preparation fails", async () => {
+    enableSearchHighlights();
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Preview\n\n```js\nconst x=1; const x=2;\n```\n");
+    let rejectPreparation!: (error: Error) => void;
+    const prepare = vi.spyOn(markdownSyntaxWorker, "prepareMarkdownSyntax").mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPreparation = reject;
+        })
+    );
+    const publish = vi.spyOn(markdownSyntaxPublication, "publishMarkdownSyntax");
+    renderViewer();
+    const code = await screen.findByText("const x=1; const x=2;");
+    await waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    await viewerSearch.openSearch("const x");
+    await screen.findByText("1 / 2");
+    const root = document.querySelector('[data-markdown-search-root="true"]');
+    const viewport = screen.getByTestId("markdown-viewer-content");
+    viewport.scrollTop = 123;
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const selected = selection.toString();
+    try {
+      await act(async () => rejectPreparation(new Error("Syntax worker response could not be decoded")));
+      expect(document.querySelector('[data-markdown-search-root="true"]')).toBe(root);
+      expect(root?.querySelector("code")).toBe(code);
+      expect(code.textContent).toBe("const x=1; const x=2;\n");
+      expect(selection.toString()).toBe(selected);
+      expect(viewport.scrollTop).toBe(123);
+      expect(screen.getByRole("heading", { name: "Preview" })).toBeInTheDocument();
+      expect(screen.queryByText(/Failed to load markdown file/)).not.toBeInTheDocument();
+      expect(publish).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+      expect(await screen.findByText("2 / 2")).toBeInTheDocument();
+      expect(prepare).toHaveBeenCalledOnce();
+    } finally {
+      selection.removeAllRanges();
+    }
+  });
+
+  it.each([2, 3])("publishes only the latest of %s documents after obsolete results arrive", async (documentCount) => {
+    const documents = [
+      { path: "/docs/readme.md", label: "js", text: "const old=1;" },
+      { path: "/docs/replacement.md", label: "python", text: "print(2)" },
+      { path: "/docs/latest.md", label: "rust", text: "let latest = 3;" },
+    ].slice(0, documentCount);
+    const load = vi.spyOn(apiService, "getFileContent");
+    for (const document of documents) load.mockResolvedValueOnce(`\`\`\`${document.label}\n${document.text}\n\`\`\``);
+    const completions: ((results: readonly PreparedCodeBlock[]) => void)[] = [];
+    const prepare = vi.spyOn(highlightingService, "prepare").mockImplementation(() => new Promise((resolve) => completions.push(resolve)));
+    const publish = vi.spyOn(markdownSyntaxPublication, "publishMarkdownSyntax").mockReturnValue(vi.fn());
+    const viewer = renderViewer();
+    for (const [index, document] of documents.entries()) {
+      if (index > 0)
+        viewer.rerender(
+          <SambeeThemeProvider>
+            <MarkdownViewer connectionId="conn1" path={document.path} onClose={() => {}} />
+          </SambeeThemeProvider>
+        );
+      await screen.findByText(document.text);
+      await waitFor(() => expect(prepare).toHaveBeenCalledTimes(index + 1));
+      expect(prepare.mock.calls[index]![0]).toEqual([{ text: document.text, label: document.label }]);
+    }
+    for (let index = documents.length - 2; index >= 0; index -= 1) {
+      expect(prepare.mock.calls[index]![1]!.aborted).toBe(true);
+      await act(async () => completions[index]!([{ ranges: [] }]));
+    }
+    expect(publish).not.toHaveBeenCalled();
+    const latest = documents[documents.length - 1]!;
+    expect(prepare.mock.calls[documents.length - 1]![1]!.aborted).toBe(false);
+    await act(async () => completions[documents.length - 1]!([{ ranges: [] }]));
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.calls[0]![2].requests).toEqual([{ text: latest.text, label: latest.label }]);
+    expect(publish.mock.calls[0]![0].querySelector("code")?.textContent).toBe(`${latest.text}\n`);
+  });
+
+  it("preserves the semantic DOM, active logical match and scroll when syntax becomes available", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("```js\nconst x=1; const x=2;\n```");
+    let finish!: (results: readonly PreparedCodeBlock[]) => void;
+    const prepare = vi.spyOn(highlightingService, "prepare").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    renderViewer();
+    await screen.findByText("const x=1; const x=2;");
+    await waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
+    const search = await viewerSearch.openSearch("missing");
+    fireEvent.change(search, { target: { value: "const x" } });
+    await screen.findByText("1 / 2");
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    await screen.findByText("2 / 2");
+    const root = document.querySelector('[data-markdown-search-root="true"]')!;
+    const scroll = root.parentElement!;
+    scroll.scrollTop = 123;
+    const scrollIntoView = vi.fn();
+    const previousScroll = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    try {
+      await act(async () =>
+        finish([
+          {
+            ranges: [
+              { from: 0, to: 5, categories: ["keyword"] },
+              { from: 11, to: 16, categories: ["keyword"] },
+            ],
+          },
+        ])
+      );
+      expect(document.querySelector('[data-markdown-search-root="true"]')).toBe(root);
+      expect(root.querySelector("code")?.textContent).toBe("const x=1; const x=2;\n");
+      expect(document.querySelectorAll(".sambee-syntax-keyword")).toHaveLength(0);
+      expect(screen.getByText("2 / 2")).toBeInTheDocument();
+      expect(scroll.scrollTop).toBe(123);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(prepare).toHaveBeenCalledTimes(1);
+      fireEvent.change(search, { target: { value: "x=2" } });
+      expect(await screen.findByText("1 / 1")).toBeInTheDocument();
+    } finally {
+      if (previousScroll) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", previousScroll);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
+  });
+
+  it.each(["dark", "custom-alpha"])("changes %s preview colors without reprocessing content or resetting native state", async (variant) => {
+    const load = vi.spyOn(apiService, "getFileContent").mockResolvedValue("```js\nconst x=1; const x=2;\n```");
+    const prepare = vi.spyOn(highlightingService, "prepare").mockResolvedValue([{ ranges: [{ from: 0, to: 5, categories: ["keyword"] }] }]);
+    const dispose = vi.fn();
+    const publish = vi.spyOn(markdownSyntaxPublication, "publishMarkdownSyntax").mockReturnValue(dispose);
+    const onClose = vi.fn();
+    const tree = (theme: ReturnType<typeof createTheme>) => (
+      <SambeeThemeProvider>
+        <ThemeProvider theme={theme}>
+          <MarkdownViewer connectionId="conn1" path="/docs/readme.md" onClose={onClose} />
+        </ThemeProvider>
+      </SambeeThemeProvider>
+    );
+    const viewer = render(tree(createTheme()));
+    await screen.findByText("const x=1; const x=2;");
+    await waitFor(() => expect(publish).toHaveBeenCalledOnce());
+    const search = await viewerSearch.openSearch("const x");
+    await screen.findByText("1 / 2");
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    await screen.findByText("2 / 2");
+    const root = document.querySelector<HTMLElement>('[data-markdown-search-root="true"]')!;
+    const code = root.querySelector("code")!;
+    const node = code.firstChild;
+    const selection = document.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const scroll = root.parentElement!;
+    scroll.scrollTop = 123;
+    const keyword = variant === "dark" ? "#80cbc4" : "#12ab3478";
+
+    viewer.rerender(
+      tree(
+        createTheme({
+          palette: {
+            mode: "dark",
+            syntax: { ...getDefaultTheme("dark").components!.syntax!, keyword },
+          },
+        })
+      )
+    );
+
+    await waitFor(() => expect(root.style.getPropertyValue("--sambee-syntax-keyword")).toBe(keyword));
+    expect(document.querySelector('[data-markdown-search-root="true"]')).toBe(root);
+    expect(code.firstChild).toBe(node);
+    expect(selection.toString()).toBe("const x=1; const x=2;\n");
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+    expect(scroll.scrollTop).toBe(123);
+    expect(load).toHaveBeenCalledOnce();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledOnce();
+    expect(dispose).not.toHaveBeenCalled();
+    selection.removeAllRanges();
+    fireEvent.change(search, { target: { value: "x=2" } });
+    expect(await screen.findByText("1 / 1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    viewer.unmount();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("preserves native selection without replacing the preview when syntax becomes available", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("```js\nconst x=1;\n```");
+    let finish!: (results: readonly PreparedCodeBlock[]) => void;
+    vi.spyOn(highlightingService, "prepare").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    renderViewer();
+    await screen.findByText("const x=1;");
+    const root = document.querySelector('[data-markdown-search-root="true"]')!;
+    const range = document.createRange();
+    range.selectNodeContents(root.querySelector("code")!);
+    const selection = document.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await act(async () => finish([{ ranges: [{ from: 0, to: 5, categories: ["keyword"] }] }]));
+    expect(document.querySelector('[data-markdown-search-root="true"]')).toBe(root);
+    expect(selection.toString()).toBe("const x=1;\n");
+    act(() => {
+      selection.removeAllRanges();
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(document.querySelector('[data-markdown-search-root="true"]')).toBe(root);
+    expect(root.querySelector("code")?.textContent).toBe("const x=1;\n");
+  });
+
+  it("aborts obsolete syntax preparation on unmount and ignores a late result", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("```js\nconst x=1;\n```");
+    let finish!: (results: readonly PreparedCodeBlock[]) => void;
+    const prepare = vi.spyOn(highlightingService, "prepare").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const { unmount } = renderViewer();
+    await screen.findByText("const x=1;");
+    await waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
+    const signal = prepare.mock.calls[0]![1]!;
+    unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish([{ ranges: [{ from: 0, to: 5, categories: ["keyword"] }] }]));
+    expect(document.querySelector(".sambee-syntax-keyword")).toBeNull();
+  });
+
+  it.each(["Back", "Close"])("leaves clean editing with %s and serializes rapid re-entry behind lock release", async (action) => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    let finishRelease!: () => void;
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    release.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishRelease = resolve;
+        })
+    );
+    const viewer = "/viewer?file=smb%2Fdemo%2Fdocs%2Freadme.md&viewer=markdown";
+    const router = createMemoryRouter([{ path: "/viewer", element: <RoutedMarkdownViewer /> }], {
+      initialEntries: [viewer, `${viewer}&mode=edit`],
+    });
+    render(
+      <SambeeThemeProvider>
+        <RouterProvider router={router} />
+      </SambeeThemeProvider>
+    );
+    await screen.findByRole("textbox", { name: "Markdown editor" });
+    const blocked = vi.fn();
+    const unsubscribe = router.subscribe((state) => {
+      if ([...state.blockers.values()].some((blocker) => blocker.state === "blocked")) blocked();
+    });
+    try {
+      if (action === "Back") await act(() => router.navigate(-1));
+      else fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      await waitFor(() => expect(release).toHaveBeenCalledTimes(1));
+      expect(router.state.location.search).not.toContain("mode=edit");
+      expect(screen.getByRole("textbox", { name: "Markdown editor" })).toHaveAttribute("readonly");
+
+      await act(() => router.navigate(action === "Back" ? 1 : -1));
+      expect(router.state.location.search).toContain("mode=edit");
+      expect(apiService.acquireEditLock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        finishRelease();
+      });
+      await waitFor(() => expect(apiService.acquireEditLock).toHaveBeenCalledTimes(2));
+      await screen.findByRole("textbox", { name: "Markdown editor" });
+      expect(blocked).not.toHaveBeenCalled();
+
+      await act(() => router.navigate(-1));
+      await waitFor(() => expect(release).toHaveBeenCalledTimes(2));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("opens an edit bookmark and guards dirty Back with Cancel and Discard", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    const router = createMemoryRouter(
+      [
+        { path: "/browse", element: <div>Files</div> },
+        { path: "/viewer/*", element: <RoutedMarkdownViewer /> },
+      ],
+      { initialEntries: ["/browse", "/viewer?file=smb%2Fdemo%2Fdocs%2Freadme.md&viewer=markdown&mode=edit"] }
+    );
+    render(
+      <SambeeThemeProvider>
+        <RouterProvider router={router} />
+      </SambeeThemeProvider>
+    );
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Unsaved\n" } });
+    await act(() => router.navigate(-1));
+    let dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(router.state.location.pathname).toBe("/viewer");
+    expect(editor).toHaveValue("# Unsaved\n");
+    expect(release).not.toHaveBeenCalled();
+    await act(() => router.navigate(-1));
+    dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Discard" }));
+    expect(await screen.findByText("Files")).toBeInTheDocument();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves edit mode after a failed Save, cancelled Close, and confirmed Discard", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    vi.spyOn(apiService, "heartbeatEditLock").mockResolvedValue();
+    vi.spyOn(logger, "error").mockImplementation(() => {});
+    const save = vi.spyOn(apiService, "saveTextFile").mockRejectedValue(new Error("Disk full"));
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    const router = createMemoryRouter(
+      [
+        { path: "/browse", element: <div>Files</div> },
+        { path: "/viewer/*", element: <RoutedMarkdownViewer /> },
+      ],
+      { initialEntries: ["/viewer?file=smb%2Fdemo%2Fdocs%2Freadme.md&viewer=markdown&mode=edit"] }
+    );
+    render(
+      <SambeeThemeProvider>
+        <RouterProvider router={router} />
+      </SambeeThemeProvider>
+    );
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Unsaved\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(requireTestValue(screen.getAllByRole("button", { name: "Close" })[0]));
+    let dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument());
+    expect(editor).toHaveValue("# Unsaved\n");
+    expect(release).not.toHaveBeenCalled();
+    fireEvent.click(requireTestValue(screen.getAllByRole("button", { name: "Close" })[0]));
+    dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(router.state.location.search).not.toContain("mode=edit"));
+    expect(await screen.findByText("Readme")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Markdown editor" })).not.toBeInTheDocument();
+    expect(router.state.errors).toBeNull();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
 
   it("does not expose markdown edit mode for read-only connections", async () => {
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
@@ -530,6 +1312,7 @@ describe("MarkdownViewer", () => {
     await screen.findByText("Readme");
     expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
     expect(screen.getByText("Read only")).toBeInTheDocument();
+    expect(screen.getByTestId("text-editor-acquisition-slot").previousElementSibling).toContainElement(screen.getByText("Read only"));
     expect(screen.queryByText("Browse and preview content, but block writes and edit flows through Sambee.")).not.toBeInTheDocument();
 
     fireEvent.keyDown(document, { key: "e" });
@@ -605,6 +1388,134 @@ describe("MarkdownViewer", () => {
     expect(getFileContentSpy).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["pagehide", "registered"])("captures current Markdown before React publication on %s", async (trigger) => {
+    vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "getThemes").mockResolvedValue({ themes: [], site_default_id: "sambee-light" });
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob(["# Readme\n"], { type: "text/markdown" }));
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
+    renderViewer();
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Older React draft\n" } });
+    const storage = vi.spyOn(Storage.prototype, "setItem");
+    const draftKey = `sambee_oidc_draft:test-user:conn1:markdown:${encodeURIComponent("/docs/readme.md")}`;
+    const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    if (!valueSetter) throw new Error("Expected the native textarea value setter");
+    valueSetter.call(editor, "# Latest editor revision\n");
+    mockMarkdownEditorBehavior.canonicalMarkdownOverride = "# Latest editor revision\n";
+    act(() => {
+      if (trigger === "pagehide") window.dispatchEvent(new Event("pagehide"));
+      else snapshotRegisteredDrafts();
+    });
+    expect(loadDraft("conn1", "/docs/readme.md", "markdown")).toMatchObject({
+      baseline: "# Readme\n",
+      content: "# Latest editor revision\n",
+    });
+    await waitFor(() => expect(storage.mock.calls.filter(([key]) => key === draftKey).length).toBeGreaterThanOrEqual(2));
+    expect(
+      storage.mock.calls
+        .filter(([key]) => key === draftKey)
+        .every(([, value]) => JSON.parse(value).content === "# Latest editor revision\n")
+    ).toBe(true);
+    expect(loadDraft("conn1", "/docs/readme.md", "markdown")?.content).toBe("# Latest editor revision\n");
+    expect(apiService.saveTextFile).not.toHaveBeenCalled();
+  });
+
+  it.each(["capture", "serialization", "storage"])("preserves the last recovery checkpoint on %s failure", async (failure) => {
+    vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
+    vi.spyOn(authSession, "refreshIfNeeded").mockResolvedValue(undefined);
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "getThemes").mockResolvedValue({ themes: [], site_default_id: "sambee-light" });
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob(["# Readme\n"], { type: "text/markdown" }));
+    vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    renderViewer();
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Acknowledged draft\n" } });
+    act(() => {
+      snapshotRegisteredDrafts();
+    });
+    const acknowledged = loadDraft("conn1", "/docs/readme.md", "markdown");
+    expect(acknowledged?.content).toBe("# Acknowledged draft\n");
+    fireEvent.change(editor, { target: { value: "# Newer draft\n" } });
+    const error = new DOMException("The latest snapshot is unavailable", "InvalidStateError");
+    if (failure === "capture") mockMarkdownEditorBehavior.flushRejectError = error;
+    if (failure === "serialization") mockMarkdownEditorBehavior.throwOnCanonicalExport = error;
+    const storage =
+      failure === "storage"
+        ? vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+            throw error;
+          })
+        : null;
+    try {
+      act(() => {
+        window.dispatchEvent(new Event("pagehide"));
+        snapshotRegisteredDrafts();
+      });
+      expect(loadDraft("conn1", "/docs/readme.md", "markdown")).toEqual(acknowledged);
+      expect(editor).toHaveValue("# Newer draft\n");
+      expect(apiService.saveTextFile).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+    } finally {
+      mockMarkdownEditorBehavior.flushRejectError = null;
+      mockMarkdownEditorBehavior.throwOnCanonicalExport = null;
+      storage?.mockRestore();
+    }
+    act(() => {
+      snapshotRegisteredDrafts();
+    });
+    expect(loadDraft("conn1", "/docs/readme.md", "markdown")?.content).toBe("# Newer draft\n");
+  });
+
+  it("retries recovery after normalization completes without changing the published draft", async () => {
+    const token = { access_token: "mock-token", token_type: "bearer", user_id: "test-user", username: "test-user" };
+    authSession.setAuthenticated(token, false);
+    vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
+    vi.spyOn(authSession, "refreshIfNeeded").mockResolvedValue(undefined);
+    vi.spyOn(authSession, "requestRefresh").mockResolvedValue(token);
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob(["# Readme\n"], { type: "text/markdown" }));
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
+    const { unmount } = renderViewer();
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    vi.useFakeTimers();
+    try {
+      fireEvent.change(editor, { target: { value: "# Acknowledged draft\n" } });
+      act(() => snapshotRegisteredDrafts());
+      const acknowledged = loadDraft("conn1", "/docs/readme.md", "markdown");
+      expect(acknowledged?.content).toBe("# Acknowledged draft\n");
+      act(() => {
+        mockMarkdownEditorBehavior.flushRejectError = new DOMException("Normalization pending", "InvalidStateError");
+        mockMarkdownEditorBehavior.onNormalizationStateChange?.(true);
+        fireEvent.change(editor, { target: { value: "# Latest | draft\n" } });
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      expect(loadDraft("conn1", "/docs/readme.md", "markdown")).toEqual(acknowledged);
+
+      act(() => {
+        mockMarkdownEditorBehavior.flushRejectError = null;
+        mockMarkdownEditorBehavior.onNormalizationStateChange?.(false);
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(249));
+      expect(loadDraft("conn1", "/docs/readme.md", "markdown")).toEqual(acknowledged);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(loadDraft("conn1", "/docs/readme.md", "markdown")).toMatchObject({
+        baseline: "# Readme\n",
+        content: "# Latest | draft\n",
+      });
+      expect(editor).toHaveValue("# Latest | draft\n");
+      expect(apiService.saveTextFile).not.toHaveBeenCalled();
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it("clears the local draft when Markdown returns to its saved baseline", async () => {
     vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
@@ -643,6 +1554,9 @@ describe("MarkdownViewer", () => {
     const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
     expect(editor).toHaveValue("# Local draft\n");
     expect(screen.getByRole("status", { name: /unsaved changes/i })).toBeInTheDocument();
+    expect(screen.getByTestId("text-editor-acquisition-slot").previousElementSibling).toBe(
+      screen.getByRole("status", { name: /unsaved changes/i })
+    );
   });
 
   it("offers recovery when the draft baseline differs from the saved markdown", async () => {
@@ -815,7 +1729,36 @@ describe("MarkdownViewer", () => {
     expect(contentContainer.scrollTop).toBe(0);
   });
 
-  it("exits edit mode on Escape without closing the viewer or prompting when nothing changed", async () => {
+  it("closes exactly once on Escape from viewer content", async () => {
+    const onClose = vi.fn();
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    renderViewerWithProps({ onClose });
+    await screen.findByText("Readme");
+    const content = screen.getByTestId("markdown-viewer-content");
+    content.focus();
+
+    fireEvent.keyDown(content, { key: "Escape" });
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("blurs toolbar focus on the first Escape and closes once on the next", async () => {
+    const onClose = vi.fn();
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    renderViewerWithProps({ onClose });
+    await screen.findByText("Readme");
+    const close = screen.getByRole("button", { name: "Close" });
+    close.focus();
+
+    fireEvent.keyDown(close, { key: "Escape" });
+    expect(close).not.toHaveFocus();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(screen.getByTestId("markdown-viewer-content"), { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it.each(["Escape", "Close"])("exits edit mode on %s without closing the viewer or prompting when nothing changed", async (action) => {
     const onClose = vi.fn();
 
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
@@ -841,15 +1784,23 @@ describe("MarkdownViewer", () => {
       expect(editor).toHaveFocus();
     });
 
-    fireEvent.keyDown(editor, { key: "Escape" });
+    if (action === "Escape") {
+      fireEvent.keyDown(editor, { key: "Escape" });
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    }
 
     await waitFor(() => {
       expect(screen.queryByRole("textbox", { name: "Markdown editor" })).not.toBeInTheDocument();
     });
 
     expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument();
     expect(onClose).not.toHaveBeenCalled();
     expect(releaseSpy).toHaveBeenCalledWith("conn1", "/docs/readme.md", expect.objectContaining(mockEditLockInfo));
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
   it("renders only the close button in the top bar while editing", async () => {
@@ -879,9 +1830,230 @@ describe("MarkdownViewer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Unable to enter edit mode. Failed to acquire edit lock.: Lock conflict")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("The file could not be opened. Check the connection and retry.");
+      expect(screen.getByRole("alert").closest(".MuiSnackbar-root")).not.toBeNull();
     });
+    expect(screen.getByRole("button", { name: "Retry editing" })).toBeEnabled();
+    expect(screen.getByText("Read only")).toBeInTheDocument();
     expect(screen.queryByRole("textbox", { name: "Markdown editor" })).not.toBeInTheDocument();
+  });
+
+  it("uses the shared lock toast, delayed retry feedback, and persistent read-only badge", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    const acquire = vi.spyOn(apiService, "acquireEditLock").mockRejectedValueOnce({ response: { status: 409 } });
+    const timeout = vi.spyOn(window, "setTimeout");
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const retry = await screen.findByRole("button", { name: "Retry editing" });
+    const toast = screen.getByRole("status");
+    expect(toast.closest(".MuiSnackbar-root")).not.toBeNull();
+    expect(toast).toHaveTextContent("This file is being edited in another session.");
+    expect(within(toast).getByRole("img", { name: "Retry editing" })).toBeInTheDocument();
+    const dismiss = timeout.mock.calls.find(([, delay]) => delay === 15_000)?.[0];
+    if (typeof dismiss !== "function") throw new Error("Expected the shared 15-second dismissal timer");
+    act(() => dismiss());
+    await waitFor(() => expect(toast).not.toBeInTheDocument());
+    expect(screen.getByText("Read only")).toBeInTheDocument();
+    expect(retry).toBeEnabled();
+    acquire.mockRejectedValueOnce({ response: { status: 409 } });
+    fireEvent.click(retry);
+    const repeatedNotice = await screen.findByRole("status");
+    expect(repeatedNotice).toHaveTextContent("This file is being edited in another session.");
+    fireEvent.click(within(repeatedNotice).getByRole("button", { name: "Close" }));
+    let finish: ((value: typeof mockEditLockInfo) => void) | undefined;
+    acquire.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    timeout.mockClear();
+    fireEvent.click(retry);
+    await waitFor(() => expect(acquire).toHaveBeenCalledTimes(3));
+    const feedback = timeout.mock.calls.find(([, delay]) => delay === 200)?.[0];
+    if (typeof feedback !== "function") throw new Error("Expected delayed acquisition feedback");
+    act(() => feedback());
+    expect(screen.getByRole("status", { name: "Checking write access..." }).closest(".MuiAlert-root")).toBeNull();
+    expect(retry).toBeDisabled();
+    fireEvent.keyDown(document, { ctrlKey: true, key: "r" });
+    expect(acquire).toHaveBeenCalledTimes(3);
+    if (!finish) throw new Error("Expected a pending lock retry");
+    await act(async () => finish?.(mockEditLockInfo));
+    expect(await screen.findByRole("textbox", { name: "Markdown editor" })).not.toHaveAttribute("readonly");
+    expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+  });
+
+  it("silently retries transient heartbeats, warns on persistent failure, and resets on recovery", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    const heartbeatRequest = vi.spyOn(apiService, "heartbeatEditLock").mockRejectedValue(new Error("Disconnected"));
+    const interval = vi.spyOn(window, "setInterval");
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    const heartbeat = interval.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+    if (typeof heartbeat !== "function") throw new Error("Expected heartbeat interval");
+    await act(async () => heartbeat());
+    expect(screen.queryByText(/Could not refresh the edit lock/)).not.toBeInTheDocument();
+    heartbeatRequest.mockResolvedValueOnce(undefined);
+    await act(async () => heartbeat());
+    await act(async () => heartbeat());
+    await act(async () => heartbeat());
+    expect(screen.queryByText(/Could not refresh the edit lock/)).not.toBeInTheDocument();
+    await act(async () => heartbeat());
+    const warning = screen.getByRole("status");
+    expect(warning).toHaveTextContent("Could not refresh the edit lock");
+    expect(warning.closest(".MuiSnackbar-root")).not.toBeNull();
+    fireEvent.click(within(warning).getByRole("button", { name: "Close" }));
+    await act(async () => heartbeat());
+    expect(screen.queryByText(/Could not refresh the edit lock/)).not.toBeInTheDocument();
+    expect(editor).not.toHaveAttribute("readonly");
+    heartbeatRequest.mockResolvedValueOnce(undefined);
+    await act(async () => heartbeat());
+    await act(async () => heartbeat());
+    expect(screen.queryByText(/Could not refresh the edit lock/)).not.toBeInTheDocument();
+    await act(async () => heartbeat());
+    await act(async () => heartbeat());
+    expect(screen.getByRole("status")).toHaveTextContent("Could not refresh the edit lock");
+    heartbeatRequest.mockResolvedValue(undefined);
+    await act(async () => heartbeat());
+    expect(screen.queryByText(/Could not refresh the edit lock/)).not.toBeInTheDocument();
+  });
+
+  it("does not overlap heartbeat requests", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    const interval = vi.spyOn(window, "setInterval");
+    let finish!: () => void;
+    const heartbeatRequest = vi
+      .spyOn(apiService, "heartbeatEditLock")
+      .mockResolvedValue(undefined)
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          })
+      );
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByRole("textbox", { name: "Markdown editor" });
+    const heartbeat = interval.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+    if (typeof heartbeat !== "function") throw new Error("Expected heartbeat interval");
+    await act(async () => heartbeat());
+    await act(async () => heartbeat());
+    expect(heartbeatRequest).toHaveBeenCalledTimes(1);
+    await act(async () => finish());
+    await act(async () => heartbeat());
+    expect(heartbeatRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["Keep my draft", "Use saved file"])(
+    "preserves the draft after lock loss and resolves remote changes with %s",
+    async (choice) => {
+      const read = vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+      vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+      vi.spyOn(apiService, "heartbeatEditLock").mockRejectedValueOnce(new ExpiredEditLockError());
+      const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+      const interval = vi.spyOn(window, "setInterval");
+      renderViewer();
+      await screen.findByText("Readme");
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+      fireEvent.change(editor, { target: { value: "# Retained draft\n" } });
+      const heartbeat = interval.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+      if (typeof heartbeat !== "function") throw new Error("Expected heartbeat interval");
+      await act(async () => heartbeat());
+      expect(editor).toHaveAttribute("readonly");
+      expect(editor).toHaveValue("# Retained draft\n");
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+      expect(release).toHaveBeenCalledTimes(1);
+      read.mockResolvedValue("# External change\n");
+      fireEvent.click(screen.getByRole("button", { name: "Retry editing" }));
+      const dialog = await screen.findByRole("dialog", { name: "File changed" });
+      expect(editor).toHaveAttribute("readonly");
+      fireEvent.click(within(dialog).getByRole("button", { name: choice }));
+      await waitFor(() => expect(editor).not.toHaveAttribute("readonly"));
+      expect(editor).toHaveValue(choice === "Keep my draft" ? "# Retained draft\n" : "# External change\n");
+      expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+    }
+  );
+
+  it.each([false, true])(
+    "compares the normalized saved source on lock retry without inventing a conflict (editor normalization: %s)",
+    async (editorNormalization) => {
+      vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+      vi.spyOn(markdownCodePreparation, "normalizeMarkdownSource").mockResolvedValue("# Readme\n\n");
+      if (editorNormalization) mockMarkdownEditorBehavior.initialNormalizedMarkdown = "# Readme\n\n\n";
+      vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+      vi.spyOn(apiService, "heartbeatEditLock").mockRejectedValueOnce(new ExpiredEditLockError());
+      vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+      const interval = vi.spyOn(window, "setInterval");
+      renderViewer();
+      await screen.findByText("Readme");
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      });
+      const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+      fireEvent.change(editor, { target: { value: "# Retained draft\n" } });
+      const heartbeat = interval.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+      if (typeof heartbeat !== "function") throw new Error("Expected heartbeat interval");
+      await act(async () => heartbeat());
+      expect(editor).toHaveAttribute("readonly");
+      expect(editor).toHaveValue("# Retained draft\n");
+      fireEvent.click(screen.getByRole("button", { name: "Retry editing" }));
+      await waitFor(() => expect(editor).not.toHaveAttribute("readonly"));
+      expect(screen.queryByRole("dialog", { name: "File changed" })).not.toBeInTheDocument();
+      expect(editor).toHaveValue("# Retained draft\n");
+      expect(markdownCodePreparation.normalizeMarkdownSource).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it("keeps lock loss inside an active unsaved-changes dialog and restores the toast after Cancel", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    vi.spyOn(apiService, "heartbeatEditLock").mockRejectedValueOnce(new ExpiredEditLockError());
+    const interval = vi.spyOn(window, "setInterval");
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Retained draft\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    const heartbeat = interval.mock.calls.find(([, delay]) => delay === 30_000)?.[0];
+    if (typeof heartbeat !== "function") throw new Error("Expected heartbeat interval");
+    await act(async () => heartbeat());
+    expect(within(dialog).getByRole("status")).toHaveTextContent("The edit lock is no longer active");
+    expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(document.querySelector(".MuiSnackbar-root")).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.querySelector(".MuiSnackbar-root")).not.toBeNull());
+    expect(editor).toHaveValue("# Retained draft\n");
+    expect(editor).toHaveAttribute("readonly");
+  });
+
+  it("shows each failed Save in a toast without discarding edits or stealing focus", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "saveTextFile").mockRejectedValue(new Error("Disk full"));
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Unsaved\n" } });
+    for (const attempt of [1, 2]) {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      const failure = await screen.findByRole("alert");
+      expect(failure).toHaveTextContent("The file could not be opened. Check the connection and retry.");
+      expect(failure.closest(".MuiSnackbar-root")).not.toBeNull();
+      expect(apiService.saveTextFile).toHaveBeenCalledTimes(attempt);
+      fireEvent.click(within(failure).getByRole("button", { name: "Close" }));
+      expect(editor).toHaveValue("# Unsaved\n");
+      expect(editor).not.toHaveAttribute("readonly");
+    }
   });
 
   it("saves markdown changes and stays in edit mode", async () => {
@@ -1070,7 +2242,7 @@ describe("MarkdownViewer", () => {
       locked_by: "alice",
       locked_at: "2026-03-23T12:00:00Z",
     });
-    let resolveSave: (() => void) | null = null;
+    let resolveSave: () => void = uninitializedTestCallback;
     const saveSpy = vi.spyOn(apiService, "saveTextFile").mockImplementation(
       () =>
         new Promise<void>((resolve) => {
@@ -1225,13 +2397,19 @@ describe("MarkdownViewer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Failed to save markdown changes.: Disk full")).toBeInTheDocument();
+      expect(
+        screen.getByText("Failed to save markdown changes. The file could not be opened. Check the connection and retry.")
+      ).toBeInTheDocument();
     });
     expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBeInTheDocument();
     expect(releaseSpy).not.toHaveBeenCalledWith("conn1", "/docs/readme.md");
   });
 
-  it("fails closed when flushing pending editor edits fails before save", async () => {
+  it.each([
+    new Error("Flush failed"),
+    new DOMException("Markdown publication timed out", "TimeoutError"),
+    new DOMException("Finish the current input method composition before saving or creating a recovery snapshot.", "InvalidStateError"),
+  ])("retains edits and permits retry when snapshot capture fails: %s", async (failure) => {
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
     vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
     vi.spyOn(apiService, "acquireEditLock").mockResolvedValueOnce({
@@ -1244,7 +2422,7 @@ describe("MarkdownViewer", () => {
     });
     const saveSpy = vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
     const releaseSpy = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
-    mockMarkdownEditorBehavior.flushRejectError = new Error("Flush failed");
+    mockMarkdownEditorBehavior.flushRejectError = failure;
 
     renderViewer();
 
@@ -1256,12 +2434,144 @@ describe("MarkdownViewer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Failed to save markdown changes.: Flush failed")).toBeInTheDocument();
+      expect(screen.getByText(`Failed to save markdown changes.: ${failure.message}`)).toBeInTheDocument();
     });
 
     expect(saveSpy).not.toHaveBeenCalled();
     expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBeInTheDocument();
+    expect(editor).toHaveValue("# Updated\n");
     expect(releaseSpy).not.toHaveBeenCalledWith("conn1", "/docs/readme.md");
+    mockMarkdownEditorBehavior.flushRejectError = null;
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(saveSpy).toHaveBeenCalled());
+    expect(editor).toHaveValue("# Updated\n");
+  });
+
+  it.each([
+    { latest: "# Newer unsaved\n", pending: false },
+    { latest: "# Saved\n", pending: false },
+    { latest: "# Newer unsaved\n", pending: true },
+  ])("acknowledges Markdown Save without losing current draft $latest with normalization pending $pending", async ({ latest, pending }) => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "getThemes").mockResolvedValue({ themes: [], site_default_id: "sambee-light" });
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob(["# Saved\n"], { type: "text/markdown" }));
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    let finishWrite: (() => void) | undefined;
+    const save = vi.spyOn(apiService, "saveTextFile").mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        })
+    );
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Saved\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(editor).not.toHaveAttribute("readonly");
+    fireEvent.change(editor, { target: { value: "# Newer unsaved\n" } });
+    if (latest === "# Saved\n") fireEvent.change(editor, { target: { value: latest } });
+    if (pending) mockMarkdownEditorBehavior.flushRejectError = new DOMException("Normalization pending", "InvalidStateError");
+    if (!finishWrite) throw new Error("Expected a pending Markdown write");
+    await act(async () => {
+      finishWrite?.();
+    });
+
+    expect(editor).toHaveValue(latest);
+    expect(screen.queryByText(/Failed to save markdown changes/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    if (latest !== "# Saved\n") {
+      const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Discard" }));
+    } else {
+      expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument();
+    }
+    expect(await screen.findByRole("heading", { name: "Saved" })).toBeInTheDocument();
+  });
+
+  it("keeps edits made during snapshot preparation dirty after saving the captured revision", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob(["# Captured\n"], { type: "text/markdown" }));
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    const save = vi.spyOn(apiService, "saveTextFile").mockResolvedValue();
+    let finishSnapshot!: () => void;
+    mockMarkdownEditorBehavior.pendingSnapshot = new Promise<void>((resolve) => {
+      finishSnapshot = resolve;
+    });
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Captured\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(save).not.toHaveBeenCalled();
+    expect(editor).not.toHaveAttribute("readonly");
+    fireEvent.change(editor, { target: { value: "# Newer while preparing\n" } });
+    await act(async () => {
+      finishSnapshot();
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    expect(save).toHaveBeenCalledExactlyOnceWith("conn1", "/docs/readme.md", "# Captured\n", {
+      filename: "readme.md",
+      mimeType: "text/markdown;charset=utf-8",
+    });
+    expect(editor).toHaveValue("# Newer while preparing\n");
+    expect(screen.getByRole("status", { name: /unsaved changes/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    expect(release).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Discard" }));
+    expect(await screen.findByRole("heading", { name: "Captured" })).toBeInTheDocument();
+    expect(save).toHaveBeenCalledOnce();
+  });
+
+  it("preserves newer edits after a delayed write fails and retries the latest snapshot", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    const release = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    let failWrite: ((reason: Error) => void) | undefined;
+    const save = vi
+      .spyOn(apiService, "saveTextFile")
+      .mockResolvedValue()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            failWrite = reject;
+          })
+      );
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# First snapshot\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0]?.[2]).toBe("# First snapshot\n");
+    fireEvent.change(editor, { target: { value: "# Newer unsaved\n" } });
+    const rejectWrite = failWrite;
+    if (!rejectWrite) throw new Error("Expected a pending Markdown write");
+    await act(async () => rejectWrite(new Error("Disk full")));
+    expect(
+      await screen.findByText("Failed to save markdown changes. The file could not be opened. Check the connection and retry.")
+    ).toBeInTheDocument();
+    expect(editor).toHaveValue("# Newer unsaved\n");
+    expect(editor).not.toHaveAttribute("readonly");
+    expect(release).not.toHaveBeenCalled();
+    fireEvent.click(
+      requireTestValue(screen.getAllByRole("button", { name: "Close" }).find((button) => !button.closest(".MuiSnackbar-root")))
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[1]?.[2]).toBe("# Newer unsaved\n");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByRole("heading", { name: "Newer unsaved" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument();
   });
 
   it("fails closed when canonical markdown export throws before save", async () => {
@@ -1297,7 +2607,54 @@ describe("MarkdownViewer", () => {
     expect(releaseSpy).not.toHaveBeenCalledWith("conn1", "/docs/readme.md");
   });
 
-  it("shows the backend read-only detail when a stale client save is rejected with 403", async () => {
+  it("keeps the mounted Markdown draft and recovery data after a confirmed missing-target save", async () => {
+    vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    vi.spyOn(apiService, "saveTextFile").mockRejectedValueOnce({
+      response: { status: 404, data: { code: "item_not_found", detail: "private OS path" } },
+    });
+    renderViewer();
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Unsaved draft\n" } });
+    const acquisitions = vi.mocked(apiService.acquireEditLock).mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText(/File "readme.md" was not found/);
+    expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBe(editor);
+    expect(editor).toHaveValue("# Unsaved draft\n");
+    expect(loadDraft("conn1", "/docs/readme.md", "markdown")?.content).toBe("# Unsaved draft\n");
+    expect(apiService.acquireEditLock).toHaveBeenCalledTimes(acquisitions);
+    expect(screen.queryByText(/private OS path/)).not.toBeInTheDocument();
+  });
+
+  it("preserves a dirty Markdown editor and lock during a directory-only route replacement", async () => {
+    vi.spyOn(authSession, "getUserId").mockReturnValue("test-user");
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue("# Readme\n");
+    const router = createMemoryRouter([{ path: "/viewer/*", element: <RoutedMarkdownViewer /> }], {
+      initialEntries: ["/viewer?file=smb%2Fdemo%2Fdocs%2Freadme.md&viewer=markdown&mode=edit"],
+    });
+    render(
+      <SambeeThemeProvider>
+        <RouterProvider router={router} />
+      </SambeeThemeProvider>
+    );
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Retained directory draft\n" } });
+    await act(async () => snapshotRegisteredDrafts());
+    const acquisitions = vi.mocked(apiService.acquireEditLock).mock.calls.length;
+    const reads = vi.mocked(apiService.getFileContent).mock.calls.length;
+    await act(async () =>
+      router.navigate({ pathname: "/viewer/recovered-parent", search: router.state.location.search }, { replace: true })
+    );
+    expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBe(editor);
+    expect(editor).toHaveValue("# Retained directory draft\n");
+    expect(loadDraft("conn1", "/docs/readme.md", "markdown")?.content).toBe("# Retained directory draft\n");
+    expect(apiService.acquireEditLock).toHaveBeenCalledTimes(acquisitions);
+    expect(apiService.getFileContent).toHaveBeenCalledTimes(reads);
+  });
+
+  it("shows safe access guidance when a stale client save is rejected with 403", async () => {
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
     vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
     vi.spyOn(apiService, "acquireEditLock").mockResolvedValueOnce({
@@ -1326,13 +2683,68 @@ describe("MarkdownViewer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(screen.getByText("Connection is read-only")).toBeInTheDocument();
+      expect(screen.getByText(/Access to this file was denied/)).toBeInTheDocument();
     });
     expect(screen.getByRole("textbox", { name: "Markdown editor" })).toBeInTheDocument();
     expect(releaseSpy).not.toHaveBeenCalledWith("conn1", "/docs/readme.md");
   });
 
+  it("does not steal search focus when delayed preview autofocus runs", async () => {
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("alpha beta\n");
+    const callbacks: (() => void)[] = [];
+    const originalTimeout = setTimeout;
+    const timer = vi.spyOn(window, "setTimeout").mockImplementation((callback, delay, ...args) => {
+      if (delay === MARKDOWN_VIEWER_CONTENT_AUTOFOCUS_DELAY_MS && typeof callback === "function") {
+        callbacks.push(() => callback(...args));
+      }
+      return originalTimeout(callback, delay, ...args);
+    });
+    try {
+      renderViewer();
+      await screen.findByText("alpha beta");
+      const search = await viewerSearch.openSearch("alpha");
+      expect(search).toHaveFocus();
+      expect(callbacks.length).toBeGreaterThan(0);
+      act(() => {
+        for (const callback of callbacks) callback();
+      });
+      expect(search).toHaveFocus();
+      fireEvent.change(search, { target: { value: "beta" } });
+      expect(await screen.findByText("1 / 1")).toBeInTheDocument();
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  it("restores open search after leaving edit mode in a progressively rendered preview", async () => {
+    enableSearchHighlights();
+    const paragraphCount = 1500;
+    const markdown = `# Search fixture\n\n${"needle ordinary paragraph text for the search fixture.\n\n".repeat(paragraphCount)}`;
+    vi.spyOn(apiService, "getFileContent").mockResolvedValue(markdown);
+    vi.spyOn(apiService, "getOriginalFileBlob").mockResolvedValue(new Blob([markdown], { type: "text/markdown" }));
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+
+    renderViewer();
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByRole("textbox", { name: "Markdown editor" });
+    const closeViewerButton = screen.getByRole("button", { name: "Close" });
+    await viewerSearch.openSearch("needle");
+    fireEvent.click(closeViewerButton);
+
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Markdown editor" })).not.toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector('[data-markdown-publication="complete"]')).not.toBeNull());
+    expect(screen.getByDisplayValue("needle")).toBeInTheDocument();
+    expect(await screen.findByText(`1 / ${paragraphCount}`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next match" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    expect(await screen.findByText(`2 / ${paragraphCount}`)).toBeInTheDocument();
+  });
+
   it("searches rendered markdown and navigates between matches", async () => {
+    enableSearchHighlights();
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Alpha\n\nAlpha beta alpha\n");
 
     renderViewer();
@@ -1343,9 +2755,7 @@ describe("MarkdownViewer", () => {
       expectedCounterText: "1 / 3",
     });
 
-    await waitFor(() => {
-      expect(document.querySelectorAll('mark[data-text-search-highlight="true"]').length).toBe(3);
-    });
+    expect(document.querySelectorAll('mark[data-text-search-highlight="true"]')).toHaveLength(0);
 
     await viewerSearch.expectRefinedSearchKeepsCurrentMatchActive({
       refinedSearchTerm: "al",
@@ -1360,6 +2770,7 @@ describe("MarkdownViewer", () => {
   });
 
   it("treats cross-inline markdown text as a single search match", async () => {
+    enableSearchHighlights();
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("sam**bee** sambee\n");
 
     renderViewer();
@@ -1371,7 +2782,9 @@ describe("MarkdownViewer", () => {
       expect(screen.getByText("1 / 2")).toBeInTheDocument();
     });
 
-    expect(document.querySelectorAll('mark[data-text-search-highlight="true"]').length).toBe(3);
+    const current = [...CSS.highlights.entries()].find(([name]) => name.startsWith("markdown-search-") && name.endsWith("-current"));
+    expect(requireTestValue([...current![1]][0]).toString()).toBe("sambee");
+    expect(document.querySelectorAll('mark[data-text-search-highlight="true"]')).toHaveLength(0);
 
     fireEvent.click(screen.getByRole("button", { name: "Next match" }));
 
@@ -1456,7 +2869,7 @@ describe("MarkdownViewer", () => {
     // The onClick handler on external links calls window.open() directly,
     // ensuring the link opens even if the browser misses the native
     // <a target="_blank"> navigation due to mid-event React re-renders.
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("link", { name: "Docs" }));
     expect(windowOpenSpy).toHaveBeenCalledWith("https://example.com/docs", "_blank", "noopener,noreferrer");
 
     windowOpenSpy.mockRestore();
@@ -1470,14 +2883,16 @@ describe("MarkdownViewer", () => {
 
     renderViewer();
 
-    const link = await screen.findByRole("link", { name: "Docs" });
-    const viewerContent = link.closest('[tabindex="0"]');
+    const viewerContent = screen.getByTestId("markdown-viewer-content");
+    await within(viewerContent).findByRole("link", { name: "Docs" });
+    expect(viewerContent).toHaveAttribute("tabindex", "0");
 
-    expect(viewerContent).not.toBeNull();
-
-    act(() => {
-      link.focus();
+    await waitFor(() => {
+      expect(viewerContent).toHaveFocus();
     });
+
+    const link = within(viewerContent).getByRole("link", { name: "Docs" });
+    link.focus();
     expect(link).toHaveFocus();
 
     fireEvent.click(link);
@@ -1935,6 +3350,9 @@ describe("MarkdownViewer", () => {
     await waitFor(() => {
       expect(within(unsavedDialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
     });
+    expect(within(unsavedDialog).getByRole("button", { name: "Cancel" })).toHaveClass("MuiButton-outlined");
+    expect(within(unsavedDialog).getByRole("button", { name: "Discard" })).toHaveClass("MuiButton-contained", "MuiButton-colorError");
+    expect(within(unsavedDialog).getByRole("button", { name: "Save" })).toHaveClass("MuiButton-contained", "MuiButton-colorPrimary");
 
     fireEvent.keyDown(unsavedDialog, { key: "Escape" });
 
@@ -1960,7 +3378,7 @@ describe("MarkdownViewer", () => {
     expect(releaseSpy).not.toHaveBeenCalled();
   });
 
-  it("discards and closes from the unsaved changes dialog", async () => {
+  it("discards to the viewer and requires a second Close to close the viewer", async () => {
     const onClose = vi.fn();
 
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
@@ -1988,11 +3406,16 @@ describe("MarkdownViewer", () => {
 
     await waitFor(() => {
       expect(releaseSpy).toHaveBeenCalledWith("conn1", "/docs/readme.md", expect.objectContaining(mockEditLockInfo));
-      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled();
     });
+    expect(await screen.findByText("Readme")).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
-  it("saves from the unsaved changes dialog before closing the viewer", async () => {
+  it("saves to the viewer and requires a second Close to close the viewer", async () => {
     const onClose = vi.fn();
 
     vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
@@ -2025,8 +3448,44 @@ describe("MarkdownViewer", () => {
         mimeType: "text/markdown;charset=utf-8",
       });
       expect(releaseSpy).toHaveBeenCalledWith("conn1", "/docs/readme.md", expect.objectContaining(mockEditLockInfo));
-      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled();
     });
+    expect(await screen.findByText("Updated")).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it.each(["Cancel", "failed Save"])("keeps Markdown editing after Close and %s", async (choice) => {
+    const onClose = vi.fn();
+    vi.spyOn(apiService, "getFileContent").mockResolvedValueOnce("# Readme\n");
+    vi.spyOn(apiService, "supportsEditLocks").mockReturnValue(true);
+    const releaseSpy = vi.spyOn(apiService, "releaseEditLock").mockResolvedValue();
+    if (choice === "failed Save") {
+      vi.mocked(apiService.writeTextWithEditLock).mockRejectedValueOnce(new Error("Save failed"));
+    }
+    renderViewerWithProps({ onClose });
+
+    await screen.findByText("Readme");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    fireEvent.change(editor, { target: { value: "# Updated\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    const dialog = await screen.findByRole("dialog", { name: "Unsaved changes" });
+    fireEvent.click(within(dialog).getByRole("button", { name: choice === "Cancel" ? "Cancel" : "Save" }));
+
+    if (choice === "Cancel") {
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).not.toBeInTheDocument());
+    } else {
+      await waitFor(() => expect(apiService.writeTextWithEditLock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(within(dialog).getByRole("button", { name: "Save" })).toBeEnabled());
+      expect(dialog).toBeInTheDocument();
+    }
+    expect(editor).toHaveValue("# Updated\n");
+    expect(editor).not.toHaveAttribute("readonly");
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("sends heartbeat requests while an edit lock is held", async () => {
@@ -2098,7 +3557,9 @@ describe("MarkdownViewer", () => {
       expect(screen.getByText("Markdown viewer shortcuts")).toBeInTheDocument();
     });
 
-    fireEvent.keyDown(document, { key: "Escape" });
+    const searchInput = screen.getByRole("searchbox");
+    await waitFor(() => expect(searchInput).toHaveFocus());
+    fireEvent.keyDown(searchInput, { key: "Escape" });
 
     await waitFor(() => {
       expect(screen.queryByText("Markdown viewer shortcuts")).not.toBeInTheDocument();
@@ -2140,7 +3601,7 @@ describe("MarkdownViewer", () => {
     await screen.findByText("Alpha");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
-    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    const editor = requireTestElement(await screen.findByRole("textbox", { name: "Markdown editor" }), HTMLTextAreaElement);
     const selectionStart = editor.value.indexOf("beta");
     const selectionEnd = selectionStart + "beta".length;
 
@@ -2166,7 +3627,7 @@ describe("MarkdownViewer", () => {
     await screen.findByText("Alpha");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
-    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    const editor = requireTestElement(await screen.findByRole("textbox", { name: "Markdown editor" }), HTMLTextAreaElement);
     const betaStart = editor.value.indexOf("beta");
     const betaEnd = betaStart + "beta".length;
 
@@ -2212,7 +3673,7 @@ describe("MarkdownViewer", () => {
     await screen.findByText("Alpha");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
 
-    const editor = await screen.findByRole("textbox", { name: "Markdown editor" });
+    const editor = requireTestElement(await screen.findByRole("textbox", { name: "Markdown editor" }), HTMLTextAreaElement);
     const betaStart = editor.value.indexOf("beta");
     const betaEnd = betaStart + "beta".length;
 
@@ -2481,7 +3942,7 @@ describe("MarkdownViewer", () => {
 
     await screen.findByText("Alpha");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    await vi.dynamicImportSettled();
+    await act(() => vi.dynamicImportSettled());
 
     await screen.findByText("Editor unavailable");
 
@@ -2504,7 +3965,7 @@ describe("MarkdownViewer", () => {
 
     await screen.findByText("Alpha");
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    await vi.dynamicImportSettled();
+    await act(() => vi.dynamicImportSettled());
     await screen.findByRole("textbox", { name: "Markdown editor" });
 
     fireEvent.keyDown(document, { key: "E", ctrlKey: true, shiftKey: true });

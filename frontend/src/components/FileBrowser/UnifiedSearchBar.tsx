@@ -30,6 +30,7 @@ import {
   Divider,
   IconButton,
   InputAdornment,
+  Link,
   ListItemButton,
   Menu,
   MenuItem,
@@ -41,19 +42,21 @@ import {
 } from "@mui/material";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type React from "react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import { usePillButtonMenu } from "../../hooks/usePillButtonMenu";
 import { getSecondaryToolbarMenuPaperStyle, pillButtonStyle } from "../../theme/commonStyles";
 import { COMPACT_LAYOUT_SIZE } from "../../theme/constants";
+import { PillButtonTooltip } from "./PillButtonTooltip";
 import {
   getQuickBarResultRowHeight,
   QUICK_BAR_RESULT_ITEM_HEIGHT,
   QuickBarResultGroupHeader,
   QuickBarResultRow,
 } from "./QuickBarResultRow";
-import type { SearchProvider, SearchResult, SearchSelectionAction, SearchSelectionBehavior } from "./search/types";
+import { SearchStatusDialog } from "./SearchStatusDialog";
+import type { SearchProvider, SearchResult, SearchSelectionAction, SearchSelectionBehavior, SearchStatusInfo } from "./search/types";
 
 // ============================================================================
 // Constants
@@ -127,7 +130,7 @@ interface UnifiedSearchBarProps {
   /** Increments whenever visible results should refresh without changing dropdown visibility. */
   refreshToken?: number;
   /** Ref forwarded to the underlying <input> element */
-  inputRef?: React.RefObject<HTMLInputElement>;
+  inputRef?: React.RefObject<HTMLInputElement | null>;
   /** Remove from Tab order (dual-pane mode uses Tab for pane switching) */
   disableTabFocus?: boolean;
   /** Whether to use compact (mobile) layout styling */
@@ -157,6 +160,8 @@ export interface UnifiedSearchBarModeOption {
   label: string;
   onSelect: () => void;
 }
+
+const MIN_BACKGROUND_REFRESH_MS = 500;
 
 // ============================================================================
 // Component
@@ -193,6 +198,7 @@ export function UnifiedSearchBar({
   const [removeError, setRemoveError] = useState(false);
   const [isFocused, setIsFocused] = useState(false);
   const [isSearchPending, setIsSearchPending] = useState(false);
+  const [statusDialog, setStatusDialog] = useState<SearchStatusInfo | null>(null);
 
   const theme = useTheme();
   const { t } = useTranslation();
@@ -209,6 +215,12 @@ export function UnifiedSearchBar({
   const anchorRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const quietRequestRef = useRef(false);
+  const acceptedQueryRef = useRef<string | null>(null);
+  const executeSearchRef = useRef<(value: string, openDropdown: boolean, quiet: boolean) => Promise<void>>(async () => {});
+  const dropdownOpenRef = useRef(false);
+  dropdownOpenRef.current = isDropdownOpen && !disableDropdown && !suppressDropdown;
   const pendingQueryRef = useRef<string>("");
   const providerRef = useRef(provider);
   const internalInputRef = useRef<HTMLInputElement>(null);
@@ -217,6 +229,9 @@ export function UnifiedSearchBar({
   const lastActivationTokenRef = useRef(activationToken);
   const lastRefreshTokenRef = useRef(refreshToken);
   const wasDropdownSuppressedRef = useRef(suppressDropdown);
+  const queryGenerationRef = useRef(0);
+  const selectedValueRef = useRef<string | undefined>(undefined);
+  selectedValueRef.current = results[selectedIndex]?.value;
 
   // Always keep providerRef current so stable callbacks use the latest provider
   providerRef.current = provider;
@@ -226,10 +241,18 @@ export function UnifiedSearchBar({
 
   const setQuery = useCallback(
     (value: string) => {
+      queryGenerationRef.current += 1;
+      acceptedQueryRef.current = null;
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+      abortControllerRef.current?.abort();
+      setIsLoading(false);
       providerRef.current.onQueryChange?.(value);
+      onQueryValueChange?.(value);
 
       if (isControlledQuery) {
-        onQueryValueChange?.(value);
         return;
       }
 
@@ -314,27 +337,31 @@ export function UnifiedSearchBar({
       return null;
     }
 
+    const modeSelectorLabel = modeSelectorAriaLabel ?? t("fileBrowser.search.modeSelectorAriaLabel");
+
     return (
       <>
-        <Button
-          onClick={handleModeMenuClick}
-          onKeyDown={handleModeTriggerKeyDown}
-          onKeyUp={handleModeMenuKeyUp}
-          size="small"
-          tabIndex={disableTabFocus ? -1 : undefined}
-          aria-label={modeSelectorAriaLabel ?? t("fileBrowser.search.modeSelectorAriaLabel")}
-          aria-controls={isModeMenuOpen ? "quick-bar-mode-menu" : undefined}
-          aria-haspopup="true"
-          aria-expanded={isModeMenuOpen ? "true" : undefined}
-          sx={QUICK_BAR_MODE_BUTTON_SX}
-        >
-          <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.125, whiteSpace: "nowrap" }}>
-            <Typography variant="body2" sx={getQuickBarModeLabelSx(useCompactLayout)}>
-              {provider.modeLabel}
-            </Typography>
-            <ArrowDropDownIcon sx={{ fontSize: "1rem" }} />
-          </Box>
-        </Button>
+        <PillButtonTooltip label={modeSelectorLabel}>
+          <Button
+            onClick={handleModeMenuClick}
+            onKeyDown={handleModeTriggerKeyDown}
+            onKeyUp={handleModeMenuKeyUp}
+            size="small"
+            tabIndex={disableTabFocus ? -1 : undefined}
+            aria-label={modeSelectorLabel}
+            aria-controls={isModeMenuOpen ? "quick-bar-mode-menu" : undefined}
+            aria-haspopup="true"
+            aria-expanded={isModeMenuOpen ? "true" : undefined}
+            sx={QUICK_BAR_MODE_BUTTON_SX}
+          >
+            <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.125, whiteSpace: "nowrap" }}>
+              <Typography variant="body2" sx={getQuickBarModeLabelSx(useCompactLayout)}>
+                {provider.modeLabel}
+              </Typography>
+              <ArrowDropDownIcon sx={{ fontSize: "1rem" }} />
+            </Box>
+          </Button>
+        </PillButtonTooltip>
         <Menu
           id="quick-bar-mode-menu"
           anchorEl={modeMenuAnchorEl}
@@ -445,7 +472,17 @@ export function UnifiedSearchBar({
   // executeSearch
   //
   const executeSearch = useCallback(
-    async (searchQuery: string, openDropdown = true) => {
+    async (searchQuery: string, openDropdown = true, quiet = false) => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+      if (
+        quiet &&
+        (document.visibilityState === "hidden" ||
+          !dropdownOpenRef.current ||
+          acceptedQueryRef.current !== searchQuery ||
+          providerRef.current.getRefreshIntervalMs?.() == null)
+      )
+        return;
       // Cancel any in-flight request
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -453,30 +490,54 @@ export function UnifiedSearchBar({
 
       const controller = new AbortController();
       abortControllerRef.current = controller;
+      quietRequestRef.current = quiet;
+      const generation = queryGenerationRef.current;
+      const activeProvider = providerRef.current;
+      const isCurrent = () =>
+        !controller.signal.aborted &&
+        generation === queryGenerationRef.current &&
+        activeProvider.id === providerRef.current.id &&
+        activeProvider.sourceKey === providerRef.current.sourceKey;
+      const publishResults = (updatedResults: SearchResult[]) => {
+        if (!isCurrent()) return;
+        const previousValue = selectedValueRef.current;
+        const previousIndex = updatedResults.findIndex((result) => result.kind === "result" && result.value === previousValue);
+        const firstIndex = updatedResults.findIndex((result) => result.kind === "result");
+        setResults(updatedResults);
+        setSelectedIndex(Math.max(previousIndex >= 0 ? previousIndex : firstIndex, 0));
+        setHasSearched(true);
+        if (openDropdown) setIsDropdownOpen(true);
+      };
 
       try {
-        setIsSearchPending(false);
-        setIsLoading(true);
-        setSearchError(false);
-        setRemoveError(false);
-        const fetchedResults = await providerRef.current.fetchResults(searchQuery, controller.signal);
-
-        if (!controller.signal.aborted) {
-          setResults(fetchedResults);
-          setSelectedIndex(
-            Math.max(
-              fetchedResults.findIndex((result) => result.kind !== "group-header"),
-              0
-            )
-          );
-          setHasSearched(true);
-          if (openDropdown) {
-            setIsDropdownOpen(true);
+        if (!quiet) {
+          acceptedQueryRef.current = null;
+          setIsSearchPending(false);
+          setIsLoading(true);
+          setSearchError(false);
+          setRemoveError(false);
+        }
+        const fetchedResults = await activeProvider.fetchResults(searchQuery, controller.signal, publishResults);
+        publishResults(fetchedResults);
+        if (isCurrent()) {
+          acceptedQueryRef.current = searchQuery;
+          const interval = providerRef.current.getRefreshIntervalMs?.();
+          if (
+            interval != null &&
+            Number.isFinite(interval) &&
+            interval >= MIN_BACKGROUND_REFRESH_MS &&
+            document.visibilityState !== "hidden"
+          ) {
+            refreshTimerRef.current = setTimeout(() => {
+              refreshTimerRef.current = null;
+              if (isCurrent()) void executeSearchRef.current(searchQuery, false, true);
+            }, interval);
           }
         }
       } catch {
-        if (!controller.signal.aborted) {
-          setResults([]);
+        if (isCurrent()) {
+          acceptedQueryRef.current = null;
+          if (!quiet) setResults([]);
           setHasSearched(true);
           setSearchError(true);
           if (openDropdown) {
@@ -484,7 +545,7 @@ export function UnifiedSearchBar({
           }
         }
       } finally {
-        if (!controller.signal.aborted) {
+        if (isCurrent()) {
           setIsLoading(false);
         }
       }
@@ -492,6 +553,7 @@ export function UnifiedSearchBar({
     // providerRef is stable — no dependency on provider object identity
     []
   );
+  executeSearchRef.current = executeSearch;
 
   // ── Input handling ─────────────────────────────────────────────────────
 
@@ -618,6 +680,23 @@ export function UnifiedSearchBar({
     return "associated-viewer";
   }, []);
 
+  const dismissSearch = useCallback(() => {
+    queryGenerationRef.current += 1;
+    acceptedQueryRef.current = null;
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = null;
+    abortControllerRef.current?.abort();
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    setIsLoading(false);
+    setIsSearchPending(false);
+    setIsDropdownOpen(false);
+    activatedRef.current = false;
+    providerRef.current.onDeactivate?.();
+  }, []);
+
   // ── Keyboard navigation ────────────────────────────────────────────────
 
   //
@@ -703,7 +782,7 @@ export function UnifiedSearchBar({
           }
           if (isDropdownOpen) {
             // First Escape: close the dropdown
-            setIsDropdownOpen(false);
+            dismissSearch();
           } else if (query) {
             // Second Escape: clear the query
             setQuery("");
@@ -718,13 +797,14 @@ export function UnifiedSearchBar({
 
         case "Tab":
           if (isDropdownOpen) {
-            setIsDropdownOpen(false);
+            dismissSearch();
           }
           break;
       }
     },
     [
       disableDropdown,
+      dismissSearch,
       findSelectableResultIndex,
       getSelectionAction,
       handleSelect,
@@ -774,12 +854,28 @@ export function UnifiedSearchBar({
     return height;
   }, [results]);
 
+  const resetOpenResults = useEffectEvent(() => {
+    const firstIndex = Math.max(
+      results.findIndex((result) => result.kind === "result"),
+      0
+    );
+    selectedValueRef.current = results[firstIndex]?.value;
+    setSelectedIndex(firstIndex);
+    rowVirtualizer.scrollToOffset(0);
+  });
+
+  useLayoutEffect(() => {
+    if (listContainer) {
+      resetOpenResults();
+    }
+  }, [listContainer]);
+
   // ── Scroll selected item into view ─────────────────────────────────────
   useEffect(() => {
-    if (results.length > 0) {
+    if (listContainer && results.length > 0) {
       rowVirtualizer.scrollToIndex(selectedIndex, { align: "auto" });
     }
-  }, [selectedIndex, results.length, rowVirtualizer]);
+  }, [listContainer, selectedIndex, results.length, rowVirtualizer]);
 
   // ── Focus activation ───────────────────────────────────────────────────
 
@@ -799,14 +895,16 @@ export function UnifiedSearchBar({
   // handleClickAway
   //
   const handleClickAway = useCallback(() => {
-    setIsDropdownOpen(false);
-  }, []);
+    if (statusDialog) return;
+    dismissSearch();
+  }, [dismissSearch, statusDialog]);
 
   // ── Re-open on typing after click-away ─────────────────────────────────
   //
   // handleInputFocus
   //
   const handleInputFocus = useCallback(() => {
+    const newlyActivated = !activatedRef.current;
     setIsFocused(true);
     handleFocus();
 
@@ -823,8 +921,11 @@ export function UnifiedSearchBar({
       return;
     }
 
-    if (!hasSearched && query.length === 0 && effectiveMinQueryLength === 0) {
-      void executeSearch("");
+    if (
+      newlyActivated &&
+      ((!hasSearched && query.length === 0 && effectiveMinQueryLength === 0) || (hasSearched && query.length >= effectiveMinQueryLength))
+    ) {
+      void executeSearch(query);
     }
 
     // Re-open dropdown if there are results to show
@@ -866,6 +967,7 @@ export function UnifiedSearchBar({
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
       }
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       providerRef.current.onDeactivate?.();
     };
   }, []);
@@ -874,7 +976,7 @@ export function UnifiedSearchBar({
   // biome-ignore lint/correctness/useExhaustiveDependencies: Reset only on explicit provider identity / activation changes
   useEffect(() => {
     const previousProvider = lastResetProviderRef.current;
-    const providerChanged = previousProvider.id !== provider.id;
+    const providerChanged = previousProvider.id !== provider.id || previousProvider.sourceKey !== provider.sourceKey;
     const activationChanged = lastActivationTokenRef.current !== activationToken;
 
     if (!providerChanged && !activationChanged) {
@@ -882,6 +984,10 @@ export function UnifiedSearchBar({
     }
 
     previousProvider.onDeactivate?.();
+    queryGenerationRef.current += 1;
+    acceptedQueryRef.current = null;
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = null;
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -907,7 +1013,10 @@ export function UnifiedSearchBar({
     const shouldOpenOnActivation = shouldSearchOnActivation || shouldShowBelowMinimumOnActivation;
     const shouldPreserveSearchStateOnActivation = shouldSearchOnActivation && !providerChanged;
 
-    if (!shouldPreserveSearchStateOnActivation) {
+    setStatusDialog(null);
+    if (shouldPreserveSearchStateOnActivation) {
+      resetOpenResults();
+    } else {
       setResults([]);
       setSelectedIndex(0);
       setHasSearched(false);
@@ -926,14 +1035,14 @@ export function UnifiedSearchBar({
     lastResetProviderRef.current = provider;
     lastActivationTokenRef.current = activationToken;
 
-    activatedRef.current = isInputFocused;
+    activatedRef.current = isInputFocused || shouldSearchOnActivation;
+
+    if (activatedRef.current) {
+      providerRef.current.onActivate?.();
+    }
 
     if (shouldSearchOnActivation) {
       void executeSearch(nextQuery);
-    }
-
-    if (isInputFocused) {
-      providerRef.current.onActivate?.();
     }
   }, [
     activationToken,
@@ -944,8 +1053,32 @@ export function UnifiedSearchBar({
     getEffectiveMinQueryLength,
     isControlledQuery,
     provider.id,
+    provider.sourceKey,
     query,
   ]);
+
+  useEffect(() => {
+    const stopQuietRefresh = () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+      if (quietRequestRef.current) abortControllerRef.current?.abort();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        stopQuietRefresh();
+        abortControllerRef.current?.abort();
+        if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+        setIsLoading(false);
+        setIsSearchPending(false);
+      } else if (dropdownOpenRef.current && acceptedQueryRef.current === query && providerRef.current.getRefreshIntervalMs?.() != null) {
+        void executeSearchRef.current(query, false, true);
+      }
+    };
+    if (!isDropdownOpen || disableDropdown || suppressDropdown) stopQuietRefresh();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [disableDropdown, isDropdownOpen, query, suppressDropdown]);
 
   useEffect(() => {
     if (lastRefreshTokenRef.current === refreshToken) {
@@ -954,18 +1087,22 @@ export function UnifiedSearchBar({
 
     lastRefreshTokenRef.current = refreshToken;
     if (!disableDropdown && !suppressDropdown && query.length >= getEffectiveMinQueryLength(query)) {
+      providerRef.current.invalidateResults?.();
       void executeSearch(query, false);
     }
   }, [disableDropdown, executeSearch, getEffectiveMinQueryLength, query, refreshToken, suppressDropdown]);
 
+  const resumeFocusedSearch = useEffectEvent(() => {
+    if (document.activeElement === effectiveInputRef.current && query.length >= getEffectiveMinQueryLength(query)) {
+      void executeSearch(query);
+    }
+  });
+
   useEffect(() => {
-    if (disableDropdown || suppressDropdown) {
-      return;
+    if (!disableDropdown && !suppressDropdown && provider.minQueryLength === 0) {
+      resumeFocusedSearch();
     }
-    if (document.activeElement === effectiveInputRef.current && provider.minQueryLength === 0) {
-      void executeSearch("");
-    }
-  }, [disableDropdown, effectiveInputRef, executeSearch, provider.minQueryLength, suppressDropdown]);
+  }, [disableDropdown, provider.minQueryLength, suppressDropdown]);
 
   useEffect(() => {
     if (isModeMenuOpen && isDropdownOpen) {
@@ -1088,6 +1225,7 @@ export function UnifiedSearchBar({
         {/* Dropdown results panel */}
         <Popper
           open={
+            !statusDialog &&
             !suppressDropdown &&
             !disableDropdown &&
             isDropdownOpen &&
@@ -1132,8 +1270,27 @@ export function UnifiedSearchBar({
                 }}
               >
                 {statusInfo.showSpinner && <CircularProgress size={14} />}
-                <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                  {statusInfo.label}
+                <Typography variant="caption" sx={{ color: "text.secondary", overflowWrap: "anywhere" }}>
+                  {statusInfo.loadDetails ? statusInfo.label.replace(/\.$/u, "") : statusInfo.label}
+                  {statusInfo.loadDetails && (
+                    <Trans
+                      i18nKey="fileBrowser.search.statusDetails.linkSuffix"
+                      components={{
+                        details: (
+                          <Link
+                            component="button"
+                            type="button"
+                            role="link"
+                            tabIndex={-1}
+                            underline="always"
+                            onPointerDown={(event) => event.preventDefault()}
+                            onClick={() => setStatusDialog(statusInfo)}
+                            sx={{ font: "inherit", verticalAlign: "baseline" }}
+                          />
+                        ),
+                      }}
+                    />
+                  )}
                 </Typography>
               </Box>
             )}
@@ -1297,6 +1454,7 @@ export function UnifiedSearchBar({
             )}
           </Paper>
         </Popper>
+        {statusDialog && <SearchStatusDialog status={statusDialog} onClose={() => setStatusDialog(null)} />}
       </Box>
     </ClickAwayListener>
   );

@@ -9,8 +9,10 @@
  */
 
 import type React from "react";
+import type { ViewerNavigation } from "../hooks/useRoutedViewerEditing";
 import type { VirtualItemHandle } from "../pages/FileBrowser/contentProviders";
 import { logger } from "../services/logger";
+import { isTextFilename, matchFileLanguage } from "./fileLanguages";
 
 // ============================================================================
 // Types
@@ -23,6 +25,7 @@ export interface ViewerComponentProps {
   fileModifiedAt?: string;
   onClose: () => void;
   isReadOnly?: boolean;
+  isTransitioning?: boolean;
   virtualSource?: VirtualItemHandle;
   hasMoreItems?: boolean;
   isLoadingMoreItems?: boolean;
@@ -32,6 +35,7 @@ export interface ViewerComponentProps {
   currentIndex?: number;
   onCurrentIndexChange?: (index: number) => void;
   sessionId?: string;
+  navigation?: ViewerNavigation;
 }
 
 export type ViewerComponent = React.ComponentType<ViewerComponentProps>;
@@ -39,7 +43,7 @@ export type ViewerId = "image" | "markdown" | "pdf" | "text";
 
 export interface ViewerDefinition {
   id: ViewerId;
-  translationKey: string;
+  translationKey: import("i18next").ParseKeys;
   description: string;
 }
 
@@ -81,7 +85,7 @@ interface FileTypeDefinition {
 const imageViewerComponentLoader = () => import("../components/Viewer/ImageViewer");
 const markdownViewerComponentLoader = () => import("../components/Viewer/MarkdownViewer");
 const pdfViewerComponentLoader = () => import("../components/Viewer/PDFViewer");
-const textViewerComponentLoader = () => import("../components/Viewer/TextViewer");
+const textEditorComponentLoader = () => import("../components/Viewer/TextEditor");
 
 const VIEWER_DEFINITIONS: Record<ViewerId, ViewerDefinition & { loader: () => Promise<{ default: ViewerComponent }> }> = {
   image: {
@@ -105,8 +109,8 @@ const VIEWER_DEFINITIONS: Record<ViewerId, ViewerDefinition & { loader: () => Pr
   text: {
     id: "text",
     translationKey: "fileBrowser.viewerPicker.viewers.text",
-    description: "Text viewer",
-    loader: textViewerComponentLoader,
+    description: "Text editor",
+    loader: textEditorComponentLoader,
   },
 };
 
@@ -413,7 +417,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".txt"],
     mimeTypes: ["text/plain"],
     category: "text",
-    viewerComponent: textViewerComponentLoader,
     icon: "text",
     color: "#616161",
     description: "Text File",
@@ -460,7 +463,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".js", ".jsx", ".mjs"],
     mimeTypes: ["text/javascript", "application/javascript"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#f7df1e",
     description: "JavaScript",
@@ -469,7 +471,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".ts", ".tsx"],
     mimeTypes: ["text/typescript", "application/typescript"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#3178c6",
     description: "TypeScript",
@@ -478,7 +479,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".py"],
     mimeTypes: ["text/x-python"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#3776ab",
     description: "Python",
@@ -487,7 +487,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".java"],
     mimeTypes: ["text/x-java"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#ed8b00",
     description: "Java",
@@ -496,7 +495,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".rb"],
     mimeTypes: ["text/x-ruby"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#cc342d",
     description: "Ruby",
@@ -505,7 +503,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".php"],
     mimeTypes: ["text/x-php"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#777bb4",
     description: "PHP",
@@ -514,7 +511,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".go"],
     mimeTypes: ["text/x-go"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#00add8",
     description: "Go",
@@ -523,7 +519,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".rs"],
     mimeTypes: ["text/x-rust"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#ce422b",
     description: "Rust",
@@ -532,7 +527,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".c"],
     mimeTypes: ["text/x-c"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#555555",
     description: "C",
@@ -541,7 +535,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".cpp", ".cc", ".cxx"],
     mimeTypes: ["text/x-c++"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#00599c",
     description: "C++",
@@ -550,7 +543,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".h", ".hpp"],
     mimeTypes: ["text/x-c", "text/x-c++"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#555555",
     description: "C/C++ Header",
@@ -559,7 +551,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".cs"],
     mimeTypes: ["text/x-csharp"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#239120",
     description: "C#",
@@ -570,7 +561,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".html", ".htm"],
     mimeTypes: ["text/html"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#e34f26",
     description: "HTML",
@@ -579,7 +569,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".css"],
     mimeTypes: ["text/css"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#1572b6",
     description: "CSS",
@@ -588,7 +577,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".scss", ".sass"],
     mimeTypes: ["text/x-scss", "text/x-sass"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#cc6699",
     description: "SCSS/SASS",
@@ -599,7 +587,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".json"],
     mimeTypes: ["application/json"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#5e5c5c",
     description: "JSON",
@@ -608,7 +595,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".xml"],
     mimeTypes: ["text/xml", "application/xml"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#0060ac",
     description: "XML",
@@ -617,7 +603,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".yaml", ".yml"],
     mimeTypes: ["text/yaml", "application/x-yaml"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#cb171e",
     description: "YAML",
@@ -626,7 +611,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".toml", ".ini", ".conf", ".log", ".env", ".sql"],
     mimeTypes: ["application/toml"],
     category: "text",
-    viewerComponent: textViewerComponentLoader,
     icon: "text",
     color: "#7b8794",
     description: "Configuration or log file",
@@ -771,7 +755,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".sh", ".bash"],
     mimeTypes: ["text/x-shellscript"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#4eaa25",
     description: "Shell Script",
@@ -780,7 +763,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".bat", ".cmd"],
     mimeTypes: ["application/bat"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#c1f015",
     description: "Batch File",
@@ -789,7 +771,6 @@ const FILE_TYPE_REGISTRY: FileTypeDefinition[] = [
     extensions: [".ps1"],
     mimeTypes: ["text/x-powershell"],
     category: "code",
-    viewerComponent: textViewerComponentLoader,
     icon: "code",
     color: "#012456",
     description: "PowerShell",
@@ -805,6 +786,9 @@ const mimeTypeMap = new Map<string, FileTypeDefinition>();
 
 // Build indexes
 for (const fileType of FILE_TYPE_REGISTRY) {
+  if (!fileType.viewerComponent && fileType.extensions.every((extension) => isTextFilename(`file${extension}`))) {
+    fileType.viewerComponent = textEditorComponentLoader;
+  }
   for (const ext of fileType.extensions) {
     extensionMap.set(ext.toLowerCase(), fileType);
   }
@@ -822,7 +806,19 @@ for (const fileType of FILE_TYPE_REGISTRY) {
  */
 export const getFileTypeByExtension = (filename: string): FileTypeDefinition | null => {
   const ext = `.${filename.toLowerCase().split(".").pop()}` || "";
-  return extensionMap.get(ext) || null;
+  const fileType = extensionMap.get(ext);
+  if (fileType?.viewerComponent) return fileType;
+  if (!isTextFilename(filename)) return fileType ?? null;
+  return {
+    extensions: [],
+    mimeTypes: [],
+    category: "code",
+    icon: "code",
+    color: "#7b8794",
+    description: matchFileLanguage(filename)?.name ?? "Text File",
+    ...fileType,
+    viewerComponent: textEditorComponentLoader,
+  };
 };
 
 /**
@@ -870,7 +866,7 @@ function getViewerIdForFileType(fileType: FileTypeDefinition | null): ViewerId |
     return "pdf";
   }
 
-  if (fileType.viewerComponent === textViewerComponentLoader) {
+  if (fileType.viewerComponent === textEditorComponentLoader) {
     return "text";
   }
 

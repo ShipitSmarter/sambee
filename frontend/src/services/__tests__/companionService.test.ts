@@ -1,9 +1,83 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  COMPANION_AUTH_PROTOCOL_VERSION,
   COMPANION_PAIR_CONFIRMATION_PENDING_CODE,
   COMPANION_PAIR_CONFIRMATION_PENDING_DETAIL,
   default as companionService,
+  getCompanionAuthProtocolStatus,
+  isCompanionPairingMissing,
 } from "../companion";
+import { companionSession } from "../companionSession";
+import { getLocalDrivePairingErrorKind } from "../localDrivePairing";
+import { logger } from "../logger";
+
+describe("companion authentication protocol", () => {
+  it("distinguishes older, matching, and newer Companion versions", () => {
+    const health = { status: "healthy", paired: true };
+    expect(getCompanionAuthProtocolStatus(health)).toBe("companion_update_required");
+    expect(getCompanionAuthProtocolStatus({ ...health, auth_protocol_version: COMPANION_AUTH_PROTOCOL_VERSION - 1 })).toBe(
+      "companion_update_required"
+    );
+    expect(getCompanionAuthProtocolStatus({ ...health, auth_protocol_version: COMPANION_AUTH_PROTOCOL_VERSION })).toBe("compatible");
+    expect(getCompanionAuthProtocolStatus({ ...health, auth_protocol_version: COMPANION_AUTH_PROTOCOL_VERSION + 1 })).toBe(
+      "browser_update_required"
+    );
+  });
+
+  it("identifies a missing origin pairing without treating other forbidden responses as pairing errors", () => {
+    expect(isCompanionPairingMissing({ response: { status: 403, data: { code: "companion_pairing_not_found" } } })).toBe(true);
+    expect(isCompanionPairingMissing({ response: { status: 403, data: { detail: "Not paired with this origin" } } })).toBe(true);
+    expect(isCompanionPairingMissing({ response: { status: 403, data: { detail: "Permission denied" } } })).toBe(false);
+    expect(isCompanionPairingMissing({ response: { status: 500, data: { code: "companion_pairing_not_found" } } })).toBe(false);
+  });
+});
+
+describe("local drive listing pairing errors", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("does not classify errors from remote connections", () => {
+    expect(getLocalDrivePairingErrorKind("remote-connection", new Error("Network Error"))).toBeNull();
+  });
+
+  it("prioritizes rejected signatures even when no secret is stored", () => {
+    expect(
+      getLocalDrivePairingErrorKind("local-drive:c", {
+        response: { status: 403, data: { code: "companion_auth_signature_mismatch" } },
+      })
+    ).toBe("signature");
+  });
+
+  it("requires pairing when the secret is missing or the companion reports a missing pairing", () => {
+    expect(getLocalDrivePairingErrorKind("local-drive:c", new Error("Network Error"))).toBe("pairing_required");
+
+    localStorage.setItem("companion_secret", "shared-secret");
+    expect(
+      getLocalDrivePairingErrorKind("local-drive:c", {
+        response: { status: 403, data: { code: "companion_pairing_not_found" } },
+      })
+    ).toBe("pairing_required");
+    expect(getLocalDrivePairingErrorKind("local-drive:c", new Error("Network Error"))).toBeNull();
+  });
+});
+
+describe("companion request signatures", () => {
+  it("binds method and URL while normalizing query order", async () => {
+    localStorage.setItem("companion_secret", "shared-secret");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      const first = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/file?z=2&A=1");
+      const reordered = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/file?A=1&z=2");
+      const differentPath = await companionSession.getSigningHeaders("GET", "http://localhost:21549/api/viewer/root/download?A=1&z=2");
+      const differentMethod = await companionSession.getSigningHeaders("DELETE", "http://localhost:21549/api/viewer/root/file?A=1&z=2");
+      expect(first["X-Companion-Secret"]).toBe("2213e964861fc8d4db9ae41c96188ce038ed113c0d064d8d6c96c5314c033d33");
+      expect(first["X-Companion-Secret"]).toBe(reordered["X-Companion-Secret"]);
+      expect(first["X-Companion-Secret"]).not.toBe(differentPath["X-Companion-Secret"]);
+      expect(first["X-Companion-Secret"]).not.toBe(differentMethod["X-Companion-Secret"]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
 
 const { mockAxiosInstance } = vi.hoisted(() => ({
   mockAxiosInstance: {
@@ -24,6 +98,23 @@ vi.mock("axios", () => ({
     create: vi.fn(() => mockAxiosInstance),
   },
 }));
+
+describe("companionService.initiatePairing", () => {
+  it("does not log the pairing identity, code, or nonces", async () => {
+    const pairingId = "private-pairing-identity";
+    const nonceCompanion = "private-companion-nonce";
+    mockAxiosInstance.post.mockResolvedValueOnce({ data: { pairing_id: pairingId, nonce_companion: nonceCompanion } });
+    const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    const result = await companionService.initiatePairing();
+    expect(result.pairingId).toBe(pairingId);
+    expect(result.pairingCode).toHaveLength(6);
+    expect(info).toHaveBeenCalledWith("Pairing initiated", {}, "companion");
+    const logged = JSON.stringify(info.mock.calls);
+    for (const privateValue of [pairingId, result.pairingCode, result.nonceBrowser, nonceCompanion]) {
+      expect(logged).not.toContain(privateValue);
+    }
+  });
+});
 
 describe("companionService.confirmPairing", () => {
   beforeEach(() => {
@@ -114,14 +205,14 @@ describe("companionService.getPairStatus", () => {
   });
 });
 
-describe("companionService.syncLocalization", () => {
+describe("companionService shared settings", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
     localStorage.setItem("companion_secret", "shared-secret");
   });
 
-  it("sends authenticated localization updates to the companion", async () => {
+  it("sends an authenticated opaque grant without browser settings values", async () => {
     mockAxiosInstance.post.mockResolvedValueOnce({
       data: {
         applied: true,
@@ -132,19 +223,12 @@ describe("companionService.syncLocalization", () => {
       },
     });
 
-    const result = await companionService.syncLocalization({
-      language: "en-XA",
-      regional_locale: "en-GB",
-      updated_at: "2026-03-22T12:00:00.000Z",
-    });
-
-    expect(result.applied).toBe(true);
+    await companionService.redeemSettingsGrant("opaque-grant");
     expect(mockAxiosInstance.post).toHaveBeenCalledWith(
-      "/localization",
+      "/settings/redeem",
       {
-        language: "en-XA",
-        regional_locale: "en-GB",
-        updated_at: "2026-03-22T12:00:00.000Z",
+        version: 1,
+        grant: "opaque-grant",
       },
       {
         headers: expect.objectContaining({

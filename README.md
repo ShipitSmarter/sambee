@@ -1,20 +1,42 @@
-# Sambee: Browser-Based File Manager
+# Sambee Turns Your Storage Into a Modern Workspace
 
-Sambee is a browser-based viewer and manager for files on SMB network shares and on your computer's local drives. It supports single-pane and dual-pane views and can replace Total Commander-style tools in your browser and on your phone.
+Sambee gives organizations and individuals a self-hosted, browser-based workspace for files on existing **SMB shares** and **local drives**. Users can browse, view, and edit files from PCs, phones, and tablets, or open and edit them in desktop apps with changes uploaded back to their original location.
+
+[**See the website for details.**](https://sambee.net/)
+
+## Browser-Based File Manager
+
+Sambee can replace traditional tools like Windows File Explorer.
+
+### Works on PCs, Phones, and Tablets
+
+Sambee is optimized for large screens as well as for compact mobile devices.
 
 ### Supports SMB Shares and Local Drives
 
-SMB shares are accessed through Sambee's server component, which translates between HTTP(S), which your browser understands, and SMB, which a file server understands. Local drive access is provided by Sambee Companion, a helper app that can be installed on your computer and acts as a small service your browser can talk to.
+SMB shares are accessed through Sambee's server component, which translates between HTTP(S), which your browser understands, and SMB, which a file server understands.
 
-All of this means that Sambee brings your files and folders into the browser and makes them accessible from your phone in much the same way as from your PC or Mac.
+Local drive access is provided by Sambee Companion, a helper app that can be installed on your computer and acts as a small service your browser can talk to.
 
-## Image and PDF Viewer, Markdown Editor
+## View and Edit Files
 
-Sambee is more than a file manager. It is built for speed and includes a fast image browser with broad file type support, a Markdown editor, and a PDF viewer. All of these work directly in the browser and do not require additional software, except Companion for local-drive access.
+### Image & PDF Viewers
 
-## Desktop App Integration
+Sambee is much more than a file manager. It includes a fast image browser with broad file type support, and a robust PDF viewer that opens even problematic PDFs. All of these work directly in the browser and do not require additional software.
+
+### Markdown & Text Editors
+
+Markdown files are rendered with rich formatting and can be modified efficiently with user-friendly WYSIWYG editing of Markdown tables.
+
+Text files of any kind can be viewed and edited in the built-in text editor, complete with syntax highlighting and search & replace.
+
+### Desktop App Integration
 
 Sambee also bridges the gap between the browser and the apps installed on your computer. It lets you open a file in its traditional desktop app directly from the browser. In other words, you can open Word, Excel, or Photoshop files in their respective native apps. When you are done editing, your changes are uploaded back to the original storage location, such as a file share. All of this happens through a smooth, browser-based workflow.
+
+## Free & Open Source
+
+Sambee is free and open source software designed for self-hosting as a Docker container.
 
 ## Documentation
 

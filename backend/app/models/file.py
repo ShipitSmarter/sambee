@@ -3,7 +3,9 @@ from enum import StrEnum
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
+
+from app.core.directory_index_contract import ScanProgress
 
 
 class FileType(StrEnum):
@@ -129,23 +131,45 @@ class ContentTransferResult(BaseModel):
             raise ValueError(f"{self.status} transfer outcomes require an error")
         if self.status == "skipped" and (self.effects.source != "unchanged" or self.effects.destination != "unchanged" or self.replaced):
             raise ValueError("skipped transfer outcomes must leave both paths unchanged")
-        if self.status == "outcome_unknown" and (
-            self.effects.source != "unknown" or self.effects.destination != "unknown" or self.replaced
+        if (
+            self.status == "outcome_unknown"
+            and "unknown" not in (self.effects.source, self.effects.destination)
+            and "mutated" not in (self.effects.source, self.effects.destination)
         ):
-            raise ValueError("unknown transfer outcomes must report unknown effects")
-        if self.status == "completed_with_source_retained" and (
-            self.effects.source != "unchanged" or self.effects.destination != "mutated"
-        ):
-            raise ValueError("source-retained outcomes require an unchanged source and mutated destination")
-        if self.status in {"skipped", "outcome_unknown", "failed", "cancelled"} and self.replaced:
-            raise ValueError(f"{self.status} transfer outcomes cannot report a replacement")
+            raise ValueError("unknown transfer outcomes require uncertain effects or confirmed aggregate mutations")
+        if self.status == "completed_with_source_retained" and (self.effects.source == "unknown" or self.effects.destination == "unknown"):
+            raise ValueError("source-retained outcomes require known effects")
+        if self.replaced and self.effects.destination != "mutated":
+            raise ValueError("replacement requires confirmed destination mutation")
         return self
+
+
+class DirectoryIssueDetail(BaseModel):
+    """A directory that could not be fully read during verification."""
+
+    path: str
+    code: Literal["access_denied", "unsupported_encoding", "unsafe_traversal", "scan_failed"]
+    scope: Literal["directory", "contents"] = "contents"
 
 
 class DirectorySearchResult(BaseModel):
     """Response model for directory search (quick navigate)."""
 
     results: List[str]
+    match_ranks: dict[str, int] = Field(default_factory=dict)
+    matched_term_counts: dict[str, int] = Field(default_factory=dict)
     total_matches: int
     cache_state: str
     directory_count: int
+    search_contract_version: Literal[1] | None = None
+    accepted_revision: int | None = Field(default=None, ge=0)
+    coverage: str | None = None
+    coverage_issue_count: int = Field(default=0, ge=0)
+    issue_details_available: bool = False
+    issue_details: list[DirectoryIssueDetail] | None = None
+    issue_details_incomplete: bool = False
+    last_verified_at_ms: int | None = Field(default=None, ge=0)
+    status_message: str | None = None
+    monitoring_state: Literal["starting", "healthy", "recovering", "unavailable"] | None = None
+    retry_after_ms: int | None = Field(default=None, ge=0)
+    scan_progress: ScanProgress | None = None

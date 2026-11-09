@@ -7,15 +7,17 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{OriginalUri, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -24,9 +26,9 @@ use http_body_util::BodyExt;
 use log::{info, warn};
 use reqwest::{Client, Response as ReqwestResponse};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinSet;
 use tokio_util::io::{ReaderStream, SyncIoBridge};
@@ -35,17 +37,19 @@ use crate::http_client::{classify_proxy_auth_intercept, log_request_error, Sambe
 use crate::{commands, show_pairing_success, show_pairing_window};
 
 use super::archive::{
-    build_local_archive_manifest_for_remote_target, build_local_archive_manifest_with_cancellation,
-    canonicalize_local_archive_member_roots, create_local_archive_relay_writer,
-    create_local_archive_with_execution_plan_progress_and_state, create_local_extraction_root, ensure_local_extraction_directory,
-    local_archive_target_write_policy_from_wire, prepare_local_archive_target_output, project_local_archive_creation_manifest,
-    resolve_companion_archive_inspection_topology_plan, resolve_companion_archive_topology_plan, stream_validated_local_archive_entry,
-    validate_local_extraction_member_path, ArchiveCreationManifest, ArchiveCreationManifestState, ArchiveDirectoryListingPresentation,
-    ArchiveInspectionCoordinator, ArchiveInspectionPlan, ArchiveInspectionPresentation, ArchiveMemberReadDelivery,
-    ArchiveMemberReadPresentation, CompanionArchiveBinding, CompanionArchiveExecutionDriver, CompanionArchiveOperationKind,
-    CompanionArchiveRelayPurpose, CompanionArchiveTopology, CompanionArchiveTopologyPlan, LocalArchiveCreationExecutionPlan,
-    LocalArchiveCreationResult, LocalArchiveDirectoryOutput, LocalArchiveEntry, LocalArchiveError, LocalArchiveExtractionDestinationResult,
+    build_local_archive_manifest_for_remote_target, build_local_archive_manifest_for_remote_target_with_cancellation,
+    build_local_archive_manifest_with_cancellation, canonicalize_local_archive_member_roots, create_local_archive_relay_writer,
+    create_local_archive_with_execution_plan_progress_and_state, create_local_extraction_root, create_temporary_local_archive,
+    create_temporary_local_zip_selection, ensure_local_extraction_directory, local_archive_target_write_policy_from_wire,
+    prepare_local_archive_target_output, project_local_archive_creation_manifest, resolve_companion_archive_inspection_topology_plan,
+    resolve_companion_archive_topology_plan, stream_validated_local_archive_entry, validate_local_extraction_member_path,
+    ArchiveCreationManifest, ArchiveCreationManifestState, ArchiveDirectoryListingPresentation, ArchiveInspectionCoordinator,
+    ArchiveInspectionPlan, ArchiveInspectionPresentation, ArchiveMemberReadDelivery, ArchiveMemberReadPresentation,
+    CompanionArchiveBinding, CompanionArchiveExecutionDriver, CompanionArchiveOperationKind, CompanionArchiveRelayPurpose,
+    CompanionArchiveTopology, CompanionArchiveTopologyPlan, LocalArchiveCreationExecutionPlan, LocalArchiveCreationResult,
+    LocalArchiveDirectoryOutput, LocalArchiveEntry, LocalArchiveError, LocalArchiveExtractionDestinationResult,
     LocalArchiveInspectionSource, LocalArchiveReadError, LocalArchiveRelayChunk, LocalArchiveTargetOutput, ARCHIVE_COPY_BUFFER_SIZE,
+    TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED,
 };
 use super::archive_sessions::{
     ArchiveSessionCompletion, ArchiveSessionKind, ArchiveSessionManager, ArchiveSessionProgress, ArchiveSessionStatus, ArchiveSessionWork,
@@ -56,11 +60,11 @@ use super::auth;
 use super::drives;
 use super::edit_locks::EDIT_LOCK_LOST_CODE;
 use super::errors::{
-    ApiError, ArchiveV2Error, ArchiveV2Json, ArchiveV2NoQuery, ArchiveV2Query, ARCHIVE_SOURCE_CHANGED_CODE,
-    LOCAL_ARCHIVE_CREATION_PARTIAL_CODE, LOCAL_LINK_TARGET_ACCESS_DENIED_CODE, LOCAL_LINK_TARGET_MISSING_CODE,
+    ApiError, ArchiveV2Error, ArchiveV2Json, ArchiveV2NoQuery, ArchiveV2Query, ARCHIVE_SOURCE_CHANGED_CODE, DIRECTORY_ACCESS_DENIED_CODE,
+    DIRECTORY_NOT_FOUND_CODE, DIRECTORY_UNAVAILABLE_CODE, FILE_ACCESS_DENIED_CODE, FILE_TIMEOUT_CODE, FILE_UNAVAILABLE_CODE,
+    ITEM_NOT_FOUND_CODE, LOCAL_ARCHIVE_CREATION_PARTIAL_CODE, LOCAL_LINK_TARGET_ACCESS_DENIED_CODE, LOCAL_LINK_TARGET_MISSING_CODE,
     LOCAL_LINK_TARGET_UNMAPPED_DRIVE_CODE, LOCAL_LINK_TARGET_UNRESOLVABLE_CODE, LOCAL_LINK_TARGET_UNSUPPORTED_TYPE_CODE,
-    PAIR_CONFIRMATION_PENDING_CODE, RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE, RECENT_FILE_TARGET_MISSING_CODE,
-    RECENT_FILE_TARGET_NOT_FILE_CODE,
+    NOT_A_DIRECTORY_CODE, NOT_A_FILE_CODE, PAIR_CONFIRMATION_PENDING_CODE, RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE,
 };
 use super::links::{resolve_activation_target, LinkResolutionError};
 use super::models::*;
@@ -69,18 +73,70 @@ use super::target_resolution::{
     resolve_target_mutation, resolve_target_mutation_attempt, ContentTransferPlan, TargetMutationAttempt, TargetResolutionDisposition,
     TargetResolutionPolicy, TargetSnapshot,
 };
-use super::AppState;
+use super::{AppState, DownloadIntent};
+
+/// Shared directory-index coordinator for directory reads and namespace mutations.
+#[derive(Clone)]
+pub struct DirectoryMutationState(pub(super) Arc<super::directory_manager::LocalDirectoryManager>);
+
+impl axum::extract::FromRef<Arc<AppState>> for DirectoryMutationState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        Self(Arc::clone(&state.directory_indexes))
+    }
+}
+
+impl DirectoryMutationState {
+    async fn create_parent(&self, drive: &str, root: &FsPath, destination: &FsPath) -> Result<(), std::io::Error> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Destination has no parent directory."))?
+            .to_path_buf();
+        let indexes = Arc::clone(&self.0);
+        let drive = drive.to_owned();
+        let root = root.to_path_buf();
+        let destination = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            indexes.run_observed_parent_creation(&drive, &root, &destination, || std::fs::create_dir_all(parent))
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "Destination directory creation failed: {error}. Check the destination and retry."
+            ))
+        })?
+    }
+}
 
 /// Characters forbidden in file/directory names (matches backend validation).
 const FORBIDDEN_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 /// Prefix used by the frontend for synthetic local-drive connection IDs.
 const LOCAL_DRIVE_PREFIX: &str = "local-drive:";
+const DRIVE_UNAVAILABLE_MESSAGE: &str = "The drive is unavailable. Reconnect the drive and try again.";
 /// Maximum number of potentially blocking local target resolutions per batch.
 const LINK_TARGET_RESOLUTION_CONCURRENCY: usize = 4;
 const ARCHIVE_RELAY_IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const ARCHIVE_RELAY_ACKNOWLEDGEMENT_ATTEMPTS: usize = 2;
 const TRANSFER_RECEIPT_TTL: Duration = Duration::from_secs(5 * 60);
 const TRANSFER_COPY_BUFFER_SIZE: usize = 1024 * 1024;
+const ACTIVE_DOCUMENT_MIME_TYPES: &[&str] = &["text/html", "application/xhtml+xml", "image/svg+xml"];
+
+fn is_active_document_mime_type(mime_type: &str) -> bool {
+    ACTIVE_DOCUMENT_MIME_TYPES.contains(&mime_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase().as_str())
+}
+
+fn active_document_disposition(filename: &str) -> String {
+    let encoded: String = filename
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    format!("attachment; filename*=UTF-8''{encoded}")
+}
 
 struct TransferReceipt {
     expires_at: Instant,
@@ -228,6 +284,7 @@ pub struct WsAuthParams {
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
     Query(params): Query<WsAuthParams>,
 ) -> Result<Response, ApiError> {
     let hmac_val = params.hmac.ok_or_else(|| ApiError::Forbidden("Missing hmac query param".into()))?;
@@ -242,7 +299,7 @@ pub async fn ws_upgrade(
         path: "/api/ws",
     };
 
-    auth::validate_hmac_public(&state, &origin_val, &hmac_val, &ts_val, &log_context)?;
+    auth::validate_hmac_public(&state, &origin_val, &hmac_val, &ts_val, &uri, &log_context)?;
 
     Ok(ws.on_upgrade(move |socket| handle_ws_connection(socket, state)))
 }
@@ -318,36 +375,54 @@ async fn handle_ws_message(
     match (action, conn_id) {
         (Some("subscribe"), Some(connection_id)) => {
             let drive = connection_id.strip_prefix(LOCAL_DRIVE_PREFIX).unwrap_or(connection_id);
-            let normalized_path = match normalize_drive_relative_path(drive, path) {
-                Ok(normalized) => normalized,
-                Err(e) => {
-                    warn!("WS subscribe failed for {drive}:{path}: {e}");
-                    return Ok(());
+            let result = async {
+                let normalized = normalize_drive_relative_path(drive, path)?;
+                let root = drives::resolve_drive_path(drive).ok_or_else(|| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
+                root.metadata()
+                    .map_err(|_| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
+                let full_path = resolve_safe_path_with_error_mapper(&root, drive, path, map_directory_io_error)?;
+                let key = format!("{drive}:{normalized}");
+                if !subscriptions.contains(&key) {
+                    state
+                        .watcher
+                        .subscribe(drive, &normalized, &root)
+                        .await
+                        .map_err(|error| map_directory_io_error(error, &full_path))?;
+                    subscriptions.insert(key);
                 }
-            };
-            let key = format!("{drive}:{normalized_path}");
-
-            if let Some(root) = drives::resolve_drive_path(drive) {
-                match state.watcher.subscribe(drive, &normalized_path, &root).await {
-                    Ok(()) => {
-                        subscriptions.insert(key);
-                        let reply = serde_json::json!({
-                            "type": "subscribed",
-                            "connection_id": connection_id,
-                            "path": normalized_path,
-                        });
-                        socket
-                            .send(Message::Text(reply.to_string().into()))
-                            .await
-                            .map_err(|e| format!("Send failed: {e}"))?;
-                    }
-                    Err(e) => {
-                        warn!("WS subscribe failed for {key}: {e}");
-                    }
-                }
-            } else {
-                warn!("WS subscribe: unknown drive '{drive}'");
+                Ok::<_, ApiError>(normalized)
             }
+            .await;
+            let mut reply = serde_json::json!({
+                "connection_id": connection_id,
+                "path": path,
+                "request_id": data.get("request_id"),
+            });
+            match result {
+                Ok(normalized) => {
+                    reply["type"] = serde_json::json!("subscribed");
+                    reply["path"] = serde_json::json!(normalized);
+                }
+                Err(error) => {
+                    let (code, message) = match error {
+                        ApiError::NotFoundWithCode { code, message }
+                        | ApiError::ForbiddenWithCode { code, message }
+                        | ApiError::ConflictWithCode { code, message }
+                        | ApiError::InternalWithCode { code, message } => (code, message),
+                        _ => (
+                            DIRECTORY_UNAVAILABLE_CODE,
+                            "Folder monitoring is unavailable. Check the drive and retry.".to_string(),
+                        ),
+                    };
+                    reply["type"] = serde_json::json!("error");
+                    reply["code"] = serde_json::json!(code);
+                    reply["message"] = serde_json::json!(message);
+                }
+            }
+            socket
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .map_err(|error| format!("Send failed: {error}"))?;
         }
         (Some("unsubscribe"), Some(connection_id)) => {
             let drive = connection_id.strip_prefix(LOCAL_DRIVE_PREFIX).unwrap_or(connection_id);
@@ -388,6 +463,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(HealthResponse {
         status: "healthy".to_string(),
         paired: state.pairing.has_any_pairing(),
+        auth_protocol_version: auth::AUTH_PROTOCOL_VERSION,
     })
 }
 
@@ -446,22 +522,13 @@ pub async fn pair_confirm(
 }
 
 /// `POST /api/localization` — synchronize browser localization to the companion.
-pub async fn sync_localization(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<LocalizationSyncRequest>,
-) -> Result<Json<LocalizationSyncResponse>, ApiError> {
-    let origin = extract_origin(&headers)?;
-    let (current, applied) = state
-        .localization
-        .apply_update(&state.app, &origin, body)
-        .map_err(ApiError::BadRequest)?;
-
-    if applied {
-        let _ = state.app.emit("localization-updated", &current);
-    }
-
-    Ok(Json(LocalizationSyncResponse { applied, state: current }))
+pub async fn sync_localization(Json(_body): Json<LocalizationSyncRequest>) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::UPGRADE_REQUIRED,
+        Json(
+            serde_json::json!({"code": "settings_update_required", "detail": "Separate localization delivery is no longer supported. Update the Sambee browser application."}),
+        ),
+    )
 }
 
 #[derive(Deserialize)]
@@ -549,17 +616,23 @@ pub struct ArchiveV2ListQuery {
 
 /// `GET /api/browse/{drive}/list` — list directory contents.
 pub async fn browse_list(Path(drive): Path<String>, Query(query): Query<BrowseQuery>) -> Result<Json<DirectoryListing>, ApiError> {
-    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
 
     let relative = query.path.as_deref().unwrap_or("");
     let normalized_relative = normalize_drive_relative_path(&drive, relative)?;
-    let full_path = resolve_safe_path(&base_path, &drive, relative)?;
+    let full_path = resolve_safe_path_with_error_mapper(&base_path, &drive, relative, map_directory_io_error)?;
 
     let mut items = Vec::new();
 
-    let mut entries = tokio::fs::read_dir(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
+    let mut entries = tokio::fs::read_dir(&full_path)
+        .await
+        .map_err(|error| map_directory_io_error(error, &full_path))?;
 
-    while let Some(entry) = entries.next_entry().await.map_err(ApiError::Io)? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| map_directory_io_error(error, &full_path))?
+    {
         match build_file_info(&entry, &normalized_relative).await {
             Ok(info) => items.push(info),
             Err(e) => {
@@ -693,20 +766,16 @@ pub async fn browse_list_link_targets(
 
 /// `GET /api/browse/{drive}/info` — get metadata for a single file/directory.
 pub async fn browse_info(Path(drive): Path<String>, Query(query): Query<BrowseQuery>) -> Result<Json<FileInfo>, ApiError> {
-    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
 
     let relative = query.path.as_deref().unwrap_or("");
     let normalized_relative = normalize_drive_relative_path(&drive, relative)?;
     let source_path = resolve_drive_relative_source_path(&base_path, &drive, relative)?;
-    let full_path = resolve_safe_path(&base_path, &drive, relative)?;
+    let full_path = resolve_safe_path_with_error_mapper(&base_path, &drive, relative, map_metadata_io_error)?;
 
-    let metadata = tokio::fs::metadata(&full_path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ApiError::not_found_code(format!("Path not found: {}", full_path.display()), RECENT_FILE_TARGET_MISSING_CODE)
-        } else {
-            map_io_error(error, &full_path)
-        }
-    })?;
+    let metadata = tokio::fs::metadata(&full_path)
+        .await
+        .map_err(|error| map_metadata_io_error(error, &full_path))?;
 
     let name = source_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
@@ -723,7 +792,7 @@ pub async fn browse_info(Path(drive): Path<String>, Query(query): Query<BrowseQu
     let is_hidden = name.starts_with('.');
     let link_kind = source_link_kind(&source_path)
         .await
-        .map_err(|error| map_io_error(error, &source_path))?;
+        .map_err(|error| map_metadata_io_error(error, &source_path))?;
 
     Ok(Json(FileInfo {
         name,
@@ -780,6 +849,122 @@ pub async fn browse_resolve_activation(
 
 // ─── Viewer ──────────────────────────────────────────────────────────────────
 
+const DOWNLOAD_INTENT_TTL: Duration = Duration::from_secs(90);
+const MAX_DOWNLOAD_INTENTS: usize = 1024;
+
+#[derive(Deserialize)]
+pub struct DownloadIntentRequest {
+    drive: String,
+    path: String,
+    member_path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DownloadIntentResponse {
+    url: String,
+}
+
+pub async fn create_download_intent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<DownloadIntentRequest>,
+) -> Result<Json<DownloadIntentResponse>, ApiError> {
+    let origin = extract_origin(&headers)?;
+    if request.path.is_empty() || request.member_path.as_deref() == Some("") {
+        return Err(ApiError::BadRequest(
+            "A file path and nonempty member path are required".to_string(),
+        ));
+    }
+    let base_path =
+        drives::resolve_drive_path(&request.drive).ok_or_else(|| ApiError::NotFound("Download drive is unavailable".to_string()))?;
+    let file_path = resolve_safe_path(&base_path, &request.drive, &request.path)?;
+    if !tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|error| map_io_error(error, &file_path))?
+        .is_file()
+    {
+        return Err(ApiError::BadRequest("Download source must be a regular file".to_string()));
+    }
+    if let Some(member_path) = &request.member_path {
+        let presentation = ArchiveMemberReadPresentation::new(member_path.clone(), true);
+        tokio::task::spawn_blocking(move || {
+            resolve_local_archive_inspection_coordinator(file_path, ArchiveInspectionPresentation::MemberRead(presentation))
+                .and_then(|coordinator| coordinator.validated_member_read().map_err(map_local_archive_read_error))
+        })
+        .await
+        .map_err(|error| ApiError::Internal(format!("Archive download validation failed: {error}")))??;
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut intents = state
+        .pairing
+        .download_intents
+        .lock()
+        .map_err(|_| ApiError::Internal("Download intents unavailable".to_string()))?;
+    intents.retain(|_, intent| intent.expires_at > Instant::now());
+    if intents.len() >= MAX_DOWNLOAD_INTENTS {
+        return Err(ApiError::TooManyRequests("Too many active download intents".to_string()));
+    }
+    intents.insert(
+        token.clone(),
+        DownloadIntent {
+            origin,
+            drive: request.drive,
+            path: request.path,
+            member_path: request.member_path,
+            expires_at: Instant::now() + DOWNLOAD_INTENT_TTL,
+        },
+    );
+    Ok(Json(DownloadIntentResponse {
+        url: format!("/api/download-intents/{token}"),
+    }))
+}
+
+fn consume_download_intent(intents: &Mutex<HashMap<String, DownloadIntent>>, token: &str) -> Result<DownloadIntent, ApiError> {
+    intents
+        .lock()
+        .map_err(|_| ApiError::Internal("Download intents unavailable".to_string()))?
+        .remove(token)
+        .filter(|intent| intent.expires_at > Instant::now())
+        .ok_or_else(|| ApiError::NotFound("Download expired or unavailable".to_string()))
+}
+
+pub async fn redeem_download_intent(State(state): State<Arc<AppState>>, Path(token): Path<String>) -> Result<Response<Body>, ApiError> {
+    let intent = consume_download_intent(&state.pairing.download_intents, &token)?;
+    if !state.pairing.is_origin_paired(&intent.origin) {
+        return Err(ApiError::NotFound("Download expired or unavailable".to_string()));
+    }
+    let mut response = if let Some(member_path) = intent.member_path {
+        viewer_archive_member(
+            Path(intent.drive),
+            Query(ArchiveMemberQuery {
+                archive_path: intent.path,
+                member_path,
+                download: true,
+            }),
+        )
+        .await?
+    } else {
+        viewer_download(
+            Path(intent.drive),
+            Query(ViewerQuery {
+                path: Some(intent.path),
+                viewport_width: None,
+                viewport_height: None,
+                no_resizing: None,
+            }),
+        )
+        .await?
+    };
+    response
+        .headers_mut()
+        .insert("Cache-Control", HeaderValue::from_static("private, no-store"));
+    response
+        .headers_mut()
+        .insert("Referrer-Policy", HeaderValue::from_static("no-referrer"));
+    Ok(response)
+}
+
 #[derive(Deserialize)]
 pub struct ViewerQuery {
     pub path: Option<String>,
@@ -820,21 +1005,25 @@ const FALLBACK_MIME: &str = "application/octet-stream";
 
 /// `GET /api/viewer/{drive}/file` — stream a file for inline viewing.
 ///
-/// Sets `Content-Type` from extension (via `mime_guess`) and
-/// `Content-Disposition: inline` so browsers render the content.
+/// Sets `Content-Type` from extension (via `mime_guess`) and downloads active documents.
 pub async fn viewer_file(Path(drive): Path<String>, Query(query): Query<ViewerQuery>) -> Result<Response<Body>, ApiError> {
     let (full_path, mime_type) = resolve_viewer_path(&drive, &query)?;
 
-    let file = File::open(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
+    let file = File::open(&full_path).await.map_err(|error| map_file_io_error(error, &full_path))?;
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
     let filename = full_path.file_name().unwrap_or_default().to_string_lossy();
-    let disposition = format!("inline; filename=\"{filename}\"");
+    let disposition = if is_active_document_mime_type(&mime_type) {
+        active_document_disposition(&filename)
+    } else {
+        format!("inline; filename=\"{filename}\"")
+    };
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", &mime_type)
+        .header("X-Content-Type-Options", "nosniff")
         .header(
             "Content-Disposition",
             HeaderValue::from_str(&disposition).unwrap_or_else(|_| HeaderValue::from_static("inline")),
@@ -849,9 +1038,11 @@ pub async fn viewer_file(Path(drive): Path<String>, Query(query): Query<ViewerQu
 pub async fn viewer_download(Path(drive): Path<String>, Query(query): Query<ViewerQuery>) -> Result<Response<Body>, ApiError> {
     let (full_path, mime_type) = resolve_viewer_path(&drive, &query)?;
 
-    let metadata = tokio::fs::metadata(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
+    let metadata = tokio::fs::metadata(&full_path)
+        .await
+        .map_err(|error| map_file_io_error(error, &full_path))?;
 
-    let file = File::open(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
+    let file = File::open(&full_path).await.map_err(|error| map_file_io_error(error, &full_path))?;
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
@@ -872,7 +1063,195 @@ pub async fn viewer_download(Path(drive): Path<String>, Query(query): Query<View
         .map_err(|e| ApiError::Internal(format!("Failed to build response: {e}")))
 }
 
+#[derive(Deserialize)]
+struct CompanionDownloadSessionToken {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct CompanionDownloadSessionLimit {
+    size_limit_bytes: u64,
+}
+
+#[derive(Deserialize)]
+pub struct LocalZipSelectionDownloadRequest {
+    archive_path: String,
+    paths: Vec<String>,
+}
+
+async fn temporary_download_limit(state: &AppState, headers: &HeaderMap, drive: &str) -> Result<u64, ApiError> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("Bearer ") && value.len() > "Bearer ".len())
+        .ok_or_else(|| ApiError::Forbidden("Browser authentication is required for downloads".to_string()))?;
+    let server_url = normalize_archive_server_url(&extract_origin(headers)?)?;
+    let clients = state
+        .app
+        .try_state::<SambeeHttpClientStore>()
+        .map(|clients| clients.inner().clone())
+        .ok_or_else(|| ApiError::Internal("Companion backend HTTP client is unavailable".to_string()))?;
+    let client = clients.client_for_server_no_redirects(&server_url).map_err(ApiError::Internal)?;
+    let session_url = format!("{server_url}/api/browse/companion-download/session");
+    let session: CompanionDownloadSessionToken = decode_archive_relay_json(
+        client
+            .post(&session_url)
+            .header("authorization", authorization)
+            .json(&serde_json::json!({ "drive": drive }))
+            .send()
+            .await
+            .map_err(|error| ApiError::Internal(log_request_error("Download session issue", "POST", &session_url, &error)))?,
+        "download session",
+    )
+    .await?;
+    let consume_url = format!("{session_url}/{}/consume", session.token);
+    let limit: CompanionDownloadSessionLimit = decode_archive_relay_json(
+        client
+            .post(&consume_url)
+            .header("authorization", authorization)
+            .json(&serde_json::json!({ "drive": drive }))
+            .send()
+            .await
+            .map_err(|error| ApiError::Internal(log_request_error("Download session consume", "POST", &consume_url, &error)))?,
+        "download size limit",
+    )
+    .await?;
+    Ok(limit.size_limit_bytes)
+}
+
+struct TemporaryArchiveReader {
+    file: File,
+    _directory: tempfile::TempDir,
+}
+
+struct DownloadPreparationGuard(Arc<AtomicBool>);
+
+impl Drop for DownloadPreparationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+impl AsyncRead for TemporaryArchiveReader {
+    fn poll_read(mut self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(context, buffer)
+    }
+}
+
+pub async fn browse_download_selection(
+    State(state): State<Arc<AppState>>,
+    Path(drive): Path<String>,
+    headers: HeaderMap,
+    Json(paths): Json<Vec<String>>,
+) -> Result<Response<Body>, ApiError> {
+    if paths.is_empty() {
+        return Err(ApiError::BadRequest("Download selection cannot be empty".to_string()));
+    }
+    let drive_root = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let sources = paths
+        .iter()
+        .map(|path| resolve_safe_path(&drive_root, &drive, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let canonical_root = std::fs::canonicalize(&drive_root).map_err(ApiError::Io)?;
+    let parent = sources[0].parent();
+    if parent.is_none_or(|parent| !parent.starts_with(&canonical_root))
+        || sources.iter().any(|source| source.parent() != parent)
+        || sources.iter().collect::<HashSet<_>>().len() != sources.len()
+    {
+        return Err(ApiError::BadRequest(
+            "Download selections must be distinct items in one directory".to_string(),
+        ));
+    }
+    let size_limit = temporary_download_limit(&state, &headers, &drive).await?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _guard = DownloadPreparationGuard(cancelled.clone());
+    let (directory, archive_path) = tokio::task::spawn_blocking(move || {
+        let entries = build_local_archive_manifest_for_remote_target_with_cancellation(&sources, || cancelled.load(Ordering::Relaxed))?;
+        create_temporary_local_archive(&entries, size_limit, || cancelled.load(Ordering::Relaxed))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("Download archive task failed: {error}")))?
+    .map_err(map_temporary_archive_error)?;
+    temporary_archive_response(directory, archive_path).await
+}
+
+pub async fn browse_download_zip_selection(
+    State(state): State<Arc<AppState>>,
+    Path(drive): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<LocalZipSelectionDownloadRequest>,
+) -> Result<Response<Body>, ApiError> {
+    if body.paths.is_empty() {
+        return Err(ApiError::BadRequest("Download selection cannot be empty".to_string()));
+    }
+    let drive_root = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let archive_path = resolve_safe_path(&drive_root, &drive, &body.archive_path)?;
+    let size_limit = temporary_download_limit(&state, &headers, &drive).await?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _guard = DownloadPreparationGuard(cancelled.clone());
+    let (directory, output_path) = tokio::task::spawn_blocking(move || {
+        create_temporary_local_zip_selection(&archive_path, &body.paths, size_limit, || cancelled.load(Ordering::Relaxed))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("ZIP selection download task failed: {error}")))?
+    .map_err(map_temporary_archive_error)?;
+    temporary_archive_response(directory, output_path).await
+}
+
+async fn temporary_archive_response(directory: tempfile::TempDir, archive_path: PathBuf) -> Result<Response<Body>, ApiError> {
+    let file = File::open(&archive_path).await.map_err(ApiError::Io)?;
+    let size = file.metadata().await.map_err(ApiError::Io)?.len();
+    let body = Body::from_stream(ReaderStream::new(TemporaryArchiveReader {
+        file,
+        _directory: directory,
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/zip")
+        .header("Content-Disposition", "attachment; filename=\"Sambee-download.zip\"")
+        .header("Content-Length", size)
+        .body(body)
+        .map_err(|error| ApiError::Internal(format!("Failed to build download response: {error}")))
+}
+
+fn map_temporary_archive_error(error: LocalArchiveError) -> ApiError {
+    fn exceeds_limit(error: &LocalArchiveError) -> bool {
+        match error {
+            LocalArchiveError::Io(io_error) | LocalArchiveError::Zip(zip::result::ZipError::Io(io_error)) => {
+                io_error.to_string() == TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED
+            }
+            LocalArchiveError::PartialArchiveOutput(inner) => exceeds_limit(inner),
+            _ => false,
+        }
+    }
+
+    if exceeds_limit(&error) {
+        ApiError::PayloadTooLarge(TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED.to_string())
+    } else {
+        map_local_archive_error(error)
+    }
+}
+
 /// Shared implementation for a parser-validated archive member stream.
+struct VerifiedArchiveStream {
+    reader: tokio::io::DuplexStream,
+    completion: oneshot::Receiver<Result<(), std::io::Error>>,
+}
+
+impl AsyncRead for VerifiedArchiveStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<Result<(), std::io::Error>> {
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.reader).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().len() == before => match Pin::new(&mut self.completion).poll(cx) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::other("Archive stream ended unexpectedly"))),
+                Poll::Pending => Poll::Pending,
+            },
+            other => other,
+        }
+    }
+}
+
 pub async fn viewer_archive_member(Path(drive): Path<String>, Query(query): Query<ArchiveMemberQuery>) -> Result<Response<Body>, ApiError> {
     if query.archive_path.trim().is_empty() || query.member_path.trim().is_empty() {
         return Err(ApiError::BadRequest("Archive and member paths are required".to_string()));
@@ -896,29 +1275,41 @@ pub async fn viewer_archive_member(Path(drive): Path<String>, Query(query): Quer
     .await
     .map_err(|error| ApiError::Internal(format!("Local archive validation task failed: {error}")))??;
     if member.delivery == ArchiveMemberReadDelivery::PreviewUnavailable {
-        return Err(ApiError::PayloadTooLarge(
-            "Archive member exceeds the inline preview size limit".to_string(),
-        ));
+        return Err(ApiError::BadRequest("Archive member is not eligible for preview".to_string()));
     }
     let validated_member =
         validated_member.ok_or_else(|| ApiError::Internal("Archive inspection did not produce a streaming descriptor".to_string()))?;
 
+    let expected_size = validated_member.uncompressed_size;
     let (writer, reader) = tokio::io::duplex(ARCHIVE_COPY_BUFFER_SIZE);
+    let (completion_sender, completion) = oneshot::channel();
     tokio::task::spawn_blocking(move || {
         let mut output = SyncIoBridge::new(writer);
-        if let Err(error) = stream_validated_local_archive_entry(validated_member, &mut output) {
+        let result = stream_validated_local_archive_entry(validated_member, &mut output);
+        drop(output);
+        if let Err(error) = &result {
             warn!("Local archive member stream failed: {error}");
         }
+        let _ = completion_sender.send(result.map_err(|error| std::io::Error::other(error.to_string())));
     });
 
     Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", member.content_type)
+        .header("Content-Type", &member.content_type)
+        .header("Content-Length", expected_size)
+        .header("X-Content-Type-Options", "nosniff")
         .header(
             "Content-Disposition",
-            HeaderValue::from_str(&member.content_disposition).unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            if is_active_document_mime_type(&member.content_type) {
+                HeaderValue::from_str(&active_document_disposition(
+                    member.member_path.rsplit('/').next().unwrap_or("download"),
+                ))
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
+            } else {
+                HeaderValue::from_str(&member.content_disposition).unwrap_or_else(|_| HeaderValue::from_static("attachment"))
+            },
         )
-        .body(Body::from_stream(ReaderStream::new(reader)))
+        .body(Body::from_stream(ReaderStream::new(VerifiedArchiveStream { reader, completion })))
         .map_err(|error| ApiError::Internal(format!("Failed to build archive member response: {error}")))
 }
 
@@ -942,15 +1333,18 @@ pub async fn viewer_v2_archive_member(
 
 /// Resolve drive + query path for viewer endpoints, returning the full path and MIME type.
 fn resolve_viewer_path(drive: &str, query: &ViewerQuery) -> Result<(PathBuf, String), ApiError> {
-    let base_path = drives::resolve_drive_path(drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let base_path = drives::resolve_drive_path(drive).ok_or_else(|| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
 
     let relative = query.path.as_deref().unwrap_or("");
-    let full_path = resolve_safe_path(&base_path, drive, relative)?;
+    let full_path = resolve_safe_path_with_error_mapper(&base_path, drive, relative, map_file_io_error)?;
 
     // Viewer endpoints must target files, not directories
-    let metadata = std::fs::metadata(&full_path).map_err(|e| map_io_error(e, &full_path))?;
-    if metadata.is_dir() {
-        return Err(ApiError::BadRequest("Cannot view a directory".to_string()));
+    let metadata = std::fs::metadata(&full_path).map_err(|error| map_file_io_error(error, &full_path))?;
+    if !metadata.is_file() {
+        return Err(ApiError::conflict_code(
+            "This target is not a regular file. Select another file.",
+            NOT_A_FILE_CODE,
+        ));
     }
 
     let mime_type = mime_guess::from_path(&full_path)
@@ -966,7 +1360,11 @@ fn resolve_viewer_path(drive: &str, query: &ViewerQuery) -> Result<(PathBuf, Str
 /// `DELETE /api/browse/{drive}/item` — delete a file or directory.
 ///
 /// Directories are removed recursively. Refuses to delete the drive root.
-pub async fn browse_delete(Path(drive): Path<String>, Query(query): Query<BrowseQuery>) -> Result<StatusCode, ApiError> {
+pub async fn browse_delete(
+    State(DirectoryMutationState(indexes)): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<StatusCode, ApiError> {
     let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
 
     let relative = normalize_drive_relative_path(&drive, query.path.as_deref().unwrap_or(""))?;
@@ -976,28 +1374,39 @@ pub async fn browse_delete(Path(drive): Path<String>, Query(query): Query<Browse
 
     let full_path = resolve_safe_path(&base_path, &drive, &relative)?;
 
-    let metadata = tokio::fs::metadata(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
+    super::directory_policy::ensure_mutation_allowed(&full_path)?;
+    let target = full_path.clone();
+    tokio::task::spawn_blocking(move || {
+        indexes.run_observed_subtree_operation(&drive, &base_path, &target, || {
+            let metadata = std::fs::symlink_metadata(&target)?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            }
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("Deletion task failed: {error}. Check the target and retry.")))?
+    .map_err(|error| map_io_error(error, &full_path))?;
 
-    if metadata.is_dir() {
-        tokio::fs::remove_dir_all(&full_path)
-            .await
-            .map_err(|e| map_io_error(e, &full_path))?;
-    } else {
-        tokio::fs::remove_file(&full_path).await.map_err(|e| map_io_error(e, &full_path))?;
-    }
-
-    log::info!("Deleted: {}", full_path.display());
+    log::info!("Local item deletion completed");
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/browse/{drive}/empty-directory` — remove one empty directory.
-pub async fn browse_delete_empty_directory(Path(drive): Path<String>, Query(query): Query<BrowseQuery>) -> Result<StatusCode, ApiError> {
+pub async fn browse_delete_empty_directory(
+    State(DirectoryMutationState(indexes)): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<StatusCode, ApiError> {
     let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
     let relative = normalize_drive_relative_path(&drive, query.path.as_deref().unwrap_or(""))?;
     if relative.is_empty() {
         return Err(ApiError::BadRequest("Cannot delete the drive root".to_string()));
     }
     let directory = resolve_safe_path(&base_path, &drive, &relative)?;
+    super::directory_policy::ensure_mutation_allowed(&directory)?;
     let metadata = tokio::fs::symlink_metadata(&directory)
         .await
         .map_err(|error| map_io_error(error, &directory))?;
@@ -1007,7 +1416,16 @@ pub async fn browse_delete_empty_directory(Path(drive): Path<String>, Query(quer
             directory.display()
         )));
     }
-    match tokio::fs::remove_dir(&directory).await {
+    let target = directory.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || indexes.run_observed_operation(&drive, &base_path, &target, || std::fs::remove_dir(&target)))
+            .await
+            .map_err(|error| {
+                ApiError::Internal(format!(
+                    "Empty-directory deletion task failed: {error}. Check the target and retry."
+                ))
+            })?;
+    match outcome {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Err(ApiError::conflict_message(format!(
             "Directory is not empty: {}",
@@ -1026,7 +1444,11 @@ pub struct RenameRequest {
 /// `POST /api/browse/{drive}/rename` — rename a file or directory.
 ///
 /// Returns the updated `FileInfo` for the renamed item.
-pub async fn browse_rename(Path(drive): Path<String>, Json(body): Json<RenameRequest>) -> Result<Json<FileInfo>, ApiError> {
+pub async fn browse_rename(
+    State(DirectoryMutationState(indexes)): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Json(body): Json<RenameRequest>,
+) -> Result<Json<FileInfo>, ApiError> {
     let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
 
     validate_name(&body.new_name)?;
@@ -1043,17 +1465,69 @@ pub async fn browse_rename(Path(drive): Path<String>, Json(body): Json<RenameReq
         .parent()
         .ok_or_else(|| ApiError::BadRequest("Cannot determine parent directory".to_string()))?;
     let new_full_path = parent.join(&body.new_name);
+    super::directory_policy::ensure_mutation_allowed(&full_path)?;
+    super::directory_policy::ensure_mutation_allowed(&new_full_path)?;
 
     if new_full_path.exists() {
-        return Err(ApiError::conflict_message(format!(
-            "An item named '{}' already exists",
-            body.new_name
-        )));
+        let candidate_is_source = new_full_path != full_path
+            && !tokio::fs::symlink_metadata(&new_full_path)
+                .await
+                .map_err(|error| map_io_error(error, &new_full_path))?
+                .file_type()
+                .is_symlink();
+        #[cfg(unix)]
+        let same_source = if candidate_is_source
+            && full_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_lowercase() == body.new_name.to_lowercase())
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let source = tokio::fs::metadata(&full_path)
+                .await
+                .map_err(|error| map_io_error(error, &full_path))?;
+            let target = tokio::fs::metadata(&new_full_path)
+                .await
+                .map_err(|error| map_io_error(error, &new_full_path))?;
+            let mut entries = tokio::fs::read_dir(parent).await.map_err(|error| map_io_error(error, parent))?;
+            let mut exact_target_exists = false;
+            while let Some(entry) = entries.next_entry().await.map_err(|error| map_io_error(error, parent))? {
+                if entry.file_name().to_str() == Some(body.new_name.as_str()) {
+                    exact_target_exists = true;
+                    break;
+                }
+            }
+            source.dev() == target.dev() && source.ino() == target.ino() && !exact_target_exists
+        } else {
+            false
+        };
+        #[cfg(not(unix))]
+        let same_source = candidate_is_source
+            && tokio::fs::canonicalize(&new_full_path)
+                .await
+                .map_err(|error| map_io_error(error, &new_full_path))?
+                == full_path;
+        if !same_source {
+            return Err(ApiError::conflict_message(format!(
+                "An item named '{}' already exists",
+                body.new_name
+            )));
+        }
     }
 
-    tokio::fs::rename(&full_path, &new_full_path)
-        .await
-        .map_err(|e| map_io_error(e, &full_path))?;
+    let target = full_path.clone();
+    let destination = new_full_path.clone();
+    tokio::task::spawn_blocking(move || {
+        indexes.run_observed_operation(&drive, &base_path, &target, || std::fs::rename(&target, &destination))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::Internal(format!(
+            "Rename task failed: {error}. Check the source and destination, then retry."
+        ))
+    })?
+    .map_err(|error| map_io_error(error, &full_path))?;
 
     // Build the new relative path for the response
     let parent_relative = relative_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
@@ -1080,7 +1554,11 @@ pub struct CreateItemRequest {
 /// `POST /api/browse/{drive}/create` — create a new file or directory.
 ///
 /// Returns the `FileInfo` for the newly created item.
-pub async fn browse_create(Path(drive): Path<String>, Json(body): Json<CreateItemRequest>) -> Result<Json<FileInfo>, ApiError> {
+pub async fn browse_create(
+    State(DirectoryMutationState(indexes)): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Json(body): Json<CreateItemRequest>,
+) -> Result<Json<FileInfo>, ApiError> {
     let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
 
     validate_name(&body.name)?;
@@ -1093,13 +1571,20 @@ pub async fn browse_create(Path(drive): Path<String>, Json(body): Json<CreateIte
     }
 
     let new_path = parent_path.join(&body.name);
+    super::directory_policy::ensure_mutation_allowed(&new_path)?;
     if new_path.exists() {
         return Err(ApiError::conflict_message(format!("An item named '{}' already exists", body.name)));
     }
 
     match body.item_type {
         FileType::Directory => {
-            tokio::fs::create_dir(&new_path).await.map_err(|e| map_io_error(e, &new_path))?;
+            let target = new_path.clone();
+            tokio::task::spawn_blocking(move || {
+                indexes.run_observed_operation(&drive, &base_path, &target, || std::fs::create_dir(&target))
+            })
+            .await
+            .map_err(|error| ApiError::Internal(format!("Directory creation task failed: {error}. Check the target and retry.")))?
+            .map_err(|error| map_io_error(error, &new_path))?;
         }
         FileType::File => {
             File::create(&new_path).await.map_err(|e| map_io_error(e, &new_path))?;
@@ -1530,7 +2015,11 @@ pub async fn browse_cancel_transfer_attempt(Path((_drive, attempt_id)): Path<(St
 ///
 /// Supports cross-drive copy when `dest_connection_id` specifies a
 /// different local drive (e.g. copying from drive C to drive D).
-pub async fn browse_copy(Path(drive): Path<String>, Json(body): Json<CopyMoveRequest>) -> Result<Json<ContentTransferResult>, ApiError> {
+pub async fn browse_copy(
+    State(indexes): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Json(body): Json<CopyMoveRequest>,
+) -> Result<Json<ContentTransferResult>, ApiError> {
     match reserve_transfer_receipt("copy", &drive, &body)? {
         TransferReceiptLookup::Owner => {}
         TransferReceiptLookup::Cached(outcome) => return replay_transfer_outcome(outcome),
@@ -1546,7 +2035,7 @@ pub async fn browse_copy(Path(drive): Path<String>, Json(body): Json<CopyMoveReq
     if cancellation.is_cancelled() {
         return Ok(finalize_transfer_result("copy", &drive, &body, cancelled_transfer_result()));
     }
-    match execute_browse_copy(&drive, &body, cancellation.cancellation.as_deref()).await {
+    match execute_browse_copy(&indexes, &drive, &body, cancellation.cancellation.as_deref()).await {
         Ok(result) => Ok(finalize_transfer_result("copy", &drive, &body, result)),
         Err(error) => {
             complete_transfer_receipt("copy", &drive, &body, TransferReceiptOutcome::Error(transfer_receipt_error(&error)));
@@ -1556,6 +2045,7 @@ pub async fn browse_copy(Path(drive): Path<String>, Json(body): Json<CopyMoveReq
 }
 
 async fn execute_browse_copy(
+    indexes: &DirectoryMutationState,
     drive: &str,
     body: &CopyMoveRequest,
     cancellation: Option<&AtomicBool>,
@@ -1579,17 +2069,21 @@ async fn execute_browse_copy(
         ));
     }
 
-    let resolution =
-        match resolve_local_regular_file_transfer(&source, &dest, &source_meta, copy_move_target_policy(body)?, cancellation).await {
-            Ok(resolution) => resolution,
-            Err(LocalTransferWriteError::Io(error)) => return Err(map_io_error(error, &source)),
-            Err(LocalTransferWriteError::SourceChanged) => return Ok(source_changed_transfer_result(false)),
-            Err(LocalTransferWriteError::Cancelled) => return Ok(cancelled_transfer_result()),
-            Err(LocalTransferWriteError::TargetChanged) => {
-                return Err(build_conflict_error(&source, &dest, &body.source_path, &body.dest_path).await);
-            }
-            Err(LocalTransferWriteError::OutcomeUnknown) => return Ok(outcome_unknown_transfer_result()),
-        };
+    let policy = copy_move_target_policy(body)?;
+    indexes
+        .create_parent(&dest_drive, &dest_base, &dest)
+        .await
+        .map_err(|error| map_io_error(error, &dest))?;
+    let resolution = match resolve_local_regular_file_transfer(&source, &dest, &source_meta, policy, cancellation).await {
+        Ok(resolution) => resolution,
+        Err(LocalTransferWriteError::Io(error)) => return Err(map_io_error(error, &source)),
+        Err(LocalTransferWriteError::SourceChanged) => return Ok(source_changed_transfer_result(false)),
+        Err(LocalTransferWriteError::Cancelled) => return Ok(cancelled_transfer_result()),
+        Err(LocalTransferWriteError::TargetChanged) => {
+            return Err(build_conflict_error(&source, &dest, &body.source_path, &body.dest_path).await);
+        }
+        Err(LocalTransferWriteError::OutcomeUnknown) => return Ok(outcome_unknown_transfer_result()),
+    };
     if matches!(
         resolution.disposition,
         TargetResolutionDisposition::CreateNew | TargetResolutionDisposition::ReplaceExisting
@@ -1618,7 +2112,11 @@ async fn execute_browse_copy(
 }
 
 /// `POST /api/browse/{drive}/move` — move an item within its local drive.
-pub async fn browse_move(Path(drive): Path<String>, Json(body): Json<CopyMoveRequest>) -> Result<Json<ContentTransferResult>, ApiError> {
+pub async fn browse_move(
+    State(indexes): State<DirectoryMutationState>,
+    Path(drive): Path<String>,
+    Json(body): Json<CopyMoveRequest>,
+) -> Result<Json<ContentTransferResult>, ApiError> {
     match reserve_transfer_receipt("move", &drive, &body)? {
         TransferReceiptLookup::Owner => {}
         TransferReceiptLookup::Cached(outcome) => return replay_transfer_outcome(outcome),
@@ -1634,7 +2132,7 @@ pub async fn browse_move(Path(drive): Path<String>, Json(body): Json<CopyMoveReq
     if cancellation.is_cancelled() {
         return Ok(finalize_transfer_result("move", &drive, &body, cancelled_transfer_result()));
     }
-    match execute_browse_move(&drive, &body, cancellation.cancellation.as_deref()).await {
+    match execute_browse_move(&indexes, &drive, &body, cancellation.cancellation.as_deref()).await {
         Ok(result) => Ok(finalize_transfer_result("move", &drive, &body, result)),
         Err(error) => {
             complete_transfer_receipt("move", &drive, &body, TransferReceiptOutcome::Error(transfer_receipt_error(&error)));
@@ -1644,6 +2142,7 @@ pub async fn browse_move(Path(drive): Path<String>, Json(body): Json<CopyMoveReq
 }
 
 async fn execute_browse_move(
+    indexes: &DirectoryMutationState,
     drive: &str,
     body: &CopyMoveRequest,
     cancellation: Option<&AtomicBool>,
@@ -1655,6 +2154,7 @@ async fn execute_browse_move(
     let (dest_drive, dest_base) = resolve_dest_drive(drive, &body.dest_connection_id)?;
     validate_copy_move_paths(&body.source_path, &body.dest_path)?;
     let source = resolve_safe_path(&base_path, drive, &body.source_path)?;
+    super::directory_policy::ensure_mutation_allowed(&source)?;
     let source_meta = tokio::fs::metadata(&source).await.map_err(|error| map_io_error(error, &source))?;
     if !source_meta.is_file() {
         return Err(ApiError::BadRequest(
@@ -1662,7 +2162,7 @@ async fn execute_browse_move(
         ));
     }
     if base_path != dest_base {
-        let copy_result = execute_browse_copy(drive, body, cancellation).await?;
+        let copy_result = execute_browse_copy(indexes, drive, body, cancellation).await?;
         if copy_result.status != "completed" {
             return Ok(copy_result);
         }
@@ -1689,17 +2189,21 @@ async fn execute_browse_move(
     }
 
     let dest = resolve_safe_path_for_new(&dest_base, &dest_drive, &body.dest_path)?;
-    let resolution =
-        match resolve_local_regular_file_transfer(&source, &dest, &source_meta, copy_move_target_policy(body)?, cancellation).await {
-            Ok(resolution) => resolution,
-            Err(LocalTransferWriteError::Io(error)) => return Err(map_io_error(error, &source)),
-            Err(LocalTransferWriteError::SourceChanged) => return Ok(source_changed_transfer_result(false)),
-            Err(LocalTransferWriteError::Cancelled) => return Ok(cancelled_transfer_result()),
-            Err(LocalTransferWriteError::TargetChanged) => {
-                return Err(build_conflict_error(&source, &dest, &body.source_path, &body.dest_path).await);
-            }
-            Err(LocalTransferWriteError::OutcomeUnknown) => return Ok(outcome_unknown_transfer_result()),
-        };
+    let policy = copy_move_target_policy(body)?;
+    indexes
+        .create_parent(&dest_drive, &dest_base, &dest)
+        .await
+        .map_err(|error| map_io_error(error, &dest))?;
+    let resolution = match resolve_local_regular_file_transfer(&source, &dest, &source_meta, policy, cancellation).await {
+        Ok(resolution) => resolution,
+        Err(LocalTransferWriteError::Io(error)) => return Err(map_io_error(error, &source)),
+        Err(LocalTransferWriteError::SourceChanged) => return Ok(source_changed_transfer_result(false)),
+        Err(LocalTransferWriteError::Cancelled) => return Ok(cancelled_transfer_result()),
+        Err(LocalTransferWriteError::TargetChanged) => {
+            return Err(build_conflict_error(&source, &dest, &body.source_path, &body.dest_path).await);
+        }
+        Err(LocalTransferWriteError::OutcomeUnknown) => return Ok(outcome_unknown_transfer_result()),
+    };
     match resolution.disposition {
         TargetResolutionDisposition::Skip => return Ok(skipped_transfer_result()),
         TargetResolutionDisposition::AwaitCollision => {
@@ -1739,6 +2243,7 @@ pub struct StreamTransferQuery {
 /// private sibling stage and publishes through the requested target policy,
 /// leaving an interrupted relay without partial output.
 pub async fn browse_stream_transfer(
+    State(indexes): State<DirectoryMutationState>,
     Path(drive): Path<String>,
     Query(query): Query<StreamTransferQuery>,
     body: Body,
@@ -1766,6 +2271,10 @@ pub async fn browse_stream_transfer(
         TargetResolutionDisposition::CreateNew | TargetResolutionDisposition::ReplaceExisting => {}
     }
 
+    indexes
+        .create_parent(&drive, &base_path, &destination)
+        .await
+        .map_err(|error| map_io_error(error, &destination))?;
     match stage_local_request_body_with_target_policy(
         &destination,
         body,
@@ -1833,7 +2342,6 @@ async fn stage_local_request_body_with_target_policy(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Transfer target name is not valid UTF-8"))?;
-    tokio::fs::create_dir_all(parent).await?;
     let stage = parent.join(format!(".{target_name}.sambee-stage-{}", uuid::Uuid::new_v4()));
 
     let result: Result<(u64, bool), LocalTransferWriteError> = async {
@@ -1919,36 +2427,58 @@ pub async fn browse_open(
     Path(drive): Path<String>,
     Json(body): Json<OpenRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
-    let file_path = resolve_safe_path(&base_path, &drive, &body.path)?;
+    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
+    let file_path = resolve_safe_path_with_error_mapper(&base_path, &drive, &body.path, map_file_io_error)?;
 
-    let metadata = tokio::fs::metadata(&file_path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ApiError::not_found_code(format!("Path not found: {}", file_path.display()), RECENT_FILE_TARGET_MISSING_CODE)
-        } else {
-            map_io_error(error, &file_path)
-        }
-    })?;
+    let metadata = tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|error| map_file_io_error(error, &file_path))?;
     if !metadata.is_file() {
-        return Err(ApiError::bad_request_code(
-            format!("Not a file: {}", file_path.display()),
-            RECENT_FILE_TARGET_NOT_FILE_CODE,
+        return Err(ApiError::conflict_code(
+            "This target is not a regular file. Select another file.",
+            NOT_A_FILE_CODE,
         ));
     }
 
     let extension = file_path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let selection = commands::open_file::prompt_for_app_selection(&state.app, extension, body.force_picker)
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|error| {
+            log::warn!("Native application selection failed: {error}");
+            ApiError::internal_code(
+                "The application picker is unavailable. Select an application and retry.",
+                RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE,
+            )
+        })?;
 
     let Some(selected_app) = selection else {
         log::info!("User cancelled app picker for local file: {}", file_path.display());
         return Ok(StatusCode::NO_CONTENT);
     };
 
+    if !tokio::fs::metadata(&file_path)
+        .await
+        .map_err(|error| map_file_io_error(error, &file_path))?
+        .is_file()
+    {
+        return Err(ApiError::conflict_code(
+            "This target is not a regular file. Select another file.",
+            NOT_A_FILE_CODE,
+        ));
+    }
+
     commands::open_file::open_in_native_app(&state.app, &file_path, &selected_app.executable, selected_app.handler_id.as_deref())
         .await
-        .map_err(|error| ApiError::internal_code(error, RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE))?;
+        .map_err(|error| {
+            log::warn!("Native launch failed: {error}");
+            match std::fs::metadata(&file_path) {
+                Err(error) => map_file_io_error(error, &file_path),
+                Ok(_) => ApiError::internal_code(
+                    "The application could not open this file. Select an application and retry.",
+                    RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE,
+                ),
+            }
+        })?;
 
     log::info!(
         "Opened local file with selected app: {} ({})",
@@ -2797,6 +3327,9 @@ pub(crate) async fn start_direct_local_archive_session(
             .await?;
         }
         super::archive_sessions::ArchiveSessionKind::Extract => {
+            let temporary = tempfile::tempdir().unwrap();
+            let indexes =
+                DirectoryMutationState(super::directory_manager::LocalDirectoryManager::new(temporary.path().join("private")).unwrap());
             resolve_companion_extraction_coordinator(
                 resolve_companion_archive_topology_plan(CompanionArchiveOperationKind::Extract, true, true)
                     .map_err(map_local_archive_error)?,
@@ -2804,7 +3337,7 @@ pub(crate) async fn start_direct_local_archive_session(
                     .await?
                     .into_plan(),
             )?
-            .execute()
+            .execute(indexes)
             .await?;
         }
     }
@@ -2859,13 +3392,15 @@ pub(crate) async fn decide_direct_local_archive_session(
     expected_revision: u64,
     decision: super::archive_sessions::ArchiveSessionDecision,
 ) -> Result<ArchiveSessionStatus, ApiError> {
+    let temporary = tempfile::tempdir().unwrap();
+    let indexes = DirectoryMutationState(super::directory_manager::LocalDirectoryManager::new(temporary.path().join("private")).unwrap());
     resolve_companion_extraction_coordinator(
         resolve_companion_archive_topology_plan(CompanionArchiveOperationKind::Extract, true, true).map_err(map_local_archive_error)?,
         CompanionArchiveExtractionCoordinator::direct_local_from_session(state_store, execution_id.to_string())
             .await?
             .into_plan(),
     )?
-    .decide(drive, owner_origin, execution_id, expected_revision, decision)
+    .decide(indexes, drive, owner_origin, execution_id, expected_revision, decision)
     .await
 }
 
@@ -2963,6 +3498,10 @@ struct LiveRemoteSourceAggregate {
     members_processed: u64,
     members_completed: u64,
     members_skipped: u64,
+    #[serde(default)]
+    encrypted_members_skipped: u64,
+    #[serde(default)]
+    unsupported_compression_members_skipped: u64,
     members_failed: u64,
     files_extracted: u64,
     directories_created: u64,
@@ -3012,6 +3551,8 @@ struct LiveLocalSourceExtractionSummary<'a> {
     members_processed: u64,
     members_completed: u64,
     members_skipped: u64,
+    encrypted_members_skipped: u64,
+    unsupported_compression_members_skipped: u64,
     members_failed: u64,
     files_extracted: u64,
     directories_created: u64,
@@ -3233,6 +3774,8 @@ impl ArchiveExtractionRelay {
             members_processed: aggregate.members_processed,
             members_completed: aggregate.members_completed,
             members_skipped: aggregate.members_skipped,
+            encrypted_members_skipped: aggregate.encrypted_members_skipped,
+            unsupported_compression_members_skipped: aggregate.unsupported_compression_members_skipped,
             members_failed: aggregate.members_failed,
             files_extracted: aggregate.files_extracted,
             directories_created: aggregate.directories_created,
@@ -3347,10 +3890,10 @@ impl CompanionArchiveExtractionCoordinator {
         Ok(Self::direct_local(state_store, execution_id))
     }
 
-    async fn execute(self) -> Result<CompanionArchiveExtractionResult, ApiError> {
+    async fn execute(self, indexes: DirectoryMutationState) -> Result<CompanionArchiveExtractionResult, ApiError> {
         match self.plan {
             CompanionArchiveExtractionPlan::DirectLocal { state_store, execution_id } => {
-                Self::execute_direct_local(state_store, execution_id).await?;
+                Self::execute_direct_local(indexes, state_store, execution_id).await?;
                 Ok(CompanionArchiveExtractionResult::DirectLocalStarted)
             }
         }
@@ -3358,6 +3901,7 @@ impl CompanionArchiveExtractionCoordinator {
 
     async fn decide(
         self,
+        indexes: DirectoryMutationState,
         drive: &str,
         owner_origin: &str,
         execution_id: &str,
@@ -3413,6 +3957,7 @@ impl CompanionArchiveExtractionCoordinator {
                     .resume_live_extraction(drive, owner_origin, execution_id, expected_revision, decision)
                     .await?;
                 Self::spawn_direct_local_extraction(
+                    indexes,
                     state_store,
                     execution_id.to_string(),
                     drive_root,
@@ -3460,7 +4005,11 @@ fn resolve_companion_extraction_coordinator(
 }
 
 impl CompanionArchiveExtractionCoordinator {
-    async fn execute_direct_local(state_store: Arc<ArchiveSessionManager>, execution_id: String) -> Result<(), ApiError> {
+    async fn execute_direct_local(
+        indexes: DirectoryMutationState,
+        state_store: Arc<ArchiveSessionManager>,
+        execution_id: String,
+    ) -> Result<(), ApiError> {
         let (drive_root, _archive_path, destination_path, cancellation_requested, source) =
             match state_store.start_live_extraction(&execution_id).await {
                 Ok(state) => state,
@@ -3472,6 +4021,7 @@ impl CompanionArchiveExtractionCoordinator {
                 }
             };
         Self::spawn_direct_local_extraction(
+            indexes,
             state_store,
             execution_id,
             drive_root,
@@ -3483,6 +4033,7 @@ impl CompanionArchiveExtractionCoordinator {
     }
 
     fn spawn_direct_local_extraction(
+        indexes: DirectoryMutationState,
         state_store: Arc<ArchiveSessionManager>,
         execution_id: String,
         drive_root: PathBuf,
@@ -3493,12 +4044,12 @@ impl CompanionArchiveExtractionCoordinator {
         tokio::spawn(async move {
             let worker_source = source.clone();
             let result = tokio::task::spawn_blocking(move || {
-                extract_live_local_archive(&drive_root, &destination_path, &cancellation_requested, &worker_source).map(|result| {
-                    match result {
+                extract_live_local_archive(&indexes, &drive_root, &destination_path, &cancellation_requested, &worker_source).map(
+                    |result| match result {
                         DirectLiveExtractionRun::Completed(result) => ArchiveSessionCompletion::ExtractionCompletedLive { result },
                         DirectLiveExtractionRun::AwaitingCollision { result } => ArchiveSessionCompletion::AwaitingLiveCollision { result },
-                    }
-                })
+                    },
+                )
             })
             .await
             .map_err(|error| LocalArchiveError::Io(std::io::Error::other(format!("Archive execution task failed: {error}"))))
@@ -3522,12 +4073,15 @@ impl CompanionArchiveExtractionCoordinator {
 }
 
 fn extract_live_local_archive(
+    indexes: &DirectoryMutationState,
     drive_root: &FsPath,
     destination_path: &FsPath,
     cancellation_requested: &AtomicBool,
     source: &AsyncMutex<super::archive_sessions::LiveLocalArchiveSourceSession>,
 ) -> Result<DirectLiveExtractionRun, LocalArchiveError> {
-    create_local_extraction_root(drive_root, destination_path)?;
+    indexes.0.run_observed_root_creation(drive_root, destination_path, || {
+        create_local_extraction_root(drive_root, destination_path)
+    })?;
     loop {
         if cancellation_requested.load(Ordering::Acquire) {
             return Err(LocalArchiveError::Cancelled);
@@ -3546,7 +4100,9 @@ fn extract_live_local_archive(
         let target_path = destination_path.join(&relative_target_path);
         let target_path_text = target_path.to_string_lossy().to_string();
         let result = if member.entry.is_directory {
-            let directories_created = match ensure_local_extraction_directory(drive_root, destination_path, &target_path)? {
+            let directories_created = match indexes.0.run_observed_root_creation(drive_root, &target_path, || {
+                ensure_local_extraction_directory(drive_root, destination_path, &target_path)
+            })? {
                 LocalArchiveDirectoryOutput::Ready { directories_created } => directories_created,
                 LocalArchiveDirectoryOutput::AwaitCollision { target } => {
                     return pause_live_local_collision(source, &member, relative_target_path, target);
@@ -3564,8 +4120,9 @@ fn extract_live_local_archive(
                 renamed: false,
             }
         } else {
-            match prepare_local_archive_target_output(drive_root, destination_path, &target_path, target_policy, member.entry.modified_at)?
-            {
+            match indexes.0.run_observed_root_creation(drive_root, &target_path, || {
+                prepare_local_archive_target_output(drive_root, destination_path, &target_path, target_policy, member.entry.modified_at)
+            })? {
                 LocalArchiveTargetOutput::Ready {
                     mut file,
                     replaced,
@@ -4003,7 +4560,7 @@ async fn start_v2_local_archive_execution(
                 .await?
                 .into_plan(),
             )?
-            .execute()
+            .execute(DirectoryMutationState(Arc::clone(&state.directory_indexes)))
             .await?;
             if !matches!(result, CompanionArchiveExtractionResult::DirectLocalStarted) {
                 return Err(ApiError::Internal(
@@ -4109,6 +4666,7 @@ async fn decide_v2_local_archive_execution(
             .into_plan(),
     )?
     .decide(
+        DirectoryMutationState(Arc::clone(&state.directory_indexes)),
         &drive,
         &extract_origin(&headers)?,
         &execution_id,
@@ -4392,6 +4950,8 @@ pub async fn browse_get_v2_relay_extraction_status(
             "members_processed": aggregate.members_processed,
             "members_completed": aggregate.members_completed,
             "members_skipped": aggregate.members_skipped,
+            "encrypted_members_skipped": aggregate.encrypted_members_skipped,
+            "unsupported_compression_members_skipped": aggregate.unsupported_compression_members_skipped,
             "members_failed": aggregate.members_failed,
             "files_extracted": aggregate.files_extracted,
             "directories_created": aggregate.directories_created,
@@ -4572,7 +5132,12 @@ async fn execute_relay_extraction_to_local_destination(
     let relay = ArchiveExtractionRelay::from_transport(transport);
     Ok(Json(
         execute_archive_relay(
-            extract_smb_archive_to_local_live(&relay, drive_root, destination_path),
+            extract_smb_archive_to_local_live(
+                DirectoryMutationState(Arc::clone(&state.directory_indexes)),
+                &relay,
+                drive_root,
+                destination_path,
+            ),
             relay.fail(),
         )
         .await?,
@@ -4601,6 +5166,7 @@ pub async fn browse_relay_v2_archive_extraction(
 }
 
 async fn extract_smb_archive_to_local_live(
+    indexes: DirectoryMutationState,
     relay: &ArchiveExtractionRelay,
     drive_root: PathBuf,
     destination_path: PathBuf,
@@ -4608,10 +5174,15 @@ async fn extract_smb_archive_to_local_live(
     relay.begin_live_remote_source().await?;
     let root = destination_path.clone();
     let root_drive = drive_root.clone();
-    let _root_created = tokio::task::spawn_blocking(move || create_local_extraction_root(&root_drive, &root))
-        .await
-        .map_err(|error| ApiError::Internal(format!("Local archive root task failed: {error}")))?
-        .map_err(map_local_archive_error)?;
+    let root_indexes = indexes.clone();
+    let _root_created = tokio::task::spawn_blocking(move || {
+        root_indexes
+            .0
+            .run_observed_root_creation(&root_drive, &root, || create_local_extraction_root(&root_drive, &root))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("Local archive root task failed: {error}")))?
+    .map_err(map_local_archive_error)?;
     loop {
         let Some(member) = relay.next_live_remote_source_member().await? else {
             return Ok(live_remote_source_response(relay.complete_live_remote_source().await?));
@@ -4625,10 +5196,15 @@ async fn extract_smb_archive_to_local_live(
         let target_path_text = target_path.to_string_lossy().to_string();
         if member.is_directory {
             let output = tokio::task::spawn_blocking({
+                let indexes = indexes.clone();
                 let drive_root = drive_root.clone();
                 let destination_path = destination_path.clone();
                 let target_path = target_path.clone();
-                move || ensure_local_extraction_directory(&drive_root, &destination_path, &target_path)
+                move || {
+                    indexes.0.run_observed_root_creation(&drive_root, &target_path, || {
+                        ensure_local_extraction_directory(&drive_root, &destination_path, &target_path)
+                    })
+                }
             })
             .await
             .map_err(|error| ApiError::Internal(format!("Local archive directory task failed: {error}")))?
@@ -4662,11 +5238,16 @@ async fn extract_smb_archive_to_local_live(
             continue;
         }
         let output = tokio::task::spawn_blocking({
+            let indexes = indexes.clone();
             let drive_root = drive_root.clone();
             let destination_path = destination_path.clone();
             let target_path = target_path.clone();
             let modified_at = member.modified_at;
-            move || prepare_local_archive_target_output(&drive_root, &destination_path, &target_path, target_policy, modified_at)
+            move || {
+                indexes.0.run_observed_root_creation(&drive_root, &target_path, || {
+                    prepare_local_archive_target_output(&drive_root, &destination_path, &target_path, target_policy, modified_at)
+                })
+            }
         })
         .await
         .map_err(|error| ApiError::Internal(format!("Local archive file task failed: {error}")))?
@@ -4751,6 +5332,8 @@ fn live_remote_source_response(status: LiveRemoteSourceStatus) -> ArchiveExtract
             members_processed: status.aggregate_counters.members_processed,
             members_completed: status.aggregate_counters.members_completed,
             members_skipped: status.aggregate_counters.members_skipped,
+            encrypted_members_skipped: status.aggregate_counters.encrypted_members_skipped,
+            unsupported_compression_members_skipped: status.aggregate_counters.unsupported_compression_members_skipped,
             members_failed: status.aggregate_counters.members_failed,
             files_extracted: status.aggregate_counters.files_extracted,
             directories_created: status.aggregate_counters.directories_created,
@@ -4769,6 +5352,8 @@ fn archive_extraction_response(
         members_processed: aggregate.members_processed,
         members_completed: aggregate.members_completed,
         members_skipped: aggregate.members_skipped,
+        encrypted_members_skipped: aggregate.encrypted_members_skipped,
+        unsupported_compression_members_skipped: aggregate.unsupported_compression_members_skipped,
         members_failed: aggregate.members_failed,
         files_extracted: aggregate.files_extracted,
         directories_created: aggregate.directories_created,
@@ -4865,13 +5450,37 @@ async fn relay_archive_response(response: ReqwestResponse, action: &str) -> Resu
     if let Some(message) = classify_proxy_auth_intercept("Archive relay", Some(status), content_type.as_deref(), &body) {
         return Err(ApiError::Forbidden(message));
     }
-    let detail = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| value.get("detail").and_then(serde_json::Value::as_str).map(str::to_owned));
+    let problem = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let detail = problem.as_ref().and_then(|value| {
+        ["message", "detail"].into_iter().find_map(|field| {
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+        })
+    });
+    let code = problem
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(serde_json::Value::as_str);
     let message = match detail {
         Some(detail) => format!("Archive relay could not {action}: backend returned HTTP {status}: {detail}"),
         None => format!("Archive relay could not {action}: backend returned HTTP {status}"),
     };
+    if let Some(code) = code {
+        return Err(match status {
+            reqwest::StatusCode::CONFLICT => {
+                ApiError::conflict_code(message, super::errors::archive_v2_contract_code(code, "invalid_operation_state"))
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                ApiError::forbidden_code(message, super::errors::archive_v2_contract_code(code, "authorization_denied"))
+            }
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                ApiError::bad_request_code(message, super::errors::archive_v2_contract_code(code, "invalid_request"))
+            }
+            _ => ApiError::internal_code(message, super::errors::archive_v2_contract_code(code, "transport_failure")),
+        });
+    }
     match status {
         reqwest::StatusCode::CONFLICT => Err(ApiError::conflict_message(message)),
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(ApiError::Forbidden(message)),
@@ -4972,122 +5581,119 @@ fn map_local_archive_read_error(error: super::archive::LocalArchiveReadError) ->
 
 // ─── Directory Search ────────────────────────────────────────────────────────
 
-/// Maximum number of directory results to return per query.
-const MAX_SEARCH_RESULTS: usize = 50;
+pub async fn directory_policy_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<super::directory_policy::DirectoryPolicyStatus>, ApiError> {
+    let origin = extract_origin(&headers)?;
+    state.directory_policy.status(Some(&origin)).map(Json)
+}
 
-/// Maximum number of directories to index per drive.
-///
-/// Prevents runaway recursion on very large or deep filesystems.
-const MAX_DIRECTORY_SCAN: usize = 100_000;
+pub async fn directory_policy_challenge(State(_state): State<Arc<AppState>>, _headers: HeaderMap) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::UPGRADE_REQUIRED,
+        Json(
+            serde_json::json!({"code": "settings_update_required", "detail": "Manual policy approval is no longer supported. Update the Sambee browser application."}),
+        ),
+    )
+}
+
+pub async fn directory_policy_redeem(
+    State(_state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    Json(_delivery): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::UPGRADE_REQUIRED,
+        Json(
+            serde_json::json!({"code": "settings_update_required", "detail": "Legacy policy delivery is no longer supported. Update the Sambee browser application."}),
+        ),
+    )
+}
+
+pub async fn companion_settings_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<super::directory_policy::CompanionSettingsStatus>, ApiError> {
+    let origin = extract_origin(&headers)?;
+    state.directory_policy.settings_status(Some(&origin), &state.pairing).map(Json)
+}
+
+pub async fn companion_settings_challenge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<super::directory_policy::CompanionSettingsStatus>, ApiError> {
+    let origin = extract_origin(&headers)?;
+    state.directory_policy.settings_challenge(&origin, &state.pairing).map(Json)
+}
+
+pub async fn companion_settings_redeem(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(delivery): Json<super::directory_policy::SettingsGrantDelivery>,
+) -> Result<Json<super::directory_policy::CompanionSettingsStatus>, ApiError> {
+    let origin = extract_origin(&headers)?;
+    let result = state
+        .directory_policy
+        .redeem_settings(&origin, delivery, &state.pairing, &state.app, &state.localization)
+        .await;
+    if let Err(error) = &result {
+        if let Err(record_error) = state.directory_policy.record_settings_error(error.to_string()) {
+            log::warn!("Settings delivery failure could not be recorded: {record_error}");
+        }
+    }
+    result.map(Json)
+}
 
 /// Query parameters for directory search.
 #[derive(Deserialize)]
 pub struct DirectorySearchQuery {
-    /// Search query string (case-insensitive substring match on path).
+    /// Independent literal terms matched against directory paths.
     pub q: Option<String>,
     /// Whether to include directories with dot-prefixed path segments.
     pub include_dot_directories: Option<bool>,
+    pub include_issue_details: Option<bool>,
 }
 
 /// `GET /api/browse/{drive}/directories` — search for directories on a local drive.
 ///
-/// Recursively walks the drive, collects directory paths, and returns those
-/// matching the query string `q`. Produces the same JSON shape as the
-/// backend's `DirectorySearchResult`.
-///
-/// Unlike the backend, this does not maintain a persistent cache — it walks
-/// the filesystem on each request. For typical local drives this is fast
-/// enough (< 1s for tens of thousands of directories).
+/// Starts or joins a background catalogue and queries its committed rows.
 pub async fn browse_search_directories(
+    State(state): State<DirectoryMutationState>,
     Path(drive): Path<String>,
     Query(query): Query<DirectorySearchQuery>,
 ) -> Result<Json<DirectorySearchResult>, ApiError> {
     let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
 
-    let canonical_base = std::fs::canonicalize(&base_path).map_err(|e| ApiError::NotFound(format!("Drive root inaccessible: {e}")))?;
-
     let q = query.q.unwrap_or_default();
     let include_dot_directories = query.include_dot_directories.unwrap_or(false);
-
-    // Walk the directory tree and collect directory paths
-    let directories = tokio::task::spawn_blocking({
-        let base = canonical_base.clone();
-        move || walk_directories(&base, MAX_DIRECTORY_SCAN, include_dot_directories)
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("Directory scan task failed: {e}")))?;
-
-    let directory_count = directories.len();
-
-    // Filter by query (case-insensitive substring match)
-    let (results, total_matches) = if q.is_empty() {
-        (Vec::new(), 0)
-    } else {
-        let q_lower = q.to_lowercase();
-        let matching: Vec<String> = directories
-            .into_iter()
-            .filter(|path| path.to_lowercase().contains(&q_lower))
-            .collect();
-        let total = matching.len();
-        let truncated = matching.into_iter().take(MAX_SEARCH_RESULTS).collect();
-        (truncated, total)
-    };
-
-    Ok(Json(DirectorySearchResult {
-        results,
-        total_matches,
-        cache_state: "ready".to_string(),
-        directory_count,
-    }))
-}
-
-/// Recursively walk a directory tree and collect relative directory paths.
-///
-/// Optionally skips hidden directories (starting with `.`) and stops after
-/// `max_dirs` directories to prevent runaway scans on very large filesystems.
-fn walk_directories(base: &std::path::Path, max_dirs: usize, include_dot_directories: bool) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![base.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        if result.len() >= max_dirs {
-            break;
-        }
-
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue, // skip unreadable directories
+    super::directory_index::search_terms(&q).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let details_drive = drive.clone();
+    let mut response = state
+        .0
+        .search(drive, base_path, q, include_dot_directories)
+        .await
+        .map_err(|error| match error {
+            super::directory_index::IndexError::QueryBusy => ApiError::TooManyRequests(error.to_string()),
+            super::directory_index::IndexError::Invalid(message) => ApiError::BadRequest(message.to_owned()),
+            super::directory_index::IndexError::Interrupted => {
+                ApiError::TooManyRequests("Directory query was cancelled or timed out. Retry the search.".to_owned())
+            }
+            _ => ApiError::Internal("Directory search failed. Check drive access and private local storage, then retry.".to_owned()),
+        })?;
+    if query.include_issue_details.unwrap_or(false) {
+        let (details, incomplete) = if response.issue_details_available {
+            state
+                .0
+                .issue_details(&details_drive)
+                .map_err(|error| ApiError::Internal(error.to_string()))?
+        } else {
+            (Vec::new(), false)
         };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            // Skip hidden directories
-            if !include_dot_directories && name_str.starts_with('.') {
-                continue;
-            }
-
-            // Build relative path
-            if let Ok(rel) = path.strip_prefix(base) {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                result.push(rel_str);
-                stack.push(path);
-            }
-
-            if result.len() >= max_dirs {
-                break;
-            }
-        }
+        response.issue_details = Some(details);
+        response.issue_details_incomplete = incomplete;
     }
-
-    result.sort();
-    result
+    Ok(Json(response))
 }
 
 // ─── Upload ──────────────────────────────────────────────────────────────────
@@ -5112,9 +5718,12 @@ pub struct EditLockPathQuery {
 async fn validate_editor_write_target(dest: &FsPath) -> Result<(), ApiError> {
     match tokio::fs::metadata(dest).await {
         Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(ApiError::BadRequest("Editor writes cannot replace a directory".to_string())),
+        Ok(_) => Err(ApiError::conflict_code(
+            "This target is not a regular file. Select another file.",
+            NOT_A_FILE_CODE,
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(map_io_error(error, dest)),
+        Err(error) => Err(map_file_io_error(error, dest)),
     }
 }
 
@@ -5129,6 +5738,18 @@ fn lock_response(lock: super::edit_locks::LocalEditLock) -> EditLockResponse {
     }
 }
 
+async fn check_editor_write_access(path: &FsPath) -> Result<(), ApiError> {
+    validate_editor_write_target(path).await?;
+    let probe = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|error| map_file_io_error(error, path))?;
+    drop(probe);
+    Ok(())
+}
+
 /// `POST /api/browse/{drive}/lock` — acquire an exclusive local editor lease.
 pub async fn browse_acquire_edit_lock(
     State(state): State<Arc<AppState>>,
@@ -5136,16 +5757,11 @@ pub async fn browse_acquire_edit_lock(
     Query(query): Query<EditLockPathQuery>,
     headers: HeaderMap,
 ) -> Result<Json<EditLockResponse>, ApiError> {
-    let base_path = drives::resolve_drive_path(&drive).ok_or_else(|| ApiError::NotFound(format!("Unknown drive: {drive}")))?;
+    let base_path = drives::resolve_drive_path(&drive)
+        .ok_or_else(|| ApiError::internal_code("The local drive is unavailable. Reconnect it and retry.", FILE_UNAVAILABLE_CODE))?;
     let path = normalize_drive_relative_path(&drive, &query.path)?;
     let full_path = resolve_safe_path(&base_path, &drive, &query.path)?;
-    if !tokio::fs::metadata(&full_path)
-        .await
-        .map_err(|error| map_io_error(error, &full_path))?
-        .is_file()
-    {
-        return Err(ApiError::BadRequest("Edit locks require an existing regular file".to_string()));
-    }
+    check_editor_write_access(&full_path).await?;
     let lock = state.edit_locks.acquire(&drive, &path, extract_origin(&headers)?).await?;
     Ok(Json(lock_response(lock)))
 }
@@ -5290,11 +5906,20 @@ pub async fn browse_upload(
 
     // Ensure parent directory exists
     if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| map_io_error(e, parent))?;
+        DirectoryMutationState(Arc::clone(&state.directory_indexes))
+            .create_parent(&drive, &base_path, &dest)
+            .await
+            .map_err(|error| map_io_error(error, parent))?;
     }
 
     let size = data.len() as u64;
-    tokio::fs::write(&dest, &data).await.map_err(|e| map_io_error(e, &dest))?;
+    tokio::fs::write(&dest, &data).await.map_err(|error| {
+        if has_editor_lock_context {
+            map_file_io_error(error, &dest)
+        } else {
+            map_io_error(error, &dest)
+        }
+    })?;
 
     // Read metadata for the response
     let last_modified = tokio::fs::metadata(&dest).await.ok().and_then(|m| m.modified().ok()).map(|t| {
@@ -5302,7 +5927,7 @@ pub async fn browse_upload(
         dt.to_rfc3339()
     });
 
-    log::info!("Uploaded {} bytes to {}", size, dest.display());
+    log::info!("Local upload completed: bytes={size}");
 
     Ok(Json(UploadResponse {
         status: "ok".to_string(),
@@ -5367,18 +5992,42 @@ fn normalize_drive_relative_path(drive: &str, path: &str) -> Result<String, ApiE
 
 /// Resolve a relative path against a base path, preventing path traversal.
 fn resolve_safe_path(base: &std::path::Path, drive: &str, relative: &str) -> Result<PathBuf, ApiError> {
+    resolve_safe_path_with_error_mapper(base, drive, relative, map_io_error)
+}
+
+fn resolve_safe_path_with_error_mapper(
+    base: &std::path::Path,
+    drive: &str,
+    relative: &str,
+    map_error: fn(std::io::Error, &std::path::Path) -> ApiError,
+) -> Result<PathBuf, ApiError> {
     let full = resolve_drive_relative_source_path(base, drive, relative)?;
 
     // Verify the resolved path is still under the base.
-    let canonical_base = std::fs::canonicalize(base).map_err(|e| ApiError::NotFound(format!("Drive root inaccessible: {e}")))?;
+    let canonical_base = std::fs::canonicalize(base).map_err(|_| ApiError::NotFound(DRIVE_UNAVAILABLE_MESSAGE.to_string()))?;
 
-    let canonical_full = std::fs::canonicalize(&full).map_err(|e| map_io_error(e, &full))?;
+    let canonical_full = std::fs::canonicalize(&full).map_err(|error| map_error(normalize_path_io_error(error, &full), &full))?;
 
     if !canonical_full.starts_with(&canonical_base) {
         return Err(ApiError::Forbidden("Path is outside the drive boundary".to_string()));
     }
 
     Ok(canonical_full)
+}
+
+/// Distinguish missing paths from file parents when the OS reports both as missing.
+fn normalize_path_io_error(error: std::io::Error, path: &std::path::Path) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        for ancestor in path.ancestors().skip(1) {
+            match ancestor.metadata() {
+                Ok(metadata) if !metadata.is_dir() => return std::io::ErrorKind::NotADirectory.into(),
+                Ok(_) => break,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    error
 }
 
 /// Build an uncanonicalized path under a drive root after rejecting traversal.
@@ -5683,6 +6332,58 @@ fn map_io_error(err: std::io::Error, path: &std::path::Path) -> ApiError {
     }
 }
 
+fn map_file_io_error(error: std::io::Error, path: &std::path::Path) -> ApiError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            ApiError::not_found_code("The item was not found. It may have been moved or deleted.", ITEM_NOT_FOUND_CODE)
+        }
+        std::io::ErrorKind::PermissionDenied => ApiError::forbidden_code(
+            "Access to this file was denied. Check your permissions and retry.",
+            FILE_ACCESS_DENIED_CODE,
+        ),
+        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory => {
+            ApiError::conflict_code("This target is not a regular file. Select another file.", NOT_A_FILE_CODE)
+        }
+        std::io::ErrorKind::TimedOut => {
+            ApiError::internal_code("The file request timed out. Check the drive and retry.", FILE_TIMEOUT_CODE)
+        }
+        _ => {
+            log::error!("File request failed for {}: {error}", path.display());
+            ApiError::internal_code("The file is unavailable. Check the drive and retry.", FILE_UNAVAILABLE_CODE)
+        }
+    }
+}
+
+fn map_metadata_io_error(error: std::io::Error, path: &std::path::Path) -> ApiError {
+    if matches!(error.kind(), std::io::ErrorKind::NotADirectory | std::io::ErrorKind::IsADirectory) {
+        return ApiError::conflict_code(
+            "An item in this path is not a folder. Select another location.",
+            NOT_A_DIRECTORY_CODE,
+        );
+    }
+    map_file_io_error(error, path)
+}
+
+fn map_directory_io_error(error: std::io::Error, path: &std::path::Path) -> ApiError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ApiError::not_found_code(
+            "The folder was not found. It may have been moved or deleted.",
+            DIRECTORY_NOT_FOUND_CODE,
+        ),
+        std::io::ErrorKind::NotADirectory => ApiError::conflict_code("This item is not a folder.", NOT_A_DIRECTORY_CODE),
+        std::io::ErrorKind::PermissionDenied => {
+            ApiError::forbidden_code("You do not have permission to open this folder.", DIRECTORY_ACCESS_DENIED_CODE)
+        }
+        _ => {
+            log::error!("Directory listing failed for {}: {error}", path.display());
+            ApiError::internal_code(
+                "The folder could not be opened. Check the drive and try again.",
+                DIRECTORY_UNAVAILABLE_CODE,
+            )
+        }
+    }
+}
+
 /// Validate a file/directory name for forbidden characters and patterns.
 ///
 /// Matches the backend validation in `browser.py` — rejects empty names,
@@ -5746,6 +6447,7 @@ fn resolve_safe_path_for_new(base: &std::path::Path, drive: &str, relative: &str
         }
     }
 
+    super::directory_policy::ensure_mutation_allowed(&full)?;
     Ok(full)
 }
 
@@ -5868,6 +6570,8 @@ fn archive_execution_response(execution: ArchiveSessionStatus) -> ArchiveExecuti
                 members_processed: progress.members_processed,
                 members_completed: progress.members_completed,
                 members_skipped: progress.members_skipped,
+                encrypted_members_skipped: progress.encrypted_members_skipped,
+                unsupported_compression_members_skipped: progress.unsupported_compression_members_skipped,
                 members_failed: progress.members_failed,
                 files_extracted: progress.files_extracted,
                 directories_created: progress.directories_created,
@@ -6048,9 +6752,6 @@ async fn resolve_local_regular_file_transfer(
     policy: TargetResolutionPolicy,
     cancellation: Option<&AtomicBool>,
 ) -> Result<super::target_resolution::TargetMutationResolution<()>, LocalTransferWriteError> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(LocalTransferWriteError::Io)?;
-    }
     resolve_target_mutation_attempt(
         ContentTransferPlan {
             source_modified_at: expected_source.modified().ok().map(DateTime::<Utc>::from),
@@ -6339,15 +7040,635 @@ async fn rename_noreplace(_source: &FsPath, _destination: &FsPath) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    fn directory_mutation_state(directory: &std::path::Path) -> axum::extract::State<super::DirectoryMutationState> {
+        axum::extract::State(super::DirectoryMutationState(
+            super::super::directory_manager::LocalDirectoryManager::new(directory.join("index-cache")).unwrap(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_directory_mutation_handlers_reconcile_the_background_index() {
+        const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const FRESHNESS_TARGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+        async fn wait_for_paths(
+            state: &super::DirectoryMutationState,
+            drive: &str,
+            root: &std::path::Path,
+            expected: &[&str],
+        ) -> super::DirectorySearchResult {
+            let mut last_status = String::new();
+            let settled = tokio::time::timeout(SETTLE_TIMEOUT, async {
+                loop {
+                    let result = match state
+                        .0
+                        .search(drive.to_owned(), root.to_path_buf(), "created renamed".to_owned(), false)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(
+                            error @ (super::super::directory_index::IndexError::Interrupted
+                            | super::super::directory_index::IndexError::QueryBusy),
+                        ) => {
+                            last_status = error.to_string();
+                            tokio::time::sleep(RETRY_INTERVAL).await;
+                            continue;
+                        }
+                        Err(error) => panic!("background directory query failed: {error}"),
+                    };
+                    if result.cache_state == "ready"
+                        && result.last_verified_at_ms.is_some()
+                        && result.results.iter().map(String::as_str).collect::<Vec<_>>() == expected
+                        && result.directory_count == expected.len()
+                    {
+                        return result;
+                    }
+                    last_status = serde_json::to_string(&result).unwrap();
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+            })
+            .await;
+            settled.unwrap_or_else(|_| {
+                panic!("background directory reconciliation should finish; expected {expected:?}; last status: {last_status}")
+            })
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let drive = format!("mutation-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        let state = directory_mutation_state(cache.path());
+        let before = wait_for_paths(&state.0, &drive, directory.path(), &[]).await;
+        let started = std::time::Instant::now();
+        let created_info = super::browse_create(
+            state.clone(),
+            axum::extract::Path(drive.clone()),
+            axum::Json(super::CreateItemRequest {
+                parent_path: String::new(),
+                name: "created".to_owned(),
+                item_type: super::FileType::Directory,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created_info.0.path, "created");
+        let created = wait_for_paths(&state.0, &drive, directory.path(), &["created"]).await;
+        eprintln!(
+            "directory_mutation_fixture operation=create elapsed_ms={} target_ms={}",
+            started.elapsed().as_millis(),
+            FRESHNESS_TARGET.as_millis()
+        );
+        assert_eq!(created.last_verified_at_ms, before.last_verified_at_ms);
+        let started = std::time::Instant::now();
+        let renamed_info = super::browse_rename(
+            state.clone(),
+            axum::extract::Path(drive.clone()),
+            axum::Json(super::RenameRequest {
+                path: "created".to_owned(),
+                new_name: "renamed".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed_info.0.path, "renamed");
+        let renamed = wait_for_paths(&state.0, &drive, directory.path(), &["renamed"]).await;
+        eprintln!(
+            "directory_mutation_fixture operation=rename elapsed_ms={} target_ms={}",
+            started.elapsed().as_millis(),
+            FRESHNESS_TARGET.as_millis()
+        );
+        assert_eq!(renamed.last_verified_at_ms, before.last_verified_at_ms);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            super::browse_delete_empty_directory(
+                state.clone(),
+                axum::extract::Path(drive.clone()),
+                axum::extract::Query(super::BrowseQuery {
+                    path: Some("renamed".to_owned())
+                }),
+            )
+            .await
+            .unwrap(),
+            axum::http::StatusCode::NO_CONTENT
+        );
+        let removed = wait_for_paths(&state.0, &drive, directory.path(), &[]).await;
+        eprintln!(
+            "directory_mutation_fixture operation=delete elapsed_ms={} target_ms={}",
+            started.elapsed().as_millis(),
+            FRESHNESS_TARGET.as_millis()
+        );
+        assert_eq!(removed.last_verified_at_ms, before.last_verified_at_ms);
+        assert!(!directory.path().join("created").exists());
+        assert!(!directory.path().join("renamed").exists());
+
+        std::fs::create_dir_all(directory.path().join("created/nested/child")).unwrap();
+        let nested = wait_for_paths(
+            &state.0,
+            &drive,
+            directory.path(),
+            &["created", "created/nested", "created/nested/child"],
+        )
+        .await;
+        assert_eq!(
+            super::browse_delete(
+                state.clone(),
+                axum::extract::Path(drive.clone()),
+                axum::extract::Query(super::BrowseQuery {
+                    path: Some("created".to_owned())
+                }),
+            )
+            .await
+            .unwrap(),
+            axum::http::StatusCode::NO_CONTENT
+        );
+        let recursively_removed = wait_for_paths(&state.0, &drive, directory.path(), &[]).await;
+        assert_eq!(recursively_removed.last_verified_at_ms, nested.last_verified_at_ms);
+        assert!(!directory.path().join("created").exists());
+
+        for complete in [true, false] {
+            let result = super::browse_stream_transfer(
+                state.clone(),
+                axum::extract::Path(drive.clone()),
+                axum::extract::Query(super::StreamTransferQuery {
+                    path: "created/nested/file.txt".to_owned(),
+                    target_resolution_policy: Some("ask".to_owned()),
+                    expected_size: if complete { 4 } else { 5 },
+                    source_modified_at: None,
+                }),
+                super::Body::from("data"),
+            )
+            .await;
+            if complete {
+                assert_eq!(result.unwrap().0.status, "completed");
+            } else {
+                assert!(matches!(result, Err(super::ApiError::UnprocessableContent(_))));
+            }
+            let transferred = wait_for_paths(&state.0, &drive, directory.path(), &["created", "created/nested"]).await;
+            assert_eq!(transferred.last_verified_at_ms, recursively_removed.last_verified_at_ms);
+            assert_eq!(directory.path().join("created/nested/file.txt").exists(), complete);
+            assert_eq!(
+                super::browse_delete(
+                    state.clone(),
+                    axum::extract::Path(drive.clone()),
+                    axum::extract::Query(super::BrowseQuery {
+                        path: Some("created".to_owned())
+                    }),
+                )
+                .await
+                .unwrap(),
+                axum::http::StatusCode::NO_CONTENT
+            );
+            wait_for_paths(&state.0, &drive, directory.path(), &[]).await;
+        }
+
+        let archive_path = directory.path().join("fixture.zip");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        archive
+            .start_file("nested/child/data.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut archive, b"data").unwrap();
+        archive.finish().unwrap();
+        let sessions = std::sync::Arc::new(super::ArchiveSessionManager::new());
+        let origin = "https://sambee.example";
+        let execution = sessions
+            .create_extraction(
+                drive.clone(),
+                origin.to_owned(),
+                directory.path().to_path_buf(),
+                archive_path,
+                directory.path().join("created"),
+            )
+            .await;
+        let coordinator = super::CompanionArchiveExtractionCoordinator::direct_local_from_session(
+            std::sync::Arc::clone(&sessions),
+            execution.execution_id.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            coordinator.execute(state.0.clone()).await.unwrap(),
+            super::CompanionArchiveExtractionResult::DirectLocalStarted
+        ));
+        tokio::time::timeout(SETTLE_TIMEOUT, async {
+            loop {
+                let status = sessions.get(&drive, origin, &execution.execution_id).await.unwrap();
+                match status.phase {
+                    super::super::archive_sessions::ArchiveSessionPhase::Completed => break,
+                    super::super::archive_sessions::ArchiveSessionPhase::Failed => panic!("archive extraction failed: {status:?}"),
+                    _ => tokio::time::sleep(RETRY_INTERVAL).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let extracted = wait_for_paths(
+            &state.0,
+            &drive,
+            directory.path(),
+            &["created", "created/nested", "created/nested/child"],
+        )
+        .await;
+        assert_eq!(extracted.last_verified_at_ms, recursively_removed.last_verified_at_ms);
+        assert_eq!(
+            std::fs::read(directory.path().join("created/nested/child/data.txt")).unwrap(),
+            b"data"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_listing_preserves_drive_boundaries() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("directory-boundary-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        let listing = super::browse_list(
+            axum::extract::Path(drive.clone()),
+            axum::extract::Query(super::BrowseQuery { path: None }),
+        )
+        .await
+        .expect("drive root should be listed");
+        assert!(listing.0.items.is_empty());
+
+        let traversal = super::browse_list(
+            axum::extract::Path(drive.clone()),
+            axum::extract::Query(super::BrowseQuery {
+                path: Some("../outside".to_string()),
+            }),
+        )
+        .await;
+        assert!(matches!(traversal, Err(super::ApiError::BadRequest(_))));
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().expect("outside directory should be created");
+            std::os::unix::fs::symlink(outside.path(), directory.path().join("outside")).expect("symlink should be created");
+            let escape = super::browse_list(
+                axum::extract::Path(drive),
+                axum::extract::Query(super::BrowseQuery {
+                    path: Some("outside".to_string()),
+                }),
+            )
+            .await;
+            assert!(matches!(escape, Err(super::ApiError::Forbidden(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_listing_errors_have_safe_explicit_codes() {
+        use axum::response::IntoResponse;
+
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("directory-errors-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        std::fs::write(directory.path().join("file.txt"), b"content").expect("file should be created");
+
+        for (path, status, code) in [
+            ("missing", axum::http::StatusCode::NOT_FOUND, super::DIRECTORY_NOT_FOUND_CODE),
+            ("missing/child", axum::http::StatusCode::NOT_FOUND, super::DIRECTORY_NOT_FOUND_CODE),
+            ("file.txt", axum::http::StatusCode::CONFLICT, super::NOT_A_DIRECTORY_CODE),
+            ("file.txt/child", axum::http::StatusCode::CONFLICT, super::NOT_A_DIRECTORY_CODE),
+            (
+                "file.txt/child/grandchild",
+                axum::http::StatusCode::CONFLICT,
+                super::NOT_A_DIRECTORY_CODE,
+            ),
+        ] {
+            let error = super::browse_list(
+                axum::extract::Path(drive.clone()),
+                axum::extract::Query(super::BrowseQuery {
+                    path: Some(path.to_string()),
+                }),
+            )
+            .await
+            .expect_err("invalid directory should fail");
+            let response = error.into_response();
+            assert_eq!(response.status(), status, "path: {path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+            assert_eq!(body["code"], code);
+            assert!(!body.to_string().contains(&directory.path().display().to_string()));
+        }
+    }
+
+    #[test]
+    fn missing_path_errors_distinguish_file_parents_on_all_platforms() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        std::fs::write(directory.path().join("file.txt"), b"content").expect("file should be created");
+        for (path, expected) in [
+            ("missing/child", std::io::ErrorKind::NotFound),
+            ("file.txt/child", std::io::ErrorKind::NotADirectory),
+            ("file.txt/child/grandchild", std::io::ErrorKind::NotADirectory),
+        ] {
+            let error = super::normalize_path_io_error(std::io::ErrorKind::NotFound.into(), &directory.path().join(path));
+            assert_eq!(error.kind(), expected, "path: {path}");
+        }
+        let error = super::normalize_path_io_error(
+            std::io::ErrorKind::PermissionDenied.into(),
+            &directory.path().join("file.txt/child"),
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn directory_listing_io_errors_do_not_expose_os_details() {
+        use axum::response::IntoResponse;
+
+        for (kind, status, code) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                axum::http::StatusCode::FORBIDDEN,
+                super::DIRECTORY_ACCESS_DENIED_CODE,
+            ),
+            (
+                std::io::ErrorKind::Other,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                super::DIRECTORY_UNAVAILABLE_CODE,
+            ),
+        ] {
+            let response = super::map_directory_io_error(
+                std::io::Error::new(kind, "private OS details"),
+                std::path::Path::new("private-path"),
+            )
+            .into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+            assert_eq!(body["code"], code);
+            assert!(!body.to_string().contains("private"));
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_listing_unavailable_drive_is_not_a_missing_folder() {
+        for drive in [
+            format!("unknown-{}", uuid::Uuid::new_v4()),
+            format!("removed-{}", uuid::Uuid::new_v4()),
+        ] {
+            let directory = tempfile::tempdir().expect("temporary drive should be created");
+            if drive.starts_with("removed-") {
+                super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+            }
+            directory.close().expect("drive should be removed");
+            let error = super::browse_list(
+                axum::extract::Path(drive),
+                axum::extract::Query(super::BrowseQuery {
+                    path: Some("missing".to_string()),
+                }),
+            )
+            .await
+            .expect_err("unavailable drive should fail");
+            assert!(matches!(error, super::ApiError::NotFound(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_access_probe_preserves_existing_content() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("notes.txt");
+        tokio::fs::write(&path, b"existing content").await.unwrap();
+        super::check_editor_write_access(&path).await.expect("writable file should pass");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing content");
+    }
+
+    #[tokio::test]
+    async fn editor_access_probe_does_not_create_missing_files() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("missing.txt");
+        let response = super::check_editor_write_access(&path)
+            .await
+            .expect_err("missing target should fail")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(!path.exists());
+        let response = super::check_editor_write_access(directory.path())
+            .await
+            .expect_err("directory target should fail")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn editor_access_probe_rejects_read_only_files() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("notes.txt");
+        tokio::fs::write(&path, b"read-only content").await.unwrap();
+        let original_permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        tokio::fs::set_permissions(&path, read_only_permissions).await.unwrap();
+        let result = super::check_editor_write_access(&path).await;
+        tokio::fs::set_permissions(&path, original_permissions).await.unwrap();
+        assert_eq!(
+            result.expect_err("read-only target should fail").into_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"read-only content");
+    }
+
+    #[tokio::test]
+    async fn local_rename_changes_only_case_for_files_and_directories() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("rename-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+
+        for (old_name, new_name, is_directory) in [("A.PDF", "A.pdf", false), ("FOLDER", "folder", true)] {
+            let source = directory.path().join(old_name);
+            if is_directory {
+                tokio::fs::create_dir(&source).await.expect("source directory should be created");
+            } else {
+                tokio::fs::write(&source, b"content").await.expect("source file should be created");
+            }
+
+            let response = super::browse_rename(
+                directory_mutation_state(directory.path()),
+                axum::extract::Path(drive.clone()),
+                axum::Json(super::RenameRequest {
+                    path: old_name.to_string(),
+                    new_name: new_name.to_string(),
+                }),
+            )
+            .await
+            .expect("case-only rename should succeed");
+
+            assert_eq!(response.0.name, new_name);
+            assert_eq!(response.0.path, new_name);
+            assert!(directory.path().join(new_name).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_rename_rejects_a_different_existing_item() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("rename-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        tokio::fs::write(directory.path().join("source.txt"), b"source")
+            .await
+            .expect("source should be created");
+        tokio::fs::write(directory.path().join("target.txt"), b"target")
+            .await
+            .expect("target should be created");
+
+        let response = super::browse_rename(
+            directory_mutation_state(directory.path()),
+            axum::extract::Path(drive),
+            axum::Json(super::RenameRequest {
+                path: "source.txt".to_string(),
+                new_name: "target.txt".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(response, Err(crate::server::errors::ApiError::Conflict(_))));
+        assert_eq!(tokio::fs::read(directory.path().join("source.txt")).await.unwrap(), b"source");
+        assert_eq!(tokio::fs::read(directory.path().join("target.txt")).await.unwrap(), b"target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_rename_rejects_aliases_to_the_source() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("rename-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        let source = directory.path().join("source.txt");
+        tokio::fs::write(&source, b"source").await.expect("source should be created");
+        std::fs::hard_link(&source, directory.path().join("hard-link.txt")).expect("hard link should be created");
+        std::os::unix::fs::symlink(&source, directory.path().join("symbolic-link.txt")).expect("symbolic link should be created");
+
+        for alias in ["hard-link.txt", "symbolic-link.txt"] {
+            let response = super::browse_rename(
+                directory_mutation_state(directory.path()),
+                axum::extract::Path(drive.clone()),
+                axum::Json(super::RenameRequest {
+                    path: "source.txt".to_string(),
+                    new_name: alias.to_string(),
+                }),
+            )
+            .await;
+
+            assert!(matches!(response, Err(crate::server::errors::ApiError::Conflict(_))));
+            assert!(source.exists());
+            assert!(directory.path().join(alias).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_rename_rejects_case_variant_hard_link() {
+        let directory = tempfile::tempdir().expect("temporary drive should be created");
+        let drive = format!("rename-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive.clone(), directory.path().to_path_buf());
+        let source = directory.path().join("A.PDF");
+        let target = directory.path().join("A.pdf");
+        tokio::fs::write(&source, b"source").await.expect("source should be created");
+        std::fs::hard_link(&source, &target).expect("case-variant hard link should be created");
+
+        let response = super::browse_rename(
+            directory_mutation_state(directory.path()),
+            axum::extract::Path(drive),
+            axum::Json(super::RenameRequest {
+                path: "A.PDF".to_string(),
+                new_name: "A.pdf".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(response, Err(crate::server::errors::ApiError::Conflict(_))));
+        assert!(source.exists());
+        assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn active_viewer_files_are_downloaded() {
+        let directory = tempfile::tempdir().expect("temporary viewer directory should be created");
+        let drive_id = format!("test-drive-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive_id.clone(), directory.path().to_path_buf());
+
+        for filename in ["page.html", "icon.svg", "page.xhtml", "r\u{e9}sum\u{e9} draft.html", "readme.txt"] {
+            std::fs::write(directory.path().join(filename), b"content").expect("viewer file should be created");
+            let response = super::viewer_file(
+                axum::extract::Path(drive_id.clone()),
+                axum::extract::Query(super::ViewerQuery {
+                    path: Some(filename.to_string()),
+                    viewport_width: None,
+                    viewport_height: None,
+                    no_resizing: None,
+                }),
+            )
+            .await
+            .expect("viewer response should succeed");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            let disposition = response.headers()["content-disposition"].to_str().unwrap();
+            assert_eq!(disposition.starts_with("attachment"), filename != "readme.txt");
+            if filename == "r\u{e9}sum\u{e9} draft.html" {
+                assert_eq!(disposition, "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9%20draft.html");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn active_archive_members_are_downloaded() {
+        let _resolver_test_guard = super::INSPECTION_RESOLVER_TEST_LOCK
+            .lock()
+            .expect("inspection resolver test lock should not be poisoned");
+        let directory = tempfile::tempdir().expect("temporary archive directory should be created");
+        let archive_path = directory.path().join("archive.zip");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&archive_path).expect("archive should be created"));
+        for filename in [
+            "page.html",
+            "icon.svg",
+            "page.xhtml",
+            "r\u{e9}sum\u{e9} \"draft\".html",
+            "readme.txt",
+        ] {
+            archive
+                .start_file(filename, zip::write::SimpleFileOptions::default())
+                .expect("entry should start");
+            std::io::Write::write_all(&mut archive, b"content").expect("entry should be written");
+        }
+        archive.finish().expect("archive should finish");
+        let drive_id = format!("test-drive-{}", uuid::Uuid::new_v4());
+        super::drives::register_test_drive_path(drive_id.clone(), directory.path().to_path_buf());
+
+        for filename in [
+            "page.html",
+            "icon.svg",
+            "page.xhtml",
+            "r\u{e9}sum\u{e9} \"draft\".html",
+            "readme.txt",
+        ] {
+            let response = super::viewer_archive_member(
+                axum::extract::Path(drive_id.clone()),
+                axum::extract::Query(super::ArchiveMemberQuery {
+                    archive_path: "archive.zip".to_string(),
+                    member_path: filename.to_string(),
+                    download: false,
+                }),
+            )
+            .await
+            .expect("archive member response should succeed");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            let disposition = response.headers()["content-disposition"].to_str().unwrap();
+            assert_eq!(disposition.starts_with("attachment"), filename != "readme.txt");
+            if filename == "r\u{e9}sum\u{e9} \"draft\".html" {
+                assert_eq!(disposition, "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9%20%22draft%22.html");
+            }
+        }
+    }
+
     use super::{
-        archive_creation_response, archive_execution_response, browse_list_archive, browse_stream_transfer, build_file_info,
-        build_pair_status_response, classify_link_target, complete_transfer_receipt, copy_regular_file_exclusively, execute_archive_relay,
-        extract_local_archive_to_smb_destination_live, extract_smb_archive_to_local_live, inspection_resolver_call_count,
-        is_retryable_live_archive_stream_failure, map_local_archive_error, normalize_drive_relative_path, normalize_windows_display_path,
+        archive_creation_response, archive_execution_response, browse_list_archive, browse_stream_transfer, build_pair_status_response,
+        complete_transfer_receipt, copy_regular_file_exclusively, execute_archive_relay, extract_local_archive_to_smb_destination_live,
+        extract_smb_archive_to_local_live, inspection_resolver_call_count, is_retryable_live_archive_stream_failure,
+        map_local_archive_error, map_temporary_archive_error, normalize_drive_relative_path, normalize_windows_display_path,
         replay_transfer_outcome, reserve_transfer_receipt, reset_inspection_resolver_call_count, resolve_companion_archive_topology,
         resolve_companion_creation_coordinator, resolve_companion_extraction_coordinator, resolve_companion_inspection_coordinator,
-        resolve_drive_relative_source_path, resolve_link_target_metadata, resolve_local_archive_inspection_coordinator,
-        resolve_pair_cancel_origin, resolve_pair_confirm_origin, resolve_pair_status_origin, resolve_safe_path, source_link_kind,
+        resolve_local_archive_inspection_coordinator, resolve_pair_cancel_origin, resolve_pair_confirm_origin, resolve_pair_status_origin,
         transfer_receipt_error, validate_editor_write_target, viewer_archive_member, write_local_archive_member_chunk,
         ArchiveCreationAdapterBinding, ArchiveCreationMemberCompletion, ArchiveCreationRelay, ArchiveExtractionRelay, ArchiveListQuery,
         ArchiveMemberQuery, ArchiveRelayBinding, ArchiveRelayFailure, ArchiveRelayTransport, CompanionArchiveCreationPlan,
@@ -6355,24 +7676,103 @@ mod tests {
         StreamTransferQuery, TransferCancellationReservation, TransferReceiptLookup, TransferReceiptOutcome, TransferReceiptReservation,
         ARCHIVE_RELAY_ACKNOWLEDGEMENT_ATTEMPTS, INSPECTION_RESOLVER_TEST_LOCK,
     };
+    #[cfg(unix)]
+    use super::{
+        build_file_info, classify_link_target, resolve_drive_relative_source_path, resolve_link_target_metadata, resolve_safe_path,
+        source_link_kind,
+    };
     use crate::server::archive::{
-        build_local_archive_manifest, build_local_archive_manifest_for_remote_target, create_local_archive,
+        build_local_archive_manifest, build_local_archive_manifest_for_remote_target, create_local_archive, create_temporary_local_archive,
         resolve_companion_archive_inspection_topology_plan, resolve_companion_archive_topology_plan, ArchiveCreationManifest,
         ArchiveCreationManifestMember, ArchiveDirectoryListingPresentation, ArchiveInspectionPlan, ArchiveInspectionPresentation,
         CompanionArchiveBinding, CompanionArchiveExecutionDriver, CompanionArchiveOperationKind, CompanionArchiveTopology,
         CompanionArchiveTopologyPlan, LocalArchiveCreationResult, LocalArchiveEntry, LocalArchiveError, LocalArchiveExtractionMemberError,
-        LocalArchiveExtractionResult, LocalArchiveInspectionSource, LocalArchiveReadError, ARCHIVE_INLINE_PREVIEW_MAX_BYTES,
+        LocalArchiveExtractionResult, LocalArchiveInspectionSource, LocalArchiveReadError,
     };
     use crate::server::archive_sessions::{
         ArchiveSessionKind, ArchiveSessionManager, ArchiveSessionPendingDecision, ArchiveSessionPhase, ArchiveSessionProgress,
         ArchiveSessionStatus, LiveLocalArchiveSourcePhase, LiveLocalArchiveSourceSession,
     };
     use crate::server::errors::{ApiError, LOCAL_ARCHIVE_CREATION_PARTIAL_CODE};
-    use crate::server::models::{
-        ArchiveContractVersion, ArchiveCreationResponse, FileType, LinkKind, LinkTargetState, LinkTargetType, PublicPairingStatus,
-    };
-    use crate::server::pairing::PairingState;
+    use crate::server::models::{ArchiveContractVersion, ArchiveCreationResponse, FileType, PublicPairingStatus};
+    #[cfg(unix)]
+    use crate::server::models::{LinkKind, LinkTargetState, LinkTargetType};
+    use crate::server::pairing::{PairingState, VerifiedOriginRecordReason};
     use crate::server::target_resolution::TargetResolutionPolicy;
+
+    #[test]
+    fn local_download_intent_can_be_redeemed_only_once() {
+        let intents = std::sync::Mutex::new(std::collections::HashMap::from([(
+            "ticket".to_string(),
+            crate::server::DownloadIntent {
+                origin: "https://example.com".to_string(),
+                drive: "test".to_string(),
+                path: "report.txt".to_string(),
+                member_path: None,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(90),
+            },
+        )]));
+        assert!(super::consume_download_intent(&intents, "ticket").is_ok());
+        assert!(matches!(
+            super::consume_download_intent(&intents, "ticket"),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn unpair_revokes_only_its_download_intents() {
+        let pairing = PairingState::new();
+        *pairing.download_intents.lock().unwrap() = std::collections::HashMap::from([
+            (
+                "revoked".to_string(),
+                crate::server::DownloadIntent {
+                    origin: "https://first.example".to_string(),
+                    drive: "test".to_string(),
+                    path: "report.txt".to_string(),
+                    member_path: None,
+                    expires_at: std::time::Instant::now() + std::time::Duration::from_secs(90),
+                },
+            ),
+            (
+                "kept".to_string(),
+                crate::server::DownloadIntent {
+                    origin: "https://second.example".to_string(),
+                    drive: "test".to_string(),
+                    path: "report.txt".to_string(),
+                    member_path: None,
+                    expires_at: std::time::Instant::now() + std::time::Duration::from_secs(90),
+                },
+            ),
+        ]);
+        pairing.unpair("https://first.example").unwrap();
+        pairing.record_verified_origin("https://first.example", VerifiedOriginRecordReason::PairingCompleted);
+        assert!(matches!(
+            super::consume_download_intent(&pairing.download_intents, "revoked"),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(super::consume_download_intent(&pairing.download_intents, "kept").is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_stream_reports_validation_failure_after_reader_eof() {
+        let (writer, reader) = tokio::io::duplex(8);
+        let (sender, completion) = tokio::sync::oneshot::channel();
+        drop(writer);
+        sender.send(Err(std::io::Error::other("ZIP checksum mismatch"))).unwrap();
+        let mut stream = super::VerifiedArchiveStream { reader, completion };
+        let mut bytes = Vec::new();
+        let error = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut bytes).await.unwrap_err();
+        assert!(error.to_string().contains("ZIP checksum mismatch"));
+    }
+
+    #[test]
+    fn temporary_archive_cap_reports_payload_too_large() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("sample.txt"), b"sample content").unwrap();
+        let entries = build_local_archive_manifest_for_remote_target(&[source.path().join("sample.txt")]).unwrap();
+        let error = create_temporary_local_archive(&entries, 10, || false).unwrap_err();
+        assert!(matches!(map_temporary_archive_error(error), ApiError::PayloadTooLarge(_)));
+    }
     use axum::body::{to_bytes, Body};
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -6473,7 +7873,9 @@ mod tests {
 
     #[tokio::test]
     async fn move_route_validates_the_source_drive() {
+        let cache = tempfile::tempdir().unwrap();
         let response = super::browse_move(
+            directory_mutation_state(cache.path()),
             Path("missing-drive".to_string()),
             axum::Json(CopyMoveRequest {
                 source_path: "source.txt".to_string(),
@@ -6502,6 +7904,7 @@ mod tests {
         tokio::fs::write(&source, b"report").await.expect("source should be written");
 
         let result = super::execute_browse_move(
+            &directory_mutation_state(destination_directory.path()).0,
             &source_drive,
             &CopyMoveRequest {
                 source_path: "report.txt".to_string(),
@@ -6542,6 +7945,7 @@ mod tests {
             .expect("source directory should be written");
 
         let result = super::execute_browse_copy(
+            &directory_mutation_state(destination_directory.path()).0,
             &source_drive,
             &CopyMoveRequest {
                 source_path: "documents".to_string(),
@@ -6580,6 +7984,7 @@ mod tests {
 
         for policy in ["ask", "skip", "replace", "replace_older"] {
             let result = super::execute_browse_copy(
+                &directory_mutation_state(destination_directory.path()).0,
                 &source_drive,
                 &CopyMoveRequest {
                     source_path: "documents".to_string(),
@@ -6618,6 +8023,7 @@ mod tests {
         tokio::fs::create_dir(&source).await.expect("source directory should be written");
 
         let result = super::execute_browse_move(
+            &directory_mutation_state(destination_directory.path()).0,
             &source_drive,
             &CopyMoveRequest {
                 source_path: "documents".to_string(),
@@ -6639,16 +8045,31 @@ mod tests {
 
     #[tokio::test]
     async fn local_streamed_destination_publishes_only_after_complete_body() {
+        let corpus_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive-contract/v2/fixtures/browser-file-publish-scenarios-v2.json");
+        let corpus: serde_json::Value = serde_json::from_slice(&std::fs::read(corpus_path).unwrap()).unwrap();
+        let scenario = &corpus["staged_publish"];
         let directory = tempfile::tempdir().expect("temporary transfer directory should be created");
-        let target = directory.path().join("target.txt");
+        let target = directory.path().join(scenario["target_path"].as_str().unwrap());
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
 
-        let bytes_written = super::stage_local_request_body(&target, Body::from("streamed content"), 16, false)
-            .await
-            .expect("streamed destination should publish");
+        let bytes_written = super::stage_local_request_body(
+            &target,
+            Body::from(scenario["contents"].as_str().unwrap().to_owned()),
+            scenario["expected_size"].as_u64().unwrap(),
+            false,
+        )
+        .await
+        .expect("streamed destination should publish");
 
-        assert_eq!(bytes_written, 16);
-        assert_eq!(tokio::fs::read(&target).await.expect("target should exist"), b"streamed content");
-        let entries = std::fs::read_dir(directory.path()).expect("directory should be readable").count();
+        assert_eq!(bytes_written, scenario["expected_size"].as_u64().unwrap());
+        assert_eq!(
+            tokio::fs::read(&target).await.expect("target should exist"),
+            scenario["contents"].as_str().unwrap().as_bytes()
+        );
+        let entries = std::fs::read_dir(target.parent().unwrap())
+            .expect("directory should be readable")
+            .count();
         assert_eq!(entries, 1);
     }
 
@@ -6687,6 +8108,7 @@ mod tests {
         tokio::fs::write(&target, b"existing").await.expect("target should be written");
 
         let response = browse_stream_transfer(
+            directory_mutation_state(directory.path()),
             Path(drive),
             Query(StreamTransferQuery {
                 path: "target.txt".to_string(),
@@ -6712,6 +8134,7 @@ mod tests {
         tokio::fs::write(&target, b"existing").await.expect("target should be written");
 
         let response = browse_stream_transfer(
+            directory_mutation_state(directory.path()),
             Path(drive),
             Query(StreamTransferQuery {
                 path: "target.txt".to_string(),
@@ -6745,6 +8168,7 @@ mod tests {
 
         for source_modified_at in [target_mtime - chrono::Duration::seconds(1), target_mtime] {
             let response = browse_stream_transfer(
+                directory_mutation_state(directory.path()),
                 Path(drive.clone()),
                 Query(StreamTransferQuery {
                     path: "target.txt".to_string(),
@@ -6762,6 +8186,7 @@ mod tests {
         }
 
         let response = browse_stream_transfer(
+            directory_mutation_state(directory.path()),
             Path(drive),
             Query(StreamTransferQuery {
                 path: "target.txt".to_string(),
@@ -6788,6 +8213,7 @@ mod tests {
         tokio::fs::write(&target, b"existing").await.expect("target should be written");
 
         let response = browse_stream_transfer(
+            directory_mutation_state(directory.path()),
             Path(drive),
             Query(StreamTransferQuery {
                 path: "target.txt".to_string(),
@@ -6807,17 +8233,32 @@ mod tests {
 
     #[tokio::test]
     async fn local_streamed_destination_discards_a_truncated_body() {
+        let corpus_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive-contract/v2/fixtures/browser-file-publish-scenarios-v2.json");
+        let corpus: serde_json::Value = serde_json::from_slice(&std::fs::read(corpus_path).unwrap()).unwrap();
+        let scenario = &corpus["staged_publish"];
         let directory = tempfile::tempdir().expect("temporary transfer directory should be created");
-        let target = directory.path().join("target.txt");
+        let target = directory.path().join(scenario["target_path"].as_str().unwrap());
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
 
-        let error = super::stage_local_request_body(&target, Body::from("short"), 16, false)
-            .await
-            .expect_err("truncated body must not publish a destination");
+        let error = super::stage_local_request_body(
+            &target,
+            Body::from(scenario["truncated_contents"].as_str().unwrap().to_owned()),
+            scenario["expected_size"].as_u64().unwrap(),
+            false,
+        )
+        .await
+        .expect_err("truncated body must not publish a destination");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!target.exists());
-        let entries = std::fs::read_dir(directory.path()).expect("directory should be readable").count();
-        assert_eq!(entries, 0);
+        let entries = std::fs::read_dir(target.parent().unwrap())
+            .expect("directory should be readable")
+            .count();
+        assert_eq!(
+            entries,
+            scenario["expected_artifacts_after_size_mismatch"].as_u64().unwrap() as usize
+        );
     }
 
     #[tokio::test]
@@ -7131,6 +8572,7 @@ mod tests {
         .await
         .expect("archive member route should succeed");
         assert_eq!(member_response.headers()["content-type"], "text/plain");
+        assert_eq!(member_response.headers()["content-length"], "6");
         assert_eq!(to_bytes(member_response.into_body(), usize::MAX).await.unwrap(), "source");
         assert_eq!(inspection_resolver_call_count(), 3);
 
@@ -7174,7 +8616,7 @@ mod tests {
         )
         .await
         .expect_err("unavailable archive member should be rejected");
-        assert!(matches!(unavailable_member, ApiError::BadRequest(message) if message.contains("unavailable codec")));
+        assert!(matches!(unavailable_member, ApiError::BadRequest(message) if message.contains("unsupported compression")));
         assert_eq!(inspection_resolver_call_count(), 6);
 
         let encrypted_target = directory.path().join("encrypted.zip");
@@ -7190,16 +8632,17 @@ mod tests {
         )
         .await
         .expect_err("encrypted archive member should be rejected");
-        assert!(matches!(encrypted_member, ApiError::BadRequest(message) if message.contains("blocked feature")));
+        assert!(matches!(encrypted_member, ApiError::BadRequest(message) if message.contains("encrypted")));
         assert_eq!(inspection_resolver_call_count(), 7);
 
         let large_source = directory.path().join("large.txt");
         let large_target = directory.path().join("large.zip");
-        std::fs::write(&large_source, vec![b'x'; (ARCHIVE_INLINE_PREVIEW_MAX_BYTES + 1) as usize])
-            .expect("large source file should be written");
+        const LARGE_MEMBER_TEST_BYTES: usize = 6 * 1024 * 1024;
+        let content = vec![b'x'; LARGE_MEMBER_TEST_BYTES];
+        std::fs::write(&large_source, &content).expect("large source file should be written");
         let large_entries = build_local_archive_manifest(&[large_source], &large_target).expect("large archive manifest should be built");
         create_local_archive(directory.path(), &large_target, &large_entries, || false).expect("large archive should be created");
-        let oversized_preview = viewer_archive_member(
+        let large_preview = viewer_archive_member(
             Path(drive_id),
             Query(ArchiveMemberQuery {
                 archive_path: "large.zip".to_string(),
@@ -7208,8 +8651,12 @@ mod tests {
             }),
         )
         .await
-        .expect_err("oversized archive preview should be rejected");
-        assert!(matches!(oversized_preview, ApiError::PayloadTooLarge(message) if message.contains("inline preview size limit")));
+        .expect("large archive preview should succeed");
+        assert_eq!(large_preview.headers()["content-length"], content.len().to_string());
+        assert_eq!(
+            to_bytes(large_preview.into_body(), LARGE_MEMBER_TEST_BYTES).await.unwrap().as_ref(),
+            content
+        );
         assert_eq!(inspection_resolver_call_count(), 8);
     }
 
@@ -7719,7 +9166,34 @@ mod tests {
                 "/member-complete",
                 axum::routing::post(|| async { (StatusCode::OK, "ignored response") }),
             )
-            .route("/fail", axum::routing::post(|| async { StatusCode::CONFLICT }));
+            .route("/fail", axum::routing::post(|| async { StatusCode::CONFLICT }))
+            .route(
+                "/v2-error",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({"code": "source_changed", "message": "Archive creation source changed"})),
+                    )
+                }),
+            )
+            .route(
+                "/legacy-error",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({"detail": "Archive operation was cancelled"})),
+                    )
+                }),
+            )
+            .route(
+                "/unknown-code",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({"code": "future_code", "message": "Future backend failure"})),
+                    )
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("relay transport test server should bind");
@@ -7803,6 +9277,33 @@ mod tests {
         assert!(
             matches!(failure_error, ApiError::Conflict(message) if message.as_str().is_some_and(|value| value.contains("record failure")))
         );
+    }
+
+    #[tokio::test]
+    async fn archive_relay_transport_preserves_error_envelopes() {
+        let transport = ArchiveRelayTransport::new(
+            reqwest::Client::new(),
+            spawn_archive_relay_transport_test_server().await,
+            "test-token".to_string(),
+        );
+        for (path, code, message) in [
+            ("v2-error", "source_changed", "Archive creation source changed"),
+            ("legacy-error", "cancelled", "Archive operation was cancelled"),
+            ("unknown-code", "invalid_operation_state", "Future backend failure"),
+        ] {
+            let error = transport
+                .post_json_without_result(path, &serde_json::json!({}), "Archive test", "read member")
+                .await
+                .expect_err("failed relay responses must return their problem details");
+            let response = super::ArchiveV2Error::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("problem response should be readable");
+            let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem response should be JSON");
+            assert_eq!(problem["code"], code);
+            assert!(problem["message"].as_str().is_some_and(|text| text.contains(message)));
+        }
     }
 
     #[tokio::test]
@@ -8309,9 +9810,14 @@ mod tests {
             playback.url.clone(),
             "test-token".to_string(),
         ));
-        let result = extract_smb_archive_to_local_live(&relay, directory.path().to_path_buf(), destination_path.clone())
-            .await
-            .expect("SMB-to-local live relay should complete");
+        let result = extract_smb_archive_to_local_live(
+            directory_mutation_state(directory.path()).0,
+            &relay,
+            directory.path().to_path_buf(),
+            destination_path.clone(),
+        )
+        .await
+        .expect("SMB-to-local live relay should complete");
 
         assert_eq!(
             (
@@ -8449,9 +9955,14 @@ mod tests {
             playback.url.clone(),
             "test-token".to_string(),
         ));
-        let result = extract_smb_archive_to_local_live(&relay, directory.path().to_path_buf(), destination_path)
-            .await
-            .expect("source integrity failure should surface the live retry decision");
+        let result = extract_smb_archive_to_local_live(
+            directory_mutation_state(directory.path()).0,
+            &relay,
+            directory.path().to_path_buf(),
+            destination_path,
+        )
+        .await
+        .expect("source integrity failure should surface the live retry decision");
 
         assert_eq!(result.phase, Some("awaiting_user_decision"));
         assert_eq!(result.members_processed, 0);
@@ -8559,6 +10070,8 @@ mod tests {
             members_processed: 5,
             members_completed: 2,
             members_skipped: 3,
+            encrypted_members_skipped: 1,
+            unsupported_compression_members_skipped: 2,
             members_failed: 0,
             files_extracted: 2,
             directories_created: 1,
@@ -8597,6 +10110,8 @@ mod tests {
                 "members_processed": 5,
                 "members_completed": 2,
                 "members_skipped": 3,
+                "encrypted_members_skipped": 1,
+                "unsupported_compression_members_skipped": 2,
                 "members_failed": 0,
                 "files_extracted": 2,
                 "directories_created": 1,
@@ -8619,6 +10134,8 @@ mod tests {
                 members_processed: 0,
                 members_completed: 0,
                 members_skipped: 0,
+                encrypted_members_skipped: 0,
+                unsupported_compression_members_skipped: 0,
                 members_failed: 0,
                 files_extracted: 0,
                 directories_created: 1,
@@ -8726,16 +10243,49 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let target = directory.path().join("recreated.md");
 
+        let response = super::check_editor_write_access(&target)
+            .await
+            .expect_err("a lock must not be acquired for a removed target")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
         validate_editor_write_target(&target)
             .await
-            .expect("a missing editor target should be recreatable");
+            .expect("an editor save can recreate a removed target");
+        assert!(!target.exists());
 
         tokio::fs::create_dir(&target).await.expect("target directory should be created");
         let response = validate_editor_write_target(&target)
             .await
             .expect_err("an editor write must not replace a directory")
             .into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let response = super::check_editor_write_access(&target)
+            .await
+            .expect_err("a lock must not be acquired for a directory")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn file_io_errors_use_safe_named_codes() {
+        for (kind, code) in [
+            (std::io::ErrorKind::NotFound, super::ITEM_NOT_FOUND_CODE),
+            (std::io::ErrorKind::NotADirectory, super::NOT_A_FILE_CODE),
+            (std::io::ErrorKind::IsADirectory, super::NOT_A_FILE_CODE),
+            (std::io::ErrorKind::PermissionDenied, super::FILE_ACCESS_DENIED_CODE),
+            (std::io::ErrorKind::TimedOut, super::FILE_TIMEOUT_CODE),
+            (std::io::ErrorKind::Other, super::FILE_UNAVAILABLE_CODE),
+        ] {
+            let response = super::map_file_io_error(std::io::Error::new(kind, "private OS detail"), std::path::Path::new("private-path"))
+                .into_response();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body should be readable");
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("error body should be JSON");
+            assert_eq!(payload["code"], code);
+            assert!(!payload.to_string().contains("private"));
+        }
     }
 
     #[tokio::test]

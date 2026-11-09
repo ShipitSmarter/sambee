@@ -1,9 +1,46 @@
+import importlib.util
+import json
 import re
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
+import pytest
 import yaml
 
 WORKSPACE = Path(__file__).parents[2]
+
+
+@pytest.mark.parametrize("cleanup_error", [subprocess.TimeoutExpired("taskkill", 15), subprocess.CalledProcessError(1, "taskkill")])
+def test_companion_recovery_smoke_kills_process_when_taskkill_fails(tmp_path, monkeypatch, cleanup_error):
+    script = WORKSPACE / "companion/scripts/recovery-smoke.py"
+    spec = importlib.util.spec_from_file_location("recovery_smoke", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    options = SimpleNamespace(executable=tmp_path / "companion.exe", report_dir=tmp_path, source_sha="test-sha", run_id="test-run")
+    monkeypatch.setattr(module.argparse.ArgumentParser, "parse_args", lambda self: options)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt", environ={}))
+    monkeypatch.setattr(module, "socket", SimpleNamespace(socket=MagicMock()))
+    opener = Mock()
+    opener.open.side_effect = RuntimeError("Controlled startup failure")
+    monkeypatch.setattr(module.urllib.request, "build_opener", lambda *args: opener)
+    process = Mock()
+    process.poll.return_value = None
+    cleanup = Mock(side_effect=cleanup_error)
+    monkeypatch.setattr(
+        module, "subprocess", SimpleNamespace(Popen=Mock(return_value=process), run=cleanup, SubprocessError=subprocess.SubprocessError)
+    )
+
+    assert module.main() == 1
+    process.kill.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=module.SHUTDOWN_TIMEOUT_SECONDS)
+    assert cleanup.call_args.kwargs["check"] is True
+    report = json.loads((tmp_path / "recovery.json").read_text(encoding="utf-8"))
+    assert report["passed"] is False
+    assert report["source_sha"] == options.source_sha
+    assert report["run_id"] == options.run_id
 
 
 def load_workflow(name: str) -> dict:
@@ -34,6 +71,38 @@ def step_uses(steps: list[dict], action: str) -> bool:
     return any(step.get("uses") == action for step in steps if isinstance(step, dict))
 
 
+@pytest.mark.parametrize("package", ["pydantic", "pydantic-core", "pydantic-settings"])
+def test_dependabot_requires_manual_pydantic_family_updates(package: str) -> None:
+    configuration = yaml.safe_load((WORKSPACE / ".github/dependabot.yml").read_text(encoding="utf-8"))
+    backend_update = next(
+        update for update in configuration["updates"] if update["package-ecosystem"] == "pip" and update["directory"] == "/backend"
+    )
+
+    assert {"dependency-name": package} in backend_update["ignore"]
+
+
+@pytest.mark.parametrize("directory", ["/frontend", "/companion"])
+def test_dependabot_requires_coordinated_biome_updates(directory: str) -> None:
+    configuration = yaml.safe_load((WORKSPACE / ".github/dependabot.yml").read_text(encoding="utf-8"))
+    npm_update = next(
+        update for update in configuration["updates"] if update["package-ecosystem"] == "npm" and update["directory"] == directory
+    )
+
+    assert {"dependency-name": "@biomejs/biome"} in npm_update["ignore"]
+
+
+@pytest.mark.parametrize("lockfile", ["requirements.lock.txt", "requirements-dev.lock.txt"])
+def test_backend_lockfile_workflow_checks_clean_hash_locked_resolution(lockfile: str) -> None:
+    workflow = load_workflow("check-backend-lockfiles.yml")
+    steps = workflow["jobs"]["backend-lockfiles"]["steps"]
+    setup_index = next(index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/setup-runtime-python")
+    resolution_index = next(index for index, step in enumerate(steps) if step.get("name") == "Validate hash-locked dependency resolution")
+
+    assert setup_index < resolution_index
+    assert f"python -m pip install --dry-run --ignore-installed --require-hashes -r backend/{lockfile}" in steps[resolution_index]["run"]
+    assert not steps[resolution_index].get("continue-on-error")
+
+
 def test_companion_promotion_index_refresh_only_rewrites_the_generated_index() -> None:
     workflow = load_workflow("refresh-companion-promotion-index.yml")
     refresh_job = workflow["jobs"]["refresh"]
@@ -57,6 +126,71 @@ def test_candidate_workflows_do_not_expose_source_or_version_overrides() -> None
     assert not forbidden_inputs & set(workflow_inputs(companion))
     assert "build_version" in workflow_inputs(docker)
     assert "build_version" in workflow_inputs(companion)
+
+
+def test_docker_release_reuses_only_verified_source_ci_jobs() -> None:
+    workflow = load_workflow("docker-image-preview-publish.yml")
+    validation = workflow["jobs"]["validate-tests"]
+    steps = validation["steps"]
+    lookup = next(step for step in steps if step.get("id") == "source-ci")
+
+    assert validation["permissions"]["actions"] == "read"
+    assert lookup["env"]["SOURCE_SHA"] == "${{ needs.prepare.outputs.checkout_ref }}"
+    assert lookup["run"] == "python .github/scripts/reuse_release_ci_tests.py"
+
+    backend_steps = (
+        "Install backend system dependencies",
+        "Install backend test dependencies",
+        "Generate backend test images",
+        "Run backend type checks",
+        "Run backend tests (excluding performance)",
+        "Run backend performance tests",
+    )
+    frontend_steps = (
+        "Set up Node.js",
+        "Install frontend dependencies",
+        "Verify frontend type correctness",
+        "Run frontend tests",
+        "Build production frontend for browser checks",
+        "Install browser dependencies",
+        "Run browser correctness contracts",
+    )
+    for component, names in (("backend", backend_steps), ("frontend", frontend_steps)):
+        for name in names:
+            step = next(step for step in steps if step.get("name") == name)
+            assert step["if"] == f"steps.source-ci.outputs.{component} != 'true'"
+
+
+def test_release_browser_checks_use_the_container_users_home() -> None:
+    workflow = load_workflow("docker-image-preview-publish.yml")
+    validation = workflow["jobs"]["validate-tests"]
+
+    assert validation["container"]["image"] == "${{ needs.prepare.outputs.python_runtime_image }}"
+    assert not validation["container"].get("options")
+    assert validation["env"]["HOME"] == "/root"
+    assert "HOME" not in workflow.get("env", {})
+    for step in validation["steps"]:
+        assert "HOME" not in step.get("env", {})
+
+
+def test_pr_browser_checks_are_required_by_the_test_gate() -> None:
+    workflow = load_workflow("test.yml")
+    trigger = workflow.get("on", workflow.get(True, {}))
+    assert "main" in trigger["pull_request"]["branches"]
+    assert "paths" not in trigger["pull_request"]
+    assert "paths-ignore" not in trigger["pull_request"]
+
+    frontend = workflow["jobs"]["frontend"]
+    assert frontend["needs"] == "changes"
+    assert frontend["if"] == "needs.changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch'"
+    assert not frontend.get("continue-on-error")
+    assert "HOME" not in workflow.get("env", {})
+    assert "HOME" not in frontend.get("env", {})
+
+    gate = workflow["jobs"]["test-gate"]
+    assert "frontend" in gate["needs"]
+    assert gate["if"] == "always()"
+    assert any(step.get("run", "").strip() == "python3 scripts/check_ci_test_gate.py" for step in gate["steps"])
 
 
 def test_candidate_matrix_builds_depend_on_shared_preflight() -> None:
@@ -134,6 +268,41 @@ def test_version_only_updates_skip_the_companion_package_build() -> None:
     package_build = jobs["windows-x64"]
     assert package_build["needs"] == "change-scope"
     assert package_build["if"] == "needs.change-scope.outputs.requires-build == 'true'"
+
+
+def test_companion_verification_packages_are_never_signed() -> None:
+    verification = load_workflow("verify-companion-build.yml")["jobs"]["windows-x64"]
+    steps = verification["steps"]
+    configure = next(step for step in steps if step.get("name") == "Configure verification-only Tauri bundle")
+    release_steps = load_workflow("build-companion.yml")["jobs"]["build"]["steps"]
+
+    assert not any(name.startswith("AZURE_") for name in verification["env"])
+    assert "AZURE_CLIENT_ID" in next(step for step in steps if step.get("name") == "Assert verification-only secret boundary")["run"]
+    assert "$config.bundle.windows.signCommand = $null" in configure["run"]
+    assert "if (" not in configure["run"]
+    assert not any("trusted-signing-cli" in step.get("run", "") for step in steps)
+    assert any(step.get("name") == "Install trusted-signing-cli" for step in release_steps)
+
+
+def test_companion_recovery_verification_builds_before_smoke_and_keeps_evidence() -> None:
+    workflow = load_workflow("verify-companion-build.yml")
+    assert set(workflow["jobs"]) == {"change-scope", "windows-x64"}
+    job = workflow["jobs"]["windows-x64"]
+    assert job["timeout-minutes"] <= 45
+    steps = job["steps"]
+    build = next(index for index, step in enumerate(steps) if step.get("name") == "Build Windows x64 package")
+    smoke = next(index for index, step in enumerate(steps) if step.get("name") == "Run packaged-process recovery smoke test")
+    assert build < smoke
+    assert "--features recovery-verification" in steps[build]["run"]
+    assert "--source-sha '${{ github.sha }}' --run-id '${{ github.run_id }}'" in steps[smoke]["run"]
+    assert steps[smoke]["timeout-minutes"] <= 5
+    artifact = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+    assert artifact["if"] == "${{ always() }}"
+    assert "${{ github.sha }}" in artifact["with"]["name"]
+    assert "recovery-report/" in artifact["with"]["path"]
+    assert not any(
+        "recovery-verification" in step.get("run", "") for step in load_workflow("build-companion.yml")["jobs"]["build"]["steps"]
+    )
 
 
 def test_workflow_output_references_use_direct_dependencies() -> None:

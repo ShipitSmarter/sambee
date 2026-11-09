@@ -1,18 +1,24 @@
 import { Alert, Box, Button, Container, Divider, Paper, TextField, Typography } from "@mui/material";
 import type React from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
+import { SettingsPasswordVisibilityToggle } from "../components/Settings/SettingsPasswordVisibilityToggle";
+import { useRemoveLocationFragment } from "../hooks/useRemoveLocationFragment";
 import { login } from "../services/api";
 import { type AuthConfig, getAuthConfig } from "../services/authConfig";
+import { authSession } from "../services/authSession";
 import { logger } from "../services/logger";
 import {
   completeAuthentication,
   loginReturnPath,
   OIDC_ATTEMPT_MARKER,
+  OIDC_LOGIN_CHANNEL,
   OIDC_LOGOUT_MARKER,
+  OIDC_RETURN_PATH_MARKER,
   startOidcAuthorization,
 } from "../services/oidcAuth";
+import { PASSWORD_CHANGED_MARKER } from "../services/passwordChange";
 
 const OIDC_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   oidc_authorization_state_invalid: "This sign-in request expired or is invalid. Start again.",
@@ -28,7 +34,6 @@ const OIDC_ERROR_MESSAGES: Readonly<Record<string, string>> = {
     "Your administrator access changed and no local password exists. Restore the administrator group at the identity provider.",
   oidc_rate_limited: "Too many sign-in attempts. Wait and try again.",
 };
-const PASSWORD_CHANGED_MARKER = "sambee_password_changed";
 
 const oidcErrorFromFragment = (): string => {
   const code = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("error");
@@ -38,8 +43,10 @@ const oidcErrorFromFragment = (): string => {
 const Login: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const removeLocationFragment = useEffectEvent(useRemoveLocationFragment());
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState(oidcErrorFromFragment);
   const [isLoading, setIsLoading] = useState(true);
   const [configurationUnavailable, setConfigurationUnavailable] = useState(false);
@@ -47,26 +54,119 @@ const Login: React.FC = () => {
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [oidcOnlyState, setOidcOnlyState] = useState<"redirecting" | "failed" | "signed-out" | null>(null);
   const [returnPath] = useState(() => loginReturnPath(window.location.search));
+  const signInMode = useRef<AuthConfig["sign_in_mode"] | null>(null);
+  const recoveryPromise = useRef<Promise<void> | null>(null);
+  const recoveredInAnotherTab = useRef(false);
+  const passwordLoginPending = useRef(false);
   const [passwordChanged] = useState(() => {
     const changed = sessionStorage.getItem(PASSWORD_CHANGED_MARKER) === "1";
     sessionStorage.removeItem(PASSWORD_CHANGED_MARKER);
     return changed;
   });
 
+  const restoreAuthenticatedSession = useEffectEvent(() => {
+    if (
+      recoveredInAnotherTab.current ||
+      passwordLoginPending.current ||
+      sessionStorage.getItem(OIDC_LOGOUT_MARKER) ||
+      !authSession.hasUsableAccessToken()
+    )
+      return false;
+    recoveredInAnotherTab.current = true;
+    sessionStorage.removeItem(OIDC_ATTEMPT_MARKER);
+    sessionStorage.removeItem(OIDC_RETURN_PATH_MARKER);
+    navigate(returnPath, { replace: true });
+    return true;
+  });
+
   useEffect(() => {
     if (oidcErrorFromFragment()) {
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      removeLocationFragment(["error"]);
     }
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    let pendingIsLoginHint = false;
+    let channel: BroadcastChannel | null = null;
+    if (typeof BroadcastChannel !== "undefined") {
+      try {
+        channel = new BroadcastChannel(OIDC_LOGIN_CHANNEL);
+      } catch (error) {
+        logger.warn("Could not listen for OIDC sign-in in other tabs; recovery on focus is still available", { error }, "auth");
+      }
+    }
+
+    const recoverSession = (fromLoginHint: boolean) => {
+      if (
+        recoveredInAnotherTab.current ||
+        passwordLoginPending.current ||
+        signInMode.current === "none" ||
+        signInMode.current === "password_only" ||
+        sessionStorage.getItem(OIDC_LOGOUT_MARKER)
+      )
+        return;
+      if (!fromLoginHint && restoreAuthenticatedSession()) return;
+      if (recoveryPromise.current && (!fromLoginHint || pendingIsLoginHint)) return;
+      pendingIsLoginHint = fromLoginHint;
+      const pending = authSession
+        .requestRefresh({ newLogin: true })
+        .then(() => {
+          if (!active || recoveryPromise.current !== pending) return;
+          recoveredInAnotherTab.current = true;
+          authSession.completeLoginBootstrap();
+          sessionStorage.removeItem(OIDC_ATTEMPT_MARKER);
+          sessionStorage.removeItem(OIDC_RETURN_PATH_MARKER);
+          navigate(returnPath, { replace: true });
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (recoveryPromise.current === pending) recoveryPromise.current = null;
+        });
+      recoveryPromise.current = pending;
+    };
+    const onMessage = (event: MessageEvent<{ type?: string }>) => {
+      if (event.data?.type === "completed") recoverSession(true);
+    };
+    const onFocus = () => {
+      if (document.visibilityState === "visible") recoverSession(false);
+    };
+    channel?.addEventListener("message", onMessage);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    const unsubscribe = authSession.subscribeToBootstrap(() => {
+      if (active && signInMode.current !== null && !recoveryPromise.current) restoreAuthenticatedSession();
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+      channel?.removeEventListener("message", onMessage);
+      channel?.close();
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+  }, [navigate, returnPath]);
+
   // Check if authentication is required
   useEffect(() => {
+    let active = true;
     const checkAuthConfig = async () => {
       const attempt = configurationAttempt;
       setIsLoading(true);
       setConfigurationUnavailable(false);
       try {
         const config = await getAuthConfig();
+        if (!active) return;
+        signInMode.current = config.sign_in_mode;
+        if (
+          (config.sign_in_mode === "oidc_only" || config.sign_in_mode === "oidc_or_password") &&
+          !sessionStorage.getItem(OIDC_LOGOUT_MARKER)
+        )
+          await authSession.bootstrap();
+        while (recoveryPromise.current) await recoveryPromise.current;
+        if (!active) return;
+        if (recoveredInAnotherTab.current) return;
+        if (restoreAuthenticatedSession()) return;
         if (config.sign_in_mode === "none") {
           logger.info("Auth method is 'none' - redirecting to requested page", { returnPath }, "auth");
           await logger.initializeBackendTracing();
@@ -87,20 +187,25 @@ const Login: React.FC = () => {
           }
         }
       } catch (error) {
+        if (!active) return;
         logger.error("Failed to check auth config", { error, attempt }, "auth");
         setError((current) => current || "Authentication is temporarily unavailable.");
         setConfigurationUnavailable(true);
       } finally {
-        setIsLoading(false);
+        if (active) setIsLoading(false);
       }
     };
 
     checkAuthConfig();
+    return () => {
+      active = false;
+    };
   }, [configurationAttempt, navigate, returnPath]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    passwordLoginPending.current = true;
 
     try {
       const response = await login(username, password);
@@ -108,6 +213,8 @@ const Login: React.FC = () => {
       navigate(authenticatedReturnPath);
     } catch (_err) {
       setError(t("auth.login.invalidCredentials"));
+    } finally {
+      passwordLoginPending.current = false;
     }
   };
 
@@ -208,10 +315,22 @@ const Login: React.FC = () => {
               required
               fullWidth
               label={t("auth.login.passwordLabel")}
-              type="password"
+              type={passwordVisible ? "text" : "password"}
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              slotProps={{
+                input: {
+                  endAdornment: (
+                    <SettingsPasswordVisibilityToggle
+                      visible={passwordVisible}
+                      onToggle={() => setPasswordVisible((visible) => !visible)}
+                      showLabel={t("auth.login.showPassword", { defaultValue: "Show password" })}
+                      hideLabel={t("auth.login.hidePassword", { defaultValue: "Hide password" })}
+                    />
+                  ),
+                },
+              }}
             />
             <Button type="submit" fullWidth variant="outlined" sx={{ mt: 3, mb: 2 }}>
               {authConfig.sign_in_mode === "oidc_or_password" ? t("auth.login.submitWithPassword") : t("auth.login.submit")}

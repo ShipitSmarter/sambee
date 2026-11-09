@@ -1,18 +1,25 @@
+import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, SQLModel, create_engine, select
 
 import app.api.admin_auth as admin_auth_module
 from app.core.security import build_user_access_token
+from app.db.database import get_session
+from app.main import app
 from app.models.audit import AuditEvent
 from app.models.oidc import (
     OidcAdmissionMode,
+    OidcBrowserSession,
+    OidcBrowserSessionStatus,
     OidcFlow,
     OidcFlowIntent,
     OidcFlowPurpose,
@@ -20,11 +27,13 @@ from app.models.oidc import (
     OidcIdentity,
     OidcPendingIdentityMapping,
     OidcProviderConfiguration,
+    OidcSessionCapability,
     SignInMode,
 )
 from app.models.system_settings import SystemSetting
 from app.models.user import User, UserRole
-from app.services.oidc_client import NormalizedOidcClaims
+from app.services.oidc_browser_session import OIDC_BROWSER_SESSION_COOKIE_NAME, build_cookie_value
+from app.services.oidc_client import NormalizedOidcClaims, OidcProviderMetadata
 from app.services.oidc_configuration import (
     NormalizedOidcCandidate,
     decrypt_candidate_snapshot,
@@ -75,6 +84,49 @@ def test_oidc_test_returns_specific_configuration_validation_error(
 
     assert response.status_code == 400
     assert response.json()["detail"] == "OIDC scopes must include openid"
+
+
+@pytest.mark.parametrize("issuer", ["https://idp.example.test", "https://auth.example.test/application/o/storage/"])
+def test_admin_oidc_test_requests_candidate_authentication_age_and_exact_scopes(
+    client: TestClient, session: Session, admin_token: str, monkeypatch: pytest.MonkeyPatch, issuer: str
+) -> None:
+    metadata = OidcProviderMetadata(
+        issuer=issuer,
+        authorization_endpoint="https://idp.example.test/authorize",
+        token_endpoint="https://idp.example.test/token",
+        jwks_uri="https://idp.example.test/jwks",
+        userinfo_endpoint=None,
+        id_token_signing_alg_values_supported=("RS256",),
+        scopes_supported=("openid", "profile", "email"),
+    )
+
+    async def provider_metadata(_http_client: object, configured_issuer: str) -> tuple[OidcProviderMetadata, dict[str, object]]:
+        assert configured_issuer == issuer
+        return metadata, {}
+
+    monkeypatch.setattr(admin_auth_module, "load_provider_metadata", provider_metadata)
+    monkeypatch.setattr(admin_auth_module, "derive_oidc_redirect_uri", lambda _public_url: "http://testserver/api/auth/oidc/callback")
+    response = client.post(
+        "/api/admin/auth/oidc/test",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "issuer_url": metadata.issuer,
+            "client_id": "sambee",
+            "client_secret": "secret",
+            "scopes": ["openid", "profile", "email"],
+            "sign_in_mode": "oidc_only",
+            "interactive_reauthentication_max_age_days": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    query = parse_qs(urlsplit(response.json()["authorization_url"]).query)
+    assert query["max_age"] == [str(2 * 24 * 60 * 60)]
+    assert query["scope"] == ["openid profile email"]
+    flow = session.exec(select(OidcFlow)).one()
+    assert flow.encrypted_candidate_configuration is not None
+    snapshot = decrypt_candidate_snapshot(flow.encrypted_candidate_configuration, get_oidc_secret_cipher())
+    assert snapshot.issuer_url == issuer
 
 
 def test_get_oidc_configuration_returns_the_admin_configuration(
@@ -215,12 +267,14 @@ def _reviewed_policy_for_flow(flow: OidcFlow) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("issuer", ["https://id.example.test", "https://auth.example.test/application/o/storage/"])
 def test_finalize_oidc_configuration_is_idempotent(
     client: TestClient,
     session: Session,
     admin_user: User,
     admin_token: str,
     monkeypatch: pytest.MonkeyPatch,
+    issuer: str,
 ) -> None:
     clear_cache = Mock()
     monkeypatch.setattr(admin_auth_module, "clear_oidc_provider_cache", clear_cache)
@@ -230,7 +284,7 @@ def test_finalize_oidc_configuration_is_idempotent(
     session.commit()
     candidate = NormalizedOidcCandidate(
         display_name="Example Identity",
-        issuer_url="https://id.example.test",
+        issuer_url=issuer,
         client_id="sambee",
         client_secret="secret",
         scopes=("openid", "profile", "groups", "offline_access"),
@@ -249,7 +303,7 @@ def test_finalize_oidc_configuration_is_idempotent(
         changed_fields=("initial_configuration", "sign_in_mode"),
     )
     claims = NormalizedOidcClaims(
-        issuer="https://id.example.test",
+        issuer=issuer,
         subject="admin-subject",
         username=admin_user.username,
         name="Test Admin",
@@ -287,6 +341,7 @@ def test_finalize_oidc_configuration_is_idempotent(
 
     assert tested.status_code == 200
     assert tested.json()["candidate"]["display_name"] == "Example Identity"
+    assert tested.json()["candidate"]["issuer_url"] == issuer
     assert tested.json()["candidate"]["sign_in_mode"] == "oidc_only"
     assert tested.json()["candidate"]["client_secret_configured"] is True
     assert tested.json()["expected_identity_mapping_revision"] is None
@@ -314,8 +369,12 @@ def test_finalize_oidc_configuration_is_idempotent(
     assert flow.encrypted_candidate_configuration is None
     assert flow.encrypted_tested_identity is None
     identity = session.exec(select(OidcIdentity).where(OidcIdentity.user_id == admin_user.id)).one()
+    assert identity.issuer == issuer
     assert identity.subject == "admin-subject"
     assert identity.last_groups_json == '["sambee-users", "sambee-admins"]'
+    configuration = session.get(OidcProviderConfiguration, 1)
+    assert configuration is not None
+    assert configuration.issuer_url == issuer
 
     flow.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     session.add(flow)
@@ -423,6 +482,201 @@ def test_finalize_commits_reviewed_policy_after_interactive_test(
     assert active.sign_in_mode == SignInMode.OIDC_ONLY
     assert active.admission_mode == OidcAdmissionMode.SELECTED_GROUPS
     assert json.loads(active.admission_groups_json) == ["sambee-admins"]
+
+
+def test_finalize_reduces_no_refresh_deadlines_without_reviving_them_on_increase(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'policy-update.db'}"
+    engine = create_engine(database_url, connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    admin_user = User(username="policy-admin", role=UserRole.ADMIN, password_hash="hash")
+    cipher = get_oidc_secret_cipher()
+    active = OidcProviderConfiguration(
+        display_name="Example Identity",
+        issuer_url="https://id.example.test",
+        client_id="sambee",
+        encrypted_client_secret=cipher.encrypt("secret"),
+        sign_in_mode=SignInMode.OIDC_OR_PASSWORD,
+    )
+    user = User(username="policy-user", role=UserRole.VIEWER, password_hash=None)
+    session.add_all([admin_user, active, user])
+    session.commit()
+    created_at = (datetime.now(timezone.utc) - timedelta(hours=3)).replace(microsecond=0)
+    browser_secret = "policy-browser-secret"
+    sessions = [
+        OidcBrowserSession(
+            user_id=user.id,
+            user_token_version=user.token_version,
+            provider_configuration_id=active.id,
+            configuration_revision=active.session_validation_revision,
+            identity_mapping_revision=active.identity_mapping_revision,
+            issuer=active.issuer_url,
+            subject=subject,
+            secret_hash=hashlib.sha256(browser_secret.encode("ascii")).hexdigest(),
+            capability=OidcSessionCapability.REAUTHORIZATION_ONLY,
+            authenticated_at=created_at,
+            created_at=created_at,
+            absolute_expires_at=created_at + timedelta(hours=8),
+            status=state,
+        )
+        for state, subject in (
+            (OidcBrowserSessionStatus.PENDING, "pending"),
+            (OidcBrowserSessionStatus.ACTIVE, "cookie"),
+            (OidcBrowserSessionStatus.ACTIVE, "token"),
+        )
+    ]
+    renewable = OidcBrowserSession(
+        user_id=user.id,
+        user_token_version=user.token_version,
+        provider_configuration_id=active.id,
+        configuration_revision=active.session_validation_revision,
+        identity_mapping_revision=active.identity_mapping_revision,
+        issuer=active.issuer_url,
+        subject="renewable",
+        secret_hash="renewable-secret",
+        encrypted_refresh_token="encrypted-token",
+        authenticated_at=created_at,
+        created_at=created_at,
+        absolute_expires_at=created_at + timedelta(days=1),
+        status=OidcBrowserSessionStatus.ACTIVE,
+    )
+    session.add_all([*sessions, renewable])
+    session.commit()
+    session_ids = [entry.id for entry in sessions]
+    renewable_id = renewable.id
+    admin_user_id = admin_user.id
+    user_id = user.id
+    configuration_id = active.id
+    original_override = app.dependency_overrides[get_session]
+    app.dependency_overrides[get_session] = lambda: session
+    try:
+        for hours in (2, 12):
+            flow = _create_validated_test_flow(session, admin_user)
+            flow.configuration_revision = active.configuration_revision
+            session.add(flow)
+            session.commit()
+            reviewed_policy = _reviewed_policy_for_flow(flow)
+            reviewed_policy["no_refresh_session_limit_hours"] = hours
+            response = client.post(
+                "/api/admin/auth/oidc/finalize",
+                headers={"Authorization": f"Bearer {build_user_access_token(admin_user)}"},
+                json={
+                    "flow_id": str(flow.id),
+                    "reviewed_policy": reviewed_policy,
+                    "expected_identity_mapping_revision": active.identity_mapping_revision,
+                },
+            )
+            assert response.status_code == 200
+            session.close()
+            engine.dispose()
+            engine = create_engine(database_url, connect_args={"check_same_thread": False})
+            session = Session(engine)
+            active = session.get(OidcProviderConfiguration, configuration_id)
+            admin_user = session.get(User, admin_user_id)
+            assert active is not None
+            assert admin_user is not None
+        assert active.no_refresh_session_limit_hours == 12
+        for session_id in session_ids:
+            browser_session = session.get(OidcBrowserSession, session_id)
+            assert browser_session is not None
+            assert browser_session.absolute_expires_at == created_at + timedelta(hours=2)
+        renewable_session = session.get(OidcBrowserSession, renewable_id)
+        assert renewable_session is not None
+        assert renewable_session.absolute_expires_at == created_at + timedelta(days=1)
+        current_user = session.get(User, user_id)
+        assert current_user is not None
+        access_token = build_user_access_token(current_user, oidc_browser_session_id=session_ids[2])
+        client.cookies.set(OIDC_BROWSER_SESSION_COOKIE_NAME, build_cookie_value(session_ids[1], browser_secret))
+        expired_cookie = client.post("/api/auth/oidc/refresh", headers={"Origin": "http://testserver"})
+        expired_token = client.get("/api/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+        assert expired_cookie.status_code == 401
+        assert expired_cookie.json()["detail"] == {"code": "oidc_reauthentication_required"}
+        assert expired_token.status_code == 401
+        assert expired_token.json()["detail"] == {"code": "oidc_reauthentication_required"}
+    finally:
+        app.dependency_overrides[get_session] = original_override
+        session.close()
+        engine.dispose()
+
+
+def test_finalize_rolls_back_no_refresh_deadlines_when_policy_save_fails(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'policy-rollback.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    admin_user = User(username="rollback-admin", role=UserRole.ADMIN, password_hash="hash")
+    active = OidcProviderConfiguration(
+        display_name="Example Identity",
+        issuer_url="https://id.example.test",
+        client_id="sambee",
+        encrypted_client_secret=get_oidc_secret_cipher().encrypt("secret"),
+        sign_in_mode=SignInMode.OIDC_OR_PASSWORD,
+    )
+    user = User(username="rollback-user", role=UserRole.VIEWER, password_hash=None)
+    session.add_all([admin_user, active, user])
+    session.commit()
+    created_at = datetime.now(timezone.utc).replace(microsecond=0)
+    browser_session = OidcBrowserSession(
+        user_id=user.id,
+        user_token_version=user.token_version,
+        provider_configuration_id=active.id,
+        configuration_revision=active.session_validation_revision,
+        identity_mapping_revision=active.identity_mapping_revision,
+        issuer=active.issuer_url,
+        subject="rollback-subject",
+        secret_hash="rollback-secret",
+        capability=OidcSessionCapability.REAUTHORIZATION_ONLY,
+        authenticated_at=created_at,
+        created_at=created_at,
+        absolute_expires_at=created_at + timedelta(hours=8),
+        status=OidcBrowserSessionStatus.ACTIVE,
+    )
+    session.add(browser_session)
+    session.commit()
+    flow = _create_validated_test_flow(session, admin_user)
+    flow.configuration_revision = active.configuration_revision
+    session.add(flow)
+    session.commit()
+    reviewed_policy = _reviewed_policy_for_flow(flow)
+    reviewed_policy["no_refresh_session_limit_hours"] = 2
+
+    def fail_commit() -> None:
+        raise IntegrityError("failed policy save", {}, RuntimeError("conflict"))
+
+    configuration_id = active.id
+    browser_session_id = browser_session.id
+    original_override = app.dependency_overrides[get_session]
+    app.dependency_overrides[get_session] = lambda: session
+    try:
+        monkeypatch.setattr(session, "commit", fail_commit)
+        response = client.post(
+            "/api/admin/auth/oidc/finalize",
+            headers={"Authorization": f"Bearer {build_user_access_token(admin_user)}"},
+            json={
+                "flow_id": str(flow.id),
+                "reviewed_policy": reviewed_policy,
+                "expected_identity_mapping_revision": active.identity_mapping_revision,
+            },
+        )
+
+        assert response.status_code == 409
+        with Session(engine) as reopened:
+            saved_configuration = reopened.get(OidcProviderConfiguration, configuration_id)
+            saved_session = reopened.get(OidcBrowserSession, browser_session_id)
+            assert saved_configuration is not None
+            assert saved_configuration.no_refresh_session_limit_hours == 8
+            assert saved_session is not None
+            assert saved_session.absolute_expires_at == created_at + timedelta(hours=8)
+    finally:
+        app.dependency_overrides[get_session] = original_override
+        session.close()
+        engine.dispose()
 
 
 def test_initial_activation_integrity_race_returns_configuration_changed(

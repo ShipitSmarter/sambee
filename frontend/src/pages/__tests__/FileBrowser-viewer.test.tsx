@@ -1,3 +1,5 @@
+import { createMockAuthToken } from "../../test/fixtures/users";
+import { requireTestValue } from "../../test/helpers/assertions";
 /**
  * Browser Component - View and Advanced Tests
  * Tests for file view, connection switching, and edge cases
@@ -10,7 +12,7 @@ import api from "../../services/api";
 import { authSession } from "../../services/authSession";
 import { type ApiMock, createMarkdownViewMock, createSettingsDialogMock, setupSuccessfulApiMocks } from "../../test/helpers";
 import { FileType } from "../../types";
-import { mockDirectoryListing, renderBrowser } from "./FileBrowser.test.utils";
+import { mockDirectoryListing, renderBrowserAndFlush } from "./FileBrowser.test.utils";
 
 const expectDirectoryLoad = (connectionId: string, path: string) => {
   expect(api.listDirectory).toHaveBeenCalledWith(
@@ -34,7 +36,7 @@ vi.mock("@tanstack/react-virtual", () => import("../../__mocks__/@tanstack/react
 describe("Browser Component - View and Advanced", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    authSession.setAuthenticated({ access_token: "fake-token", token_type: "bearer" }, false);
+    authSession.setAuthenticated(createMockAuthToken({ access_token: "fake-token", token_type: "bearer" }), false);
     localStorage.removeItem("selectedConnectionId");
 
     // Use mock factory for successful API responses
@@ -44,10 +46,7 @@ describe("Browser Component - View and Advanced", () => {
   describe("File View", () => {
     it("opens view when clicking file", async () => {
       const user = userEvent.setup();
-      renderBrowser("/browse/smb/test-server-1");
 
-      // Wait for the browser to load - find an image file which has view support
-      // Add a mock image file to the directory listing
       vi.mocked(api.listDirectory).mockResolvedValue({
         path: "",
         items: [
@@ -66,8 +65,8 @@ describe("Browser Component - View and Advanced", () => {
         total: mockDirectoryListing.total + 1,
       });
 
-      // Re-render to get the updated file list
-      expect(await screen.findByText("image.png")).toBeInTheDocument();
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
+      expect(screen.getByText("image.png")).toBeInTheDocument();
 
       // Click on file - find the button that contains the text
       const fileButton = screen.getByRole("button", { name: /image\.png/i });
@@ -79,9 +78,7 @@ describe("Browser Component - View and Advanced", () => {
 
     it("handles Escape key press without crashing", async () => {
       const user = userEvent.setup();
-      renderBrowser("/browse/smb/test-server-1");
 
-      // Add a mock image file
       vi.mocked(api.listDirectory).mockResolvedValue({
         path: "",
         items: [
@@ -100,8 +97,8 @@ describe("Browser Component - View and Advanced", () => {
         total: mockDirectoryListing.total + 1,
       });
 
-      // Wait for file to appear
-      expect(await screen.findByText("test-image.jpg")).toBeInTheDocument();
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
+      expect(screen.getByText("test-image.jpg")).toBeInTheDocument();
 
       // Click on a file to open view
       const fileButton = screen.getByRole("button", { name: /test-image\.jpg/i });
@@ -146,7 +143,7 @@ describe("Browser Component - View and Advanced", () => {
         return Promise.resolve(mockDirectoryListing);
       });
 
-      renderBrowser("/browse/smb/test-server-1/Documents");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
 
       // Wait for the Documents folder content to load
       await waitFor(
@@ -194,7 +191,7 @@ describe("Browser Component - View and Advanced", () => {
         return Promise.resolve(mockDirectoryListing);
       });
 
-      renderBrowser("/browse/smb/test-server-1/Documents");
+      await renderBrowserAndFlush("/browse/smb/test-server-1/Documents");
 
       await waitFor(() => {
         expectDirectoryLoad("conn-1", "Documents");
@@ -217,7 +214,7 @@ describe("Browser Component - View and Advanced", () => {
   describe("Performance and Edge Cases", () => {
     it("handles rapid navigation without crashes", async () => {
       const user = userEvent.setup();
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // Wait for Documents to appear - there may be multiple (breadcrumb + file list)
       await waitFor(
@@ -234,9 +231,9 @@ describe("Browser Component - View and Advanced", () => {
       const documentsFolder = documentsFolders[0]; // Use first Documents button
 
       // Click multiple times rapidly
-      await user.click(documentsFolder);
-      await user.click(documentsFolder);
-      await user.click(documentsFolder);
+      await user.click(requireTestValue(documentsFolder));
+      await user.click(requireTestValue(documentsFolder));
+      await user.click(requireTestValue(documentsFolder));
 
       // Should handle gracefully - at least one Documents should exist
       const documentsElements = screen.getAllByText("Documents");
@@ -245,7 +242,7 @@ describe("Browser Component - View and Advanced", () => {
 
     it("displays file info tooltips on hover", async () => {
       const user = userEvent.setup();
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // Optimized: Use findByText
       expect(await screen.findByText("readme.txt")).toBeInTheDocument();
@@ -276,7 +273,7 @@ describe("Browser Component - View and Advanced", () => {
         total: 1,
       });
 
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // UI should render without crashing - filename may be truncated
       expect(await screen.findByText("Sambee")).toBeInTheDocument();
@@ -304,7 +301,7 @@ describe("Browser Component - View and Advanced", () => {
         total: 1,
       });
 
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // UI should render without crashing - special chars may be escaped
       expect(await screen.findByText("Sambee")).toBeInTheDocument();
@@ -314,7 +311,7 @@ describe("Browser Component - View and Advanced", () => {
     });
 
     it("updates UI when localStorage changes externally", async () => {
-      renderBrowser("/browse/smb/test-server-1");
+      await renderBrowserAndFlush("/browse/smb/test-server-1");
 
       // Wait for component to load - Optimized: Use findByText
       expect(await screen.findByText("Sambee")).toBeInTheDocument();

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearCachedAsyncData } from "../../hooks/useCachedAsyncData";
@@ -8,6 +8,8 @@ import { SmbSettings } from "../SmbSettings";
 
 vi.mock("../../services/api", () => ({
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
+    getCurrentUser: () => Promise.resolve({ role: "editor" }),
     getSmbSettings: vi.fn(),
     updateSmbSettings: vi.fn(),
   },
@@ -34,7 +36,6 @@ const smbSettings: SmbSettingsData = {
   },
   domain_controller_primary: "",
   domain_controller_secondary: "",
-  policy_source: "default",
   require_signing: true,
   require_encryption: false,
 };
@@ -152,13 +153,15 @@ describe("SmbSettings", () => {
     );
 
     const protection = await screen.findByRole("combobox", { name: "Transport protection" });
-    protection.focus();
+    act(() => protection.focus());
     await user.click(protection);
     await user.click(screen.getByRole("option", { name: "Signing and encryption (SMB 3+)" }));
 
     await waitFor(() => expect(protection).toHaveAttribute("aria-disabled", "true"));
-    protection.blur();
-    resolveUpdate?.({ field: "encryption_mode", value: "encryption_required" });
+    await act(async () => {
+      protection.blur();
+      resolveUpdate?.({ field: "encryption_mode", value: "encryption_required" });
+    });
 
     await waitFor(() => expect(protection).toHaveFocus());
   });

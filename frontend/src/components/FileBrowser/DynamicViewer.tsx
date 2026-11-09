@@ -2,6 +2,9 @@ import CloseIcon from "@mui/icons-material/Close";
 import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, IconButton, Stack, Typography } from "@mui/material";
 import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { COMMON_SHORTCUTS } from "../../config/keyboardShortcuts";
+import { KeyboardShortcutScopeContext, useKeyboardShortcutScope, useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
+import type { ViewerNavigation } from "../../hooks/useRoutedViewerEditing";
 import { translate } from "../../i18n";
 import {
   type ContentProviderRegistry,
@@ -9,11 +12,13 @@ import {
   type VirtualItemHandle,
 } from "../../pages/FileBrowser/contentProviders";
 import { logger } from "../../services/logger";
+import { PhysicalFileRequestError } from "../../utils/apiErrors";
 import type { ViewerComponentLoadResult, ViewerComponent as ViewerComponentType } from "../../utils/FileTypeRegistry";
 import { getViewerComponentLoadResult, getViewerLoadErrorDiagnostics } from "../../utils/FileTypeRegistry";
-import { settingsSubduedIconButtonSx } from "../Settings/settingsButtonStyles";
+import { settingsSubduedIconButtonSx, settingsUtilityButtonSx } from "../Settings/settingsButtonStyles";
 
 interface DynamicViewerProps {
+  isPending?: boolean;
   connectionId: string;
   isReadOnly?: boolean;
   viewInfo: {
@@ -33,15 +38,17 @@ interface DynamicViewerProps {
   isLoadingMoreItems?: boolean;
   onLoadMoreItems?: () => void;
   contentProviders: ContentProviderRegistry;
+  navigation?: ViewerNavigation;
 }
 
 type DynamicViewerLoadState =
   | { status: "loading" }
-  | { status: "loaded"; component: ViewerComponentType }
+  | { status: "loaded"; component: ViewerComponentType; viewerKey: string }
   | { status: "unsupported" }
   | { status: "failed"; error: unknown };
 
 function getViewerLoadFailureMessage(error: unknown): string {
+  if (error instanceof PhysicalFileRequestError) return error.message;
   if (error instanceof Error && error.message.trim()) {
     return translate("viewer.fallback.failedMessageWithError", { message: error.message.trim() });
   }
@@ -64,7 +71,7 @@ interface ViewerFallbackDialogProps {
   onRetry?: () => void;
 }
 
-function ViewerFallbackDialog({ mode, path, error, onClose, onRetry }: ViewerFallbackDialogProps) {
+export function ViewerFallbackDialog({ mode, path, error, onClose, onRetry }: ViewerFallbackDialogProps) {
   const { t } = useTranslation();
   const filename = path.split("/").pop() || path;
   const message = mode === "failed" ? getViewerLoadFailureMessage(error) : t("viewer.fallback.unsupportedMessage");
@@ -94,7 +101,11 @@ function ViewerFallbackDialog({ mode, path, error, onClose, onRetry }: ViewerFal
         </Stack>
       </DialogContent>
       <DialogActions>
-        {mode === "failed" && onRetry ? <Button onClick={onRetry}>{t("viewer.fallback.retry")}</Button> : null}
+        {mode === "failed" && onRetry ? (
+          <Button onClick={onRetry} variant="outlined" sx={settingsUtilityButtonSx}>
+            {t("viewer.fallback.retry")}
+          </Button>
+        ) : null}
         <Button variant="contained" onClick={onClose}>
           {t("common.actions.close")}
         </Button>
@@ -103,60 +114,58 @@ function ViewerFallbackDialog({ mode, path, error, onClose, onRetry }: ViewerFal
   );
 }
 
-export const DynamicViewer = memo(function DynamicViewer({
-  connectionId,
-  isReadOnly,
-  viewInfo,
-  onClose,
-  onIndexChange,
-  hasMoreItems = false,
-  isLoadingMoreItems = false,
-  onLoadMoreItems,
-  contentProviders,
-}: DynamicViewerProps) {
+function PendingViewerShortcuts({ onClose }: { onClose: () => void }) {
+  useKeyboardShortcuts({ shortcuts: [{ ...COMMON_SHORTCUTS.CLOSE, handler: onClose, allowInInput: true }] });
+  return null;
+}
+
+export const DynamicViewer = memo(function DynamicViewer(props: DynamicViewerProps) {
+  const { viewInfo, onClose, isPending = false } = props;
+  const viewerKey = viewInfo.viewerId ?? viewInfo.mimeType;
   const [loadState, setLoadState] = useState<DynamicViewerLoadState>({ status: "loading" });
   const [retryToken, setRetryToken] = useState(0);
   const latestViewInfoRef = useRef(viewInfo);
+  const presentation = useRef(props);
+  const isTransitioning = isPending || (loadState.status === "loaded" && loadState.viewerKey !== viewerKey);
+  const pendingShortcutScope = useKeyboardShortcutScope(isTransitioning);
 
   latestViewInfoRef.current = viewInfo;
 
   useEffect(() => {
     let mounted = true;
     const loadAttempt = retryToken;
-    const requestedPath = latestViewInfoRef.current.path;
-    const requestedSessionId = latestViewInfoRef.current.sessionId;
-    setLoadState((current) => (current.status === "loading" ? current : { status: "loading" }));
+    const { path: requestedPath, sessionId: requestedSessionId, mimeType, viewerId } = latestViewInfoRef.current;
 
     logger.info(
       "DynamicViewer: Loading viewer component",
       {
         loadAttempt,
-        mimeType: viewInfo.mimeType,
+        mimeType,
         sessionId: requestedSessionId,
       },
       "viewer"
     );
 
-    getViewerComponentLoadResult(viewInfo.mimeType, viewInfo.viewerId).then((result: ViewerComponentLoadResult) => {
+    getViewerComponentLoadResult(mimeType, viewerId).then((result: ViewerComponentLoadResult) => {
       if (mounted) {
         logger.info("DynamicViewer: Viewer component loaded", {
-          mimeType: viewInfo.mimeType,
-          viewerId: viewInfo.viewerId,
+          mimeType,
+          viewerId,
           componentFound: result.status === "loaded",
           resultStatus: result.status,
           sessionId: requestedSessionId,
         });
         if (result.status === "loaded") {
-          setLoadState({ status: "loaded", component: result.component });
+          setLoadState({ status: "loaded", component: result.component, viewerKey });
         } else if (result.status === "failed") {
           logger.error(
             "DynamicViewer: Viewer component failed to load",
             {
               loadAttempt,
-              mimeType: viewInfo.mimeType,
+              mimeType,
               path: requestedPath,
               sessionId: requestedSessionId,
-              viewerId: viewInfo.viewerId,
+              viewerId,
               online: typeof navigator !== "undefined" ? navigator.onLine : undefined,
               pageUrl: typeof window !== "undefined" ? window.location.href : undefined,
               ...getViewerLoadErrorDiagnostics(result.error),
@@ -174,7 +183,7 @@ export const DynamicViewer = memo(function DynamicViewer({
     return () => {
       mounted = false;
     };
-  }, [retryToken, viewInfo.mimeType, viewInfo.viewerId]);
+  }, [retryToken, viewerKey]);
 
   useEffect(() => {
     if (loadState.status !== "loaded") {
@@ -222,24 +231,45 @@ export const DynamicViewer = memo(function DynamicViewer({
   }
 
   const ViewerComponent = loadState.component;
-
+  if (!isTransitioning) presentation.current = props;
+  const displayed = presentation.current;
+  const { connectionId, isReadOnly, onIndexChange, hasMoreItems, isLoadingMoreItems, onLoadMoreItems, contentProviders, navigation } =
+    displayed;
+  const displayedInfo = displayed.viewInfo;
   return (
     <ContentProviderRegistryContext.Provider value={contentProviders}>
+      {isTransitioning ? (
+        <KeyboardShortcutScopeContext.Provider value={pendingShortcutScope}>
+          <PendingViewerShortcuts onClose={onClose} />
+        </KeyboardShortcutScopeContext.Provider>
+      ) : null}
       <ViewerComponent
+        key={
+          displayedInfo.viewerId === "text" || displayedInfo.viewerId === "markdown" ? `${connectionId}:${displayedInfo.path}` : undefined
+        }
         connectionId={connectionId}
-        path={viewInfo.path}
-        fileSize={viewInfo.fileSize}
-        fileModifiedAt={viewInfo.fileModifiedAt}
+        path={displayedInfo.path}
+        fileSize={displayedInfo.fileSize}
+        fileModifiedAt={displayedInfo.fileModifiedAt}
         onClose={onClose}
         isReadOnly={isReadOnly}
-        virtualSource={viewInfo.virtualSource}
+        isTransitioning={isTransitioning}
+        virtualSource={displayedInfo.virtualSource}
         hasMoreItems={hasMoreItems}
         isLoadingMoreItems={isLoadingMoreItems}
-        onLoadMoreItems={onLoadMoreItems}
-        images={viewInfo.images}
-        currentIndex={viewInfo.currentIndex}
-        onCurrentIndexChange={onIndexChange}
-        sessionId={viewInfo.sessionId}
+        onLoadMoreItems={isTransitioning ? undefined : onLoadMoreItems}
+        images={displayedInfo.images}
+        currentIndex={displayedInfo.currentIndex}
+        onCurrentIndexChange={isTransitioning ? undefined : onIndexChange}
+        sessionId={displayedInfo.sessionId}
+        navigation={
+          navigation
+            ? {
+                ...navigation,
+                ...(isTransitioning ? { mode: "view", onModeChange: () => {} } : {}),
+              }
+            : navigation
+        }
       />
     </ContentProviderRegistryContext.Provider>
   );

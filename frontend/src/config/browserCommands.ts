@@ -1,3 +1,4 @@
+import type { ParseKeys } from "i18next";
 import type { KeyboardShortcut } from "../hooks/useKeyboardShortcuts";
 import { translate } from "../i18n";
 
@@ -17,6 +18,11 @@ export interface BrowserCommandContext {
   canOpenFocusedFileInApp: boolean;
   canCopyToOtherPane: boolean;
   canMoveToOtherPane: boolean;
+  canOpenLocationInNewTab: boolean;
+  canMatchPaneLocations: boolean;
+  openLocationInNewTab: () => void;
+  matchLeftPaneLocation: () => void;
+  matchRightPaneLocation: () => void;
   openQuickNav: () => void;
   openFileSearch: () => void;
   openCommandMode: () => void;
@@ -58,9 +64,9 @@ export interface BrowserCommandDefinition {
 
 interface BrowserCommandTemplate {
   id: string;
-  titleKey: string;
-  categoryKey: string;
-  descriptionKey?: string;
+  titleKey: ParseKeys;
+  categoryKey: ParseKeys;
+  descriptionKey?: ParseKeys;
   keywords?: string[];
   defaultShortcutIds?: string[];
   shortcutLabel?: string;
@@ -129,6 +135,36 @@ const BROWSER_COMMANDS = [
     shortcutLabel: "Backspace",
     isEnabled: (context) => context.connectionSelected,
     run: (context) => context.navigateUp(),
+  }),
+  createCommand({
+    id: "browser.openLocationInNewTab",
+    titleKey: "fileBrowser.commands.items.openLocationInNewTab.title",
+    categoryKey: "fileBrowser.commands.categories.navigation",
+    keywords: ["open", "location", "folder", "directory", "tab"],
+    defaultShortcutIds: ["open-location-in-new-tab"],
+    shortcutLabel: "Ctrl+Alt+T",
+    isEnabled: (context) => context.canOpenLocationInNewTab,
+    run: (context) => context.openLocationInNewTab(),
+  }),
+  createCommand({
+    id: "browser.matchLeftPaneLocation",
+    titleKey: "fileBrowser.commands.items.matchLeftPaneLocation.title",
+    categoryKey: "fileBrowser.commands.categories.panes",
+    keywords: ["left", "right", "pane", "location", "match", "directory"],
+    defaultShortcutIds: ["match-left-pane-location"],
+    shortcutLabel: "Ctrl+Left",
+    isEnabled: (context) => context.canMatchPaneLocations,
+    run: (context) => context.matchLeftPaneLocation(),
+  }),
+  createCommand({
+    id: "browser.matchRightPaneLocation",
+    titleKey: "fileBrowser.commands.items.matchRightPaneLocation.title",
+    categoryKey: "fileBrowser.commands.categories.panes",
+    keywords: ["left", "right", "pane", "location", "match", "directory"],
+    defaultShortcutIds: ["match-right-pane-location"],
+    shortcutLabel: "Ctrl+Right",
+    isEnabled: (context) => context.canMatchPaneLocations,
+    run: (context) => context.matchRightPaneLocation(),
   }),
   createCommand({
     id: "browser.refresh",
@@ -245,8 +281,6 @@ const BROWSER_COMMANDS = [
     titleKey: "fileBrowser.commands.items.focusLeftPane.title",
     categoryKey: "fileBrowser.commands.categories.panes",
     keywords: ["left", "pane", "focus"],
-    defaultShortcutIds: ["focus-left-pane"],
-    shortcutLabel: "Ctrl+1",
     isEnabled: (context) => !context.settingsOpen && !context.mobileSettingsOpen,
     run: (context) => context.focusLeftPane(),
   }),
@@ -255,8 +289,6 @@ const BROWSER_COMMANDS = [
     titleKey: "fileBrowser.commands.items.focusRightPane.title",
     categoryKey: "fileBrowser.commands.categories.panes",
     keywords: ["right", "pane", "focus"],
-    defaultShortcutIds: ["focus-right-pane"],
-    shortcutLabel: "Ctrl+2",
     isEnabled: (context) => !context.settingsOpen && !context.mobileSettingsOpen,
     run: (context) => context.focusRightPane(),
   }),

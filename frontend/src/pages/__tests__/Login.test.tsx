@@ -1,8 +1,12 @@
-import { render as renderWithMemoryRouter, screen, waitFor } from "@testing-library/react";
+import { act, render as renderWithMemoryRouter, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes, useLocation } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { authSession } from "../../services/authSession";
+import { OIDC_ATTEMPT_MARKER, OIDC_LOGIN_CHANNEL, OIDC_LOGOUT_MARKER, OIDC_RETURN_PATH_MARKER } from "../../services/oidcAuth";
+import { createMockAuthToken } from "../../test/fixtures/users";
 import { render } from "../../test/utils/test-utils";
+import type { AuthToken } from "../../types";
 import Login from "../Login";
 
 // Mock the entire API module
@@ -26,8 +30,63 @@ function CurrentPath() {
   return <output>{location.pathname}</output>;
 }
 
+function renderLoginRoute() {
+  const router = createMemoryRouter(
+    [
+      { path: "/login", element: <Login /> },
+      { path: "*", element: <CurrentPath /> },
+    ],
+    { initialEntries: [`/login${window.location.search}`] }
+  );
+  renderWithMemoryRouter(<RouterProvider router={router} />);
+  return router;
+}
+
+class LoginChannel {
+  static channels: LoginChannel[] = [];
+  private readonly listeners = new Set<(event: MessageEvent<{ type: string }>) => void>();
+
+  constructor(readonly name: string) {
+    LoginChannel.channels.push(this);
+  }
+
+  addEventListener(_type: string, listener: (event: MessageEvent<{ type: string }>) => void) {
+    this.listeners.add(listener);
+  }
+
+  removeEventListener(_type: string, listener: (event: MessageEvent<{ type: string }>) => void) {
+    this.listeners.delete(listener);
+  }
+
+  close() {}
+
+  emit(type: string) {
+    for (const listener of this.listeners) listener(new MessageEvent("message", { data: { type } }));
+  }
+}
+
 describe("Login Component", () => {
+  it("reveals and hides the password without changing it or submitting", async () => {
+    const user = userEvent.setup();
+    render(<Login />);
+    const password = await screen.findByLabelText(/^password/i);
+    expect(password).toHaveAttribute("type", "password");
+    await user.type(password, "Secret123!");
+    await user.click(screen.getByRole("button", { name: "Show password" }));
+    expect(password).toHaveAttribute("type", "text");
+    expect(password).toHaveValue("Secret123!");
+    expect(password).toHaveAttribute("autocomplete", "current-password");
+    await user.click(screen.getByRole("button", { name: "Hide password" }));
+    expect(password).toHaveAttribute("type", "password");
+    expect(password).toHaveValue("Secret123!");
+    expect(mockLogin).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
+    authSession.clear();
+    vi.spyOn(authSession, "bootstrap").mockResolvedValue("idle");
+    vi.spyOn(authSession, "hasUsableAccessToken").mockReturnValue(false);
+    LoginChannel.channels = [];
     // Clear localStorage before each test
     localStorage.clear();
     // Clear all mocks
@@ -38,6 +97,290 @@ describe("Login Component", () => {
     window.location.hash = "";
     vi.mocked(window.location.assign).mockClear();
     vi.mocked(mockGetAuthConfig).mockResolvedValue({ sign_in_mode: "password_only", oidc: null });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["/browse/smb/demo", "/settings/appearance"])("recovers the tab's own destination %s after another OIDC login", async (path) => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    vi.spyOn(authSession, "requestRefresh").mockResolvedValue(
+      createMockAuthToken({ access_token: "restored-token", token_type: "bearer" })
+    );
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    window.location.search = `?return_path=${encodeURIComponent(path)}`;
+    sessionStorage.setItem(OIDC_ATTEMPT_MARKER, "1");
+
+    renderWithMemoryRouter(
+      <MemoryRouter initialEntries={[`/login${window.location.search}`]}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="*" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByLabelText(/username/i);
+    expect(LoginChannel.channels.at(-1)?.name).toBe(OIDC_LOGIN_CHANNEL);
+    LoginChannel.channels.at(-1)?.emit("completed");
+
+    expect(await screen.findByText(path)).toBeInTheDocument();
+    expect(authSession.requestRefresh).toHaveBeenCalledOnce();
+    expect(sessionStorage.getItem(OIDC_ATTEMPT_MARKER)).toBeNull();
+  });
+
+  it("stays on login after failed verification and retries when brought into focus", async () => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    const refresh = vi
+      .spyOn(authSession, "requestRefresh")
+      .mockRejectedValueOnce(new Error("No browser session"))
+      .mockResolvedValueOnce(createMockAuthToken({ access_token: "restored-token", token_type: "bearer" }));
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+
+    renderWithMemoryRouter(
+      <MemoryRouter initialEntries={["/login"]}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/browse" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByLabelText(/username/i);
+    await act(async () => LoginChannel.channels.at(-1)?.emit("completed"));
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
+
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(await screen.findByText("/browse")).toBeInTheDocument();
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers on focus when BroadcastChannel is unavailable", async () => {
+    vi.stubGlobal("BroadcastChannel", undefined);
+    const refresh = vi
+      .spyOn(authSession, "requestRefresh")
+      .mockResolvedValue(createMockAuthToken({ access_token: "restored-token", token_type: "bearer" }));
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+
+    renderWithMemoryRouter(
+      <MemoryRouter initialEntries={["/login"]}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/browse" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByLabelText(/username/i);
+    act(() => window.dispatchEvent(new Event("focus")));
+
+    expect(await screen.findByText("/browse")).toBeInTheDocument();
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("ignores login hints after explicit logout", async () => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    const refresh = vi.spyOn(authSession, "requestRefresh");
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    sessionStorage.setItem(OIDC_LOGOUT_MARKER, "1");
+
+    render(<Login />);
+    await screen.findByLabelText(/username/i);
+    LoginChannel.channels.at(-1)?.emit("completed");
+    window.dispatchEvent(new Event("focus"));
+
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it.each(["oidc_or_password", "oidc_only"] as const)("leaves login after startup restores a session in %s mode", async (signInMode) => {
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: signInMode,
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    const usable = vi.spyOn(authSession, "hasUsableAccessToken").mockReturnValue(false);
+    vi.mocked(authSession.bootstrap).mockImplementation(async () => {
+      usable.mockReturnValue(true);
+      return "active";
+    });
+    const refresh = vi.spyOn(authSession, "requestRefresh");
+    window.location.search = "?return_path=%2Fsettings%2Fappearance";
+
+    renderLoginRoute();
+
+    expect(await screen.findByText("/settings/appearance")).toBeInTheDocument();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(window.location.assign).not.toHaveBeenCalled();
+  });
+
+  it("uses an already restored session when the tab becomes visible", async () => {
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    const refresh = vi.spyOn(authSession, "requestRefresh");
+    const usable = vi.spyOn(authSession, "hasUsableAccessToken").mockReturnValue(false);
+    const router = renderLoginRoute();
+    await screen.findByLabelText(/username/i);
+
+    await act(async () => {
+      usable.mockReturnValue(true);
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/browse"));
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("leaves login when session startup completes after the login form loads", async () => {
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    renderLoginRoute();
+    await screen.findByLabelText(/username/i);
+
+    await act(async () => {
+      vi.mocked(authSession.hasUsableAccessToken).mockReturnValue(true);
+      authSession.completeLoginBootstrap();
+    });
+
+    expect(await screen.findByText("/browse")).toBeInTheDocument();
+  });
+
+  it("opens the main page after an explicit logout and password login", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(OIDC_LOGOUT_MARKER, "1");
+    sessionStorage.setItem(OIDC_RETURN_PATH_MARKER, "/settings/account");
+    window.location.search = "?return_path=%2Fsettings%2Faccount";
+    vi.mocked(mockLogin).mockResolvedValueOnce(createMockAuthToken());
+    const router = renderLoginRoute();
+
+    await user.type(await screen.findByLabelText(/username/i), "alice");
+    await user.type(screen.getByLabelText(/^password/i), "test-password");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/browse"));
+    expect(sessionStorage.getItem(OIDC_LOGOUT_MARKER)).toBeNull();
+    expect(sessionStorage.getItem(OIDC_RETURN_PATH_MARKER)).toBeNull();
+  });
+
+  it("requests the main page after an explicit logout and OIDC login", async () => {
+    const user = userEvent.setup();
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+    sessionStorage.setItem(OIDC_LOGOUT_MARKER, "1");
+    sessionStorage.setItem(OIDC_RETURN_PATH_MARKER, "/settings/account");
+    window.location.search = "?return_path=%2Fsettings%2Faccount";
+    renderLoginRoute();
+
+    await user.click(await screen.findByRole("button", { name: /sign in with sso/i }));
+
+    expect(window.location.assign).toHaveBeenCalledWith("/api/auth/oidc/authorize?return_path=%2Fbrowse");
+    expect(sessionStorage.getItem(OIDC_RETURN_PATH_MARKER)).toBe("/browse");
+    expect(sessionStorage.getItem(OIDC_LOGOUT_MARKER)).toBeNull();
+    expect(authSession.bootstrap).not.toHaveBeenCalled();
+  });
+
+  it("coalesces duplicate login hints while verifying", async () => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    const refresh = vi.spyOn(authSession, "requestRefresh").mockReturnValue(new Promise(() => undefined));
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+
+    render(<Login />);
+    await screen.findByLabelText(/username/i);
+    LoginChannel.channels.at(-1)?.emit("completed");
+    LoginChannel.channels.at(-1)?.emit("completed");
+    window.dispatchEvent(new Event("focus"));
+
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("lets a login hint supersede a pending focus refresh", async () => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    let finishFocus!: (response: AuthToken) => void;
+    let finishHint!: (response: AuthToken) => void;
+    const refresh = vi
+      .spyOn(authSession, "requestRefresh")
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishFocus = resolve;
+        })
+      )
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishHint = resolve;
+        })
+      );
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_or_password",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+
+    renderWithMemoryRouter(
+      <MemoryRouter initialEntries={["/login"]}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/browse" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByLabelText(/username/i);
+    act(() => window.dispatchEvent(new Event("focus")));
+    act(() => LoginChannel.channels.at(-1)?.emit("completed"));
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(refresh).toHaveBeenNthCalledWith(2, { newLogin: true });
+
+    await act(async () => finishFocus(createMockAuthToken({ access_token: "old-session", token_type: "bearer" })));
+    expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
+    await act(async () => finishHint(createMockAuthToken({ access_token: "new-session", token_type: "bearer" })));
+    expect(await screen.findByText("/browse")).toBeInTheDocument();
+  });
+
+  it("waits for a login hint received during configuration loading before starting OIDC", async () => {
+    vi.stubGlobal("BroadcastChannel", LoginChannel);
+    let finishRefresh!: (response: AuthToken) => void;
+    vi.spyOn(authSession, "requestRefresh").mockReturnValue(
+      new Promise((resolve) => {
+        finishRefresh = resolve;
+      })
+    );
+    vi.mocked(mockGetAuthConfig).mockResolvedValue({
+      sign_in_mode: "oidc_only",
+      oidc: { display_name: "Example Identity", authorization_path: "/api/auth/oidc/authorize" },
+    });
+
+    renderWithMemoryRouter(
+      <MemoryRouter initialEntries={["/login"]}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/browse" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    LoginChannel.channels.at(-1)?.emit("completed");
+    await waitFor(() => expect(authSession.requestRefresh).toHaveBeenCalledOnce());
+    expect(window.location.assign).not.toHaveBeenCalled();
+
+    finishRefresh(createMockAuthToken({ access_token: "restored-token", token_type: "bearer" }));
+    expect(await screen.findByText("/browse")).toBeInTheDocument();
+    expect(window.location.assign).not.toHaveBeenCalled();
   });
 
   it("renders login form with all elements", async () => {
@@ -53,7 +396,7 @@ describe("Login Component", () => {
 
     // Check for form fields
     expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/^password/i)).toBeInTheDocument();
 
     // Check for submit button
     expect(screen.getByRole("button", { name: /sign in/i })).toBeInTheDocument();
@@ -72,7 +415,7 @@ describe("Login Component", () => {
     });
 
     const usernameInput = screen.getByLabelText(/username/i);
-    const passwordInput = screen.getByLabelText(/password/i);
+    const passwordInput = screen.getByLabelText(/^password/i);
 
     // Type in username
     await user.type(usernameInput, "testuser");
@@ -102,7 +445,7 @@ describe("Login Component", () => {
 
     // Fill in form with valid credentials
     await user.type(screen.getByLabelText(/username/i), "admin");
-    await user.type(screen.getByLabelText(/password/i), "admin");
+    await user.type(screen.getByLabelText(/^password/i), "admin");
 
     // Submit form
     await user.click(screen.getByRole("button", { name: /sign in/i }));
@@ -141,7 +484,7 @@ describe("Login Component", () => {
 
     // Fill in form with invalid credentials
     await user.type(screen.getByLabelText(/username/i), "wronguser");
-    await user.type(screen.getByLabelText(/password/i), "wrongpass");
+    await user.type(screen.getByLabelText(/^password/i), "wrongpass");
 
     // Submit form
     await user.click(screen.getByRole("button", { name: /sign in/i }));
@@ -167,7 +510,7 @@ describe("Login Component", () => {
     // First attempt with invalid credentials
     vi.mocked(mockLogin).mockRejectedValueOnce(new Error("Unauthorized"));
     await user.type(screen.getByLabelText(/username/i), "wronguser");
-    await user.type(screen.getByLabelText(/password/i), "wrongpass");
+    await user.type(screen.getByLabelText(/^password/i), "wrongpass");
     await user.click(screen.getByRole("button", { name: /sign in/i }));
 
     // Wait for error
@@ -177,7 +520,7 @@ describe("Login Component", () => {
 
     // Clear the fields
     await user.clear(screen.getByLabelText(/username/i));
-    await user.clear(screen.getByLabelText(/password/i));
+    await user.clear(screen.getByLabelText(/^password/i));
 
     // Second attempt with valid credentials
     vi.mocked(mockLogin).mockResolvedValueOnce({
@@ -187,7 +530,7 @@ describe("Login Component", () => {
       role: "admin",
     });
     await user.type(screen.getByLabelText(/username/i), "admin");
-    await user.type(screen.getByLabelText(/password/i), "admin");
+    await user.type(screen.getByLabelText(/^password/i), "admin");
     await user.click(screen.getByRole("button", { name: /sign in/i }));
 
     await waitFor(() => expect(mockLogin).toHaveBeenCalledTimes(2));
@@ -212,7 +555,7 @@ describe("Login Component", () => {
 
     // Fill in form
     const usernameInput = screen.getByLabelText(/username/i);
-    const passwordInput = screen.getByLabelText(/password/i);
+    const passwordInput = screen.getByLabelText(/^password/i);
 
     await user.type(usernameInput, "admin");
     await user.type(passwordInput, "admin");
@@ -242,7 +585,7 @@ describe("Login Component", () => {
 
     // Use the non-admin test user
     await user.type(screen.getByLabelText(/username/i), "testuser");
-    await user.type(screen.getByLabelText(/password/i), "testpass");
+    await user.type(screen.getByLabelText(/^password/i), "testpass");
     await user.click(screen.getByRole("button", { name: /sign in/i }));
 
     await waitFor(() => expect(mockLogin).toHaveBeenCalledWith("testuser", "testpass"));
@@ -260,7 +603,7 @@ describe("Login Component", () => {
     expect(providerButton).toHaveClass("MuiButton-contained");
     expect(screen.getByRole("button", { name: "Sign in with password" })).toHaveClass("MuiButton-outlined");
     expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/^password/i)).toBeInTheDocument();
   });
 
   it("renders no controls while authentication mode is unknown", () => {
@@ -281,7 +624,7 @@ describe("Login Component", () => {
     expect(await screen.findByRole("button", { name: "Try again" })).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Authentication is temporarily unavailable");
     expect(screen.queryByLabelText(/username/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^password/i)).not.toBeInTheDocument();
   });
 
   it("clears the configuration error after a successful retry", async () => {
@@ -324,7 +667,7 @@ describe("Login Component", () => {
 
     expect(await screen.findByRole("button", { name: "Try again" })).toBeInTheDocument();
     expect(screen.queryByLabelText(/username/i)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^password/i)).not.toBeInTheDocument();
   });
 
   it("shows a stable OIDC error and clears it from browser history", async () => {
@@ -339,7 +682,9 @@ describe("Login Component", () => {
     render(<Login />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/did not supply required account information/i);
-    expect(replaceState).toHaveBeenCalledWith(null, "", window.location.pathname + window.location.search);
+    expect(
+      replaceState.mock.calls.some(([state, , url]) => typeof state?.idx === "number" && typeof url === "string" && !url.includes("error="))
+    ).toBe(true);
   });
 
   it("shows a provider failure alongside password login in mixed mode", async () => {
@@ -353,6 +698,6 @@ describe("Login Component", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/identity provider is temporarily unavailable/i);
     expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/^password/i)).toBeInTheDocument();
   });
 });

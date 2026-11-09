@@ -1125,6 +1125,107 @@ def test_local_to_smb_creation_rejects_members_after_live_writer_interruption(
     execution.write_member.assert_not_awaited()
 
 
+def test_v2_creates_from_selected_zip_members_and_closes_reader(
+    client: TestClient,
+    auth_headers_user: dict,
+    test_connection: Connection,
+) -> None:
+    prepared = client.post(
+        "/api/archive/v2/operations",
+        headers=auth_headers_user,
+        json={
+            "contract_version": "v2",
+            "kind": "create",
+            "source_connection_id": str(test_connection.id),
+            "source_path": "source.zip",
+            "destination_connection_id": str(test_connection.id),
+            "destination_path": "nested/backup.zip",
+            "selected_member_paths": ["nested"],
+        },
+    ).json()
+    backend = AsyncMock()
+    archive_buffer = BytesIO()
+    with ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("nested/empty/", b"")
+        archive.writestr("nested/report.txt", b"hello")
+    archive_bytes = archive_buffer.getvalue()
+    reader = MemoryRandomAccessReader(archive_bytes)
+    backend.get_file_info.return_value = FileInfo(name="source.zip", path="source.zip", type=FileType.FILE, size=len(archive_bytes))
+    backend.open_random_access_reader.return_value = reader
+    streamed: list[bytes] = []
+
+    async def create_archive(source, *, preflight_manifest, on_member_completed, **_kwargs):
+        for member in preflight_manifest.members:
+            if member.is_directory:
+                await on_member_completed(ArchiveCreationMemberOutcome(member.archive_path, "directory"))
+            else:
+                streamed.extend([chunk async for chunk in source.read_file(member.source_path)])
+                await on_member_completed(ArchiveCreationMemberOutcome(member.archive_path, "created", member.source_size))
+        return ArchiveCreationResult(1, 5, 2)
+
+    with (
+        patch("app.api.archive_operations.SMBBackend", return_value=backend),
+        patch("app.api.archive_operations.create_archive_from_files", new=AsyncMock(side_effect=create_archive)) as creator,
+    ):
+        response = client.post(f"/api/archive/v2/operations/{prepared['id']}/creation/begin", headers=auth_headers_user)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["phase"] == "completed"
+    assert streamed == [b"hello"]
+    assert reader.closed
+    assert creator.await_args.kwargs["source_paths"] == ["nested"]
+    assert {entry["archive_path"] for entry in json.loads(response.json()["checkpoint_json"])["manifest"]} == {
+        "nested",
+        "nested/empty",
+        "nested/report.txt",
+    }
+
+
+def test_v2_zip_member_creation_rejects_invalid_scope_and_closes_failed_source(
+    client: TestClient,
+    auth_headers_user: dict,
+    test_connection: Connection,
+) -> None:
+    request = {
+        "contract_version": "v2",
+        "kind": "create",
+        "source_connection_id": str(test_connection.id),
+        "source_path": "source.zip",
+        "destination_connection_id": str(test_connection.id),
+        "destination_path": "backup.zip",
+        "selected_member_paths": ["nested/report.txt"],
+    }
+    invalid = client.post("/api/archive/v2/operations", headers=auth_headers_user, json={**request, "selected_member_paths": ["../escape"]})
+    assert invalid.status_code == 422
+    mixed = client.post(
+        "/api/archive/v2/operations",
+        headers=auth_headers_user,
+        json={**request, "destination_connection_id": "local-drive:c"},
+    )
+    assert mixed.status_code == 422
+
+    prepared = client.post("/api/archive/v2/operations", headers=auth_headers_user, json=request).json()
+    backend = AsyncMock()
+    archive_buffer = BytesIO()
+    with ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("nested/report.txt", b"hello")
+        archive.writestr("../unsafe.txt", b"unsafe")
+    reader = MemoryRandomAccessReader(archive_buffer.getvalue())
+    backend.get_file_info.return_value = FileInfo(
+        name="source.zip", path="source.zip", type=FileType.FILE, size=len(archive_buffer.getvalue())
+    )
+    backend.open_random_access_reader.return_value = reader
+    with (
+        patch("app.api.archive_operations.SMBBackend", return_value=backend),
+        patch("app.api.archive_operations.create_archive_from_files", new=AsyncMock()) as creator,
+    ):
+        response = client.post(f"/api/archive/v2/operations/{prepared['id']}/creation/begin", headers=auth_headers_user)
+
+    assert response.status_code == 422
+    assert reader.closed
+    creator.assert_not_awaited()
+
+
 def test_v2_executes_same_connection_creation_with_strict_ledger(
     client: TestClient,
     auth_headers_user: dict,
@@ -1269,6 +1370,8 @@ def test_executes_same_connection_extraction(
             "members_processed": 2,
             "members_completed": 2,
             "members_skipped": 0,
+            "encrypted_members_skipped": 0,
+            "unsupported_compression_members_skipped": 0,
             "members_failed": 0,
             "files_extracted": 2,
             "directories_created": 1,
@@ -1682,6 +1785,8 @@ def test_direct_extraction_source_loss_persists_known_aggregate_progress(
         "members_processed": 1,
         "members_completed": 1,
         "members_skipped": 0,
+        "encrypted_members_skipped": 0,
+        "unsupported_compression_members_skipped": 0,
         "members_failed": 0,
         "files_extracted": 1,
         "directories_created": 1,
@@ -1889,6 +1994,8 @@ def test_live_smb_to_companion_relay_is_source_driven_and_aggregate_only(
         "members_processed": 1,
         "members_completed": 1,
         "members_skipped": 0,
+        "encrypted_members_skipped": 0,
+        "unsupported_compression_members_skipped": 0,
         "members_failed": 0,
         "files_extracted": 1,
         "directories_created": 0,

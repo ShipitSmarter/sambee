@@ -1,5 +1,7 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render as renderBase, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearCachedAsyncData,
@@ -7,16 +9,29 @@ import {
   getCachedAsyncData,
   primeCachedAsyncData,
 } from "../../hooks/useCachedAsyncData";
+import { setRegionalLocalePreference } from "../../i18n";
+import { createMockAdminUser, createMockAdminUserList } from "../../test/fixtures/users";
+import { requireTestElement, requireTestValue } from "../../test/helpers/assertions";
 import { SambeeThemeProvider } from "../../theme";
 import type { AdminUserCreateResult, AdminUserPasswordResetResult } from "../../types";
 import { USER_DIRECTORY_VISIBLE_COLUMNS_STORAGE_KEY, UserManagementSettings } from "../UserManagementSettings";
 
+let testRouter: ReturnType<typeof createMemoryRouter>;
+const render = (ui: ReactNode) => {
+  const url = new URL(document.URL);
+  testRouter = createMemoryRouter([{ path: "*", element: ui }], { initialEntries: [url.pathname + url.search] });
+  return renderBase(<RouterProvider router={testRouter} />);
+};
+
 vi.mock("../../services/api", () => ({
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
     getUsers: vi.fn(),
     getCurrentUser: vi.fn(),
     getOidcConfiguration: vi.fn(),
     moveOidcIdentity: vi.fn(),
+    cancelPendingOidcMapping: vi.fn(),
+    detachOidcIdentity: vi.fn(),
     createUser: vi.fn(),
     updateUser: vi.fn(),
     resetUserPassword: vi.fn(),
@@ -73,21 +88,23 @@ describe("UserManagementSettings", () => {
     window.localStorage.removeItem(USER_DIRECTORY_VISIBLE_COLUMNS_STORAGE_KEY);
     window.history.replaceState(null, "", window.location.pathname);
     vi.mocked(isControlledReauthenticationInProgress).mockReturnValue(false);
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     vi.mocked(api.getCurrentUser).mockResolvedValue({
       id: "user-1",
       username: "admin",
@@ -121,6 +138,35 @@ describe("UserManagementSettings", () => {
     expect(getCachedAsyncData(firstDirectoryKey)).toBeNull();
     expect(getCachedAsyncData(secondDirectoryKey)).toBeNull();
     expect(getCachedAsyncData(unrelatedKey)).toBe("unrelated");
+  });
+
+  it("shows username conflicts even for an empty directory and clears resolved conflicts", async () => {
+    const directory = {
+      items: [],
+      total: 0,
+      summary: { total: 0, active_admins: 0, disabled: 0, expiring_soon: 0, pending_oidc: 0, unavailable_sign_in: 0 },
+      username_conflicts: [["UserA", "usera"]],
+    };
+    vi.mocked(api.getUsers).mockResolvedValue(directory);
+    const view = render(
+      <SambeeThemeProvider>
+        <UserManagementSettings />
+      </SambeeThemeProvider>
+    );
+    const warning = await screen.findByText(/These accounts have conflicting usernames/);
+    expect(warning.closest('[role="status"]')).toHaveTextContent("UserA, usera");
+    expect(warning).toHaveTextContent("exact spelling");
+    view.unmount();
+    clearCachedAsyncData();
+    vi.mocked(api.getUsers).mockResolvedValue({ ...directory, username_conflicts: [] });
+    render(
+      <SambeeThemeProvider>
+        <UserManagementSettings />
+      </SambeeThemeProvider>
+    );
+    await waitFor(() => expect(api.getUsers).toHaveBeenCalledTimes(2));
+    await screen.findByRole("button", { name: /add user/i });
+    expect(screen.queryByText(/These accounts have conflicting usernames/)).not.toBeInTheDocument();
   });
 
   it("opens the create-user dialog with outlined form controls", async () => {
@@ -176,34 +222,36 @@ describe("UserManagementSettings", () => {
   });
 
   it("uses the inline bold username confirmation when deleting another user", async () => {
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "other-user",
-        role: "viewer",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "other-user",
+          role: "viewer",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     render(
@@ -274,7 +322,7 @@ describe("UserManagementSettings", () => {
         "Choose an access level",
         "Leave blank for no expiration",
         "If left blank, the server will generate a secure temporary password",
-        "Prompt for a new password at next sign-in",
+        "Block local-password access until the password is changed. OIDC sign-in remains available.",
       ];
 
       for (const description of descriptions) {
@@ -375,23 +423,25 @@ describe("UserManagementSettings", () => {
 
   it("uses the role selector and read-only identity fields for linked OIDC users", async () => {
     mockOidcAuthenticationEnabled();
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        name: "OIDC Admin",
-        email: "admin@example.test",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: { identity_id: "identity-1", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          name: "OIDC Admin",
+          email: "admin@example.test",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: { identity_id: "identity-1", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     render(
@@ -412,36 +462,38 @@ describe("UserManagementSettings", () => {
 
   it("shows the inherited OIDC role and clears an individual override", async () => {
     mockOidcAuthenticationEnabled();
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "oidc-user",
-        name: "OIDC User",
-        email: "oidc-user@example.test",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: "admin",
-        oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "viewer" },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "oidc-user",
+          name: "OIDC User",
+          email: "oidc-user@example.test",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: "admin",
+          oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "viewer" },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     render(
@@ -473,38 +525,40 @@ describe("UserManagementSettings", () => {
 
   it("does not offer an inherited role for a pending OIDC mapping", async () => {
     mockOidcAuthenticationEnabled();
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "pending-user",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: "admin",
-        oidc: null,
-        pending_oidc: {
-          expected_username: "provider-user",
-          created_by_username: "admin",
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
           created_at: "2026-03-01T10:00:00Z",
-        },
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "pending-user",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: "admin",
+          oidc: null,
+          pending_oidc: {
+            expected_username: "provider-user",
+            created_by_username: "admin",
+            created_at: "2026-03-01T10:00:00Z",
+          },
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     render(
@@ -524,34 +578,36 @@ describe("UserManagementSettings", () => {
 
   it("does not offer an inherited role until a linked OIDC account has a verified role", async () => {
     mockOidcAuthenticationEnabled();
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "unresolved-oidc-user",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: "admin",
-        oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: null },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "unresolved-oidc-user",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: "admin",
+          oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: null },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     render(
@@ -604,7 +660,7 @@ describe("UserManagementSettings", () => {
     expect(passwordInput).toHaveAttribute("type", "text");
     expect(screen.getByRole("button", { name: /hide initial password/i })).toBeInTheDocument();
 
-    const passwordChangeSwitch = screen.getByLabelText(/require password change after next sign-in/i);
+    const passwordChangeSwitch = screen.getByLabelText(/require change on next password sign-in/i);
     expect(screen.getByText("On")).toBeInTheDocument();
     await user.click(passwordChangeSwitch);
     expect(screen.getByText("Off")).toBeInTheDocument();
@@ -679,18 +735,24 @@ describe("UserManagementSettings", () => {
 
       expect(header.querySelectorAll('[role="columnheader"]')).toHaveLength(6);
       expect(row.children).toHaveLength(6);
-      expect(screen.getByTestId("user-row-role")).toHaveStyle({ width: "fit-content" });
+      expect(screen.getByTestId("user-row-role")).toHaveTextContent("Admin");
+      expect(row.querySelector(".MuiChip-root")).toBeNull();
       const sortButtons = within(header).getAllByRole("button", { name: /^Sort by/ });
       expect(sortButtons).toHaveLength(5);
       for (const sortButton of sortButtons) {
         expect(sortButton).toHaveAttribute("tabindex", "-1");
       }
-      expect(within(header).getByRole("button", { name: "Manage visible columns" })).toHaveAttribute("tabindex", "-1");
+      expect(screen.getAllByRole("button", { name: "Columns" })).toHaveLength(1);
+      const headerColumnsButton = within(header.lastElementChild as HTMLElement).getByRole("button", { name: "Manage visible columns" });
 
       await user.tab();
       expect(screen.getByRole("textbox", { name: "Search users" })).toHaveFocus();
       await user.tab();
       expect(screen.getByRole("button", { name: "Filters" })).toHaveFocus();
+      await user.tab();
+      expect(screen.getByRole("button", { name: "Columns" })).toHaveFocus();
+      await user.tab();
+      expect(headerColumnsButton).toHaveFocus();
       await user.tab();
       expect(screen.getByRole("button", { name: "Edit admin" })).toHaveFocus();
       await user.tab();
@@ -704,7 +766,7 @@ describe("UserManagementSettings", () => {
     }
   });
 
-  it("lets users choose and restore directory columns", async () => {
+  it("keeps the header column menu open through selection changes and restores focus to the visible trigger", async () => {
     const restoreViewport = mockViewportWidth(1200);
     const user = userEvent.setup();
 
@@ -716,18 +778,41 @@ describe("UserManagementSettings", () => {
       );
 
       await screen.findByTestId("user-directory-header");
-      await user.click(within(screen.getByTestId("user-directory-header")).getByRole("button", { name: "Manage visible columns" }));
+      const columnsButton = within(screen.getByTestId("user-directory-header")).getByRole("button", { name: "Manage visible columns" });
+      const headerBounds = vi.spyOn(columnsButton, "getBoundingClientRect").mockReturnValue(new DOMRect(800, 200, 28, 28));
+      await user.click(columnsButton);
+      const expectStableTrigger = () => {
+        expect(screen.getByRole("button", { name: "Manage visible columns", hidden: true })).toBe(columnsButton);
+        expect(columnsButton).toBeVisible();
+        expect(columnsButton).toHaveAttribute("aria-expanded", "true");
+        expect(screen.getByRole("menu")).toBeVisible();
+      };
+      await user.click(screen.getByRole("menuitemcheckbox", { name: "Email" }));
+      expect(screen.getByTestId("user-row").children).toHaveLength(7);
+      expectStableTrigger();
       await user.click(screen.getByRole("menuitemcheckbox", { name: "Expiration" }));
 
       expect(within(screen.getByTestId("user-directory-header")).queryByText("Expiration", { exact: true })).not.toBeInTheDocument();
-      expect(screen.getByTestId("user-row").children).toHaveLength(5);
+      expect(screen.getByTestId("user-row").children).toHaveLength(6);
       expect(JSON.parse(window.localStorage.getItem(USER_DIRECTORY_VISIBLE_COLUMNS_STORAGE_KEY) ?? "[]")).not.toContain("expiration");
+      expectStableTrigger();
 
       await user.click(screen.getByRole("menuitem", { name: "Reset columns" }));
 
       expect(within(screen.getByTestId("user-directory-header")).getByText("Expiration", { exact: true })).toBeInTheDocument();
       expect(screen.getByTestId("user-row").children).toHaveLength(6);
       expect(window.localStorage.getItem(USER_DIRECTORY_VISIBLE_COLUMNS_STORAGE_KEY)).toBeNull();
+      expectStableTrigger();
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+      expect(columnsButton).toHaveFocus();
+      expect(columnsButton).toHaveAttribute("aria-expanded", "false");
+      await user.click(columnsButton);
+      headerBounds.mockReturnValue(new DOMRect());
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+      expect(screen.getByRole("button", { name: "Columns" })).toHaveFocus();
+      headerBounds.mockRestore();
     } finally {
       restoreViewport();
     }
@@ -745,7 +830,7 @@ describe("UserManagementSettings", () => {
       );
 
       await screen.findByTestId("user-directory-header");
-      await user.click(within(screen.getByTestId("user-directory-header")).getByRole("button", { name: "Manage visible columns" }));
+      await user.click(screen.getByRole("button", { name: "Columns" }));
 
       expect(screen.getByRole("menuitemcheckbox", { name: "Email" })).toBeInTheDocument();
       expect(screen.getByRole("menuitemcheckbox", { name: "Created" })).toBeInTheDocument();
@@ -772,7 +857,7 @@ describe("UserManagementSettings", () => {
       );
 
       await screen.findByTestId("user-directory-header");
-      await user.click(within(screen.getByTestId("user-directory-header")).getByRole("button", { name: "Manage visible columns" }));
+      await user.click(screen.getByRole("button", { name: "Columns" }));
 
       expect(screen.getByRole("menuitemcheckbox", { name: "Last OIDC sign-in" })).toBeInTheDocument();
       expect(screen.getByRole("menuitemcheckbox", { name: "OIDC state" })).toBeInTheDocument();
@@ -826,10 +911,88 @@ describe("UserManagementSettings", () => {
         expect.stringContaining("Expiration: Never"),
         "",
       ]);
-      expect(within(row.children[5]).getByRole("button", { name: "Edit admin" })).toBeInTheDocument();
-      expect(within(row.children[5]).getByRole("button", { name: "User actions for admin" })).toBeInTheDocument();
+      const actionsCell = within(requireTestElement(row.children[5], HTMLElement));
+      expect(actionsCell.getByRole("button", { name: "Edit admin" })).toBeInTheDocument();
+      expect(actionsCell.getByRole("button", { name: "User actions for admin" })).toBeInTheDocument();
     } finally {
       restoreViewport();
+    }
+  });
+
+  it("keeps long identifiers and multiple statuses as full plain text with compact localized timestamps", async () => {
+    const timestamp = "2026-03-01T10:00:00Z";
+    const email = "very.long.email.address.without.breaks@example-with-a-very-long-domain.example";
+    const provider = "VeryLongIdentityProviderNameWithoutSpaces";
+    const columns = [
+      "role",
+      "status",
+      "signIn",
+      "lastSignIn",
+      "expiration",
+      "email",
+      "createdAt",
+      "updatedAt",
+      "oidcState",
+      "roleSource",
+      "oidcProvider",
+    ];
+    window.localStorage.setItem(USER_DIRECTORY_VISIBLE_COLUMNS_STORAGE_KEY, JSON.stringify(columns));
+    mockOidcAuthenticationEnabled();
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "long-user",
+          username: "very-long-username-without-spaces",
+          name: "Layout test",
+          email,
+          role: "admin",
+          is_active: false,
+          must_change_password: true,
+          has_local_password: true,
+          expires_at: "2025-01-01T10:00:00Z",
+          created_at: timestamp,
+          updated_at: timestamp,
+          oidc_role_assignment: "admin",
+          pending_oidc: null,
+          oidc: {
+            identity_id: "identity",
+            user_id: "long-user",
+            provider_display_name: provider,
+            issuer: "https://idp.example",
+            subject: "subject",
+            last_seen_username: "long-user",
+            last_groups: [],
+            created_at: timestamp,
+            last_login_at: timestamp,
+          },
+        }),
+      ])
+    );
+    await setRegionalLocalePreference("de-DE");
+    try {
+      render(
+        <SambeeThemeProvider>
+          <UserManagementSettings />
+        </SambeeThemeProvider>
+      );
+      const row = await screen.findByTestId("user-row");
+      expect(row.querySelector(".MuiChip-root")).toBeNull();
+      expect(row.children).toHaveLength(columns.length + 2);
+      expect(screen.getByTestId("user-row-email")).toHaveTextContent(email);
+      expect(screen.getByTestId("user-row-oidc-provider")).toHaveTextContent(provider);
+      expect(screen.getByTestId("user-row-role")).toHaveTextContent("Admin");
+      const statuses = screen.getByTestId("user-metadata");
+      expect(Array.from(statuses.children, (status) => status.textContent)).toEqual(["Disabled", "Expired", "Pwd change req'd"]);
+      const created = screen.getByTestId("user-row-created");
+      expect(
+        within(created).getByText(new Intl.DateTimeFormat("de-DE", { dateStyle: "short" }).format(new Date(timestamp)))
+      ).toBeInTheDocument();
+      expect(
+        within(created).getByText(new Intl.DateTimeFormat("de-DE", { timeStyle: "short" }).format(new Date(timestamp)))
+      ).toBeInTheDocument();
+      expect(created.querySelector("time")).toHaveAttribute("datetime", timestamp);
+    } finally {
+      await setRegionalLocalePreference("browser");
     }
   });
 
@@ -851,7 +1014,7 @@ describe("UserManagementSettings", () => {
 
     await screen.findByText("admin (you)", { exact: true });
     expect(api.getUsers).toHaveBeenCalledTimes(1);
-    expect(api.getCurrentUser).toHaveBeenCalledTimes(1);
+    expect(api.getCurrentUser).toHaveBeenCalledTimes(3);
     expect(api.getOidcConfiguration).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("progressbar", { name: "Updating user directory" })).not.toBeInTheDocument();
   });
@@ -862,21 +1025,23 @@ describe("UserManagementSettings", () => {
     let resolveSortedUsers: ((users: Awaited<ReturnType<typeof api.getUsers>>) => void) | undefined;
 
     vi.mocked(api.getUsers)
-      .mockResolvedValueOnce([
-        {
-          id: "user-1",
-          username: "admin",
-          role: "admin",
-          is_active: true,
-          must_change_password: false,
-          has_local_password: true,
-          oidc_role_assignment: null,
-          oidc: null,
-          pending_oidc: null,
-          created_at: "2026-03-01T10:00:00Z",
-          updated_at: "2026-03-01T10:00:00Z",
-        },
-      ])
+      .mockResolvedValueOnce(
+        createMockAdminUserList([
+          createMockAdminUser({
+            id: "user-1",
+            username: "admin",
+            role: "admin",
+            is_active: true,
+            must_change_password: false,
+            has_local_password: true,
+            oidc_role_assignment: null,
+            oidc: null,
+            pending_oidc: null,
+            created_at: "2026-03-01T10:00:00Z",
+            updated_at: "2026-03-01T10:00:00Z",
+          }),
+        ])
+      )
       .mockImplementationOnce(
         () =>
           new Promise((resolve) => {
@@ -896,24 +1061,26 @@ describe("UserManagementSettings", () => {
 
       expect(screen.getByText("admin (you)", { exact: true })).toBeInTheDocument();
       expect(screen.getByRole("progressbar", { name: "Updating user directory" })).toBeInTheDocument();
-      expect(api.getCurrentUser).toHaveBeenCalledTimes(1);
+      expect(api.getCurrentUser).toHaveBeenCalledTimes(2);
       expect(api.getOidcConfiguration).toHaveBeenCalledTimes(1);
 
-      resolveSortedUsers?.([
-        {
-          id: "user-1",
-          username: "admin",
-          role: "admin",
-          is_active: true,
-          must_change_password: false,
-          has_local_password: true,
-          oidc_role_assignment: null,
-          oidc: null,
-          pending_oidc: null,
-          created_at: "2026-03-01T10:00:00Z",
-          updated_at: "2026-03-01T10:00:00Z",
-        },
-      ]);
+      resolveSortedUsers?.(
+        createMockAdminUserList([
+          createMockAdminUser({
+            id: "user-1",
+            username: "admin",
+            role: "admin",
+            is_active: true,
+            must_change_password: false,
+            has_local_password: true,
+            oidc_role_assignment: null,
+            oidc: null,
+            pending_oidc: null,
+            created_at: "2026-03-01T10:00:00Z",
+            updated_at: "2026-03-01T10:00:00Z",
+          }),
+        ])
+      );
       await waitFor(() => expect(api.getUsers).toHaveBeenCalledTimes(2));
       await waitFor(() => expect(screen.queryByRole("progressbar", { name: "Updating user directory" })).not.toBeInTheDocument());
     } finally {
@@ -924,21 +1091,23 @@ describe("UserManagementSettings", () => {
   it("hides OIDC-only controls and clears OIDC query parameters when OIDC is disabled", async () => {
     const restoreViewport = mockViewportWidth(1200);
     window.history.replaceState(null, "", `${window.location.pathname}?auth=oidc&oidc_state=linked&role_source=oidc_groups`);
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: { identity_id: "identity-1", provider_display_name: "Corporate login", last_login_at: null },
-        pending_oidc: { expected_username: "admin", created_by_username: "admin", created_at: "2026-03-01T10:00:00Z" },
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: { identity_id: "identity-1", provider_display_name: "Corporate login", last_login_at: null },
+          pending_oidc: { expected_username: "admin", created_by_username: "admin", created_at: "2026-03-01T10:00:00Z" },
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     const user = userEvent.setup();
 
     try {
@@ -949,15 +1118,15 @@ describe("UserManagementSettings", () => {
       );
 
       await screen.findByText("admin (you)", { exact: true });
-      await user.click(screen.getByRole("button", { name: "Filters" }));
+      await user.click(await screen.findByRole("button", { name: "Filters" }));
 
       expect(screen.queryByRole("combobox", { name: "OIDC state" })).not.toBeInTheDocument();
       expect(screen.queryByRole("combobox", { name: "Role source" })).not.toBeInTheDocument();
       expect(screen.queryByText("Last OIDC sign-in", { exact: true })).not.toBeInTheDocument();
       expect(screen.queryByText(/OIDC setup pending/)).not.toBeInTheDocument();
-      expect(window.location.search).not.toContain("auth=oidc");
-      expect(window.location.search).not.toContain("oidc_state");
-      expect(window.location.search).not.toContain("role_source");
+      expect(testRouter.state.location.search).not.toContain("auth=oidc");
+      expect(testRouter.state.location.search).not.toContain("oidc_state");
+      expect(testRouter.state.location.search).not.toContain("role_source");
 
       await user.keyboard("{Escape}");
       await openUserActions(user, "admin");
@@ -1034,42 +1203,44 @@ describe("UserManagementSettings", () => {
 
   it("shows OIDC state and hides password reset for a passwordless account", async () => {
     mockOidcAuthenticationEnabled();
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: {
-          identity_id: "identity-1",
-          provider_display_name: "Corporate login",
-          last_login_at: "2026-03-01T10:00:00Z",
-        },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "second-oidc-user",
-        role: "viewer",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: {
-          identity_id: "identity-2",
-          provider_display_name: "Corporate login",
-          last_login_at: null,
-        },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: {
+            identity_id: "identity-1",
+            provider_display_name: "Corporate login",
+            last_login_at: "2026-03-01T10:00:00Z",
+          },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "second-oidc-user",
+          role: "viewer",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: {
+            identity_id: "identity-2",
+            provider_display_name: "Corporate login",
+            last_login_at: null,
+          },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
 
     render(
       <SambeeThemeProvider>
@@ -1078,15 +1249,14 @@ describe("UserManagementSettings", () => {
     );
 
     expect((await screen.findAllByText("OIDC", { exact: true })).length).toBeGreaterThan(0);
-    const localTimestamp = new Intl.DateTimeFormat(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "short",
-    }).format(new Date("2026-03-01T10:00:00Z"));
-    expect(screen.getByText(localTimestamp)).toBeInTheDocument();
+    const lastSignIn = requireTestValue(screen.getAllByTestId("user-row-last-oidc-sign-in")[0]);
+    expect(
+      within(lastSignIn).getByText(new Intl.DateTimeFormat(undefined, { dateStyle: "short" }).format(new Date("2026-03-01T10:00:00Z")))
+    ).toBeInTheDocument();
+    expect(
+      within(lastSignIn).getByText(new Intl.DateTimeFormat(undefined, { timeStyle: "short" }).format(new Date("2026-03-01T10:00:00Z")))
+    ).toBeInTheDocument();
+    expect(lastSignIn.querySelector("time")).toHaveAttribute("datetime", "2026-03-01T10:00:00Z");
     expect(screen.getAllByText("second-oidc-user", { exact: true })).toHaveLength(2);
     expect(screen.queryByRole("button", { name: /reset password/i })).not.toBeInTheDocument();
   });
@@ -1095,79 +1265,82 @@ describe("UserManagementSettings", () => {
     ["oidc_only", "uniform"],
     ["oidc_or_password", "group_based"],
   ] as const)("renders directory identities in %s mode", async (authMode, roleAssignmentMode) => {
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "local-user",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "inherited-user",
-        role: "editor",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-3",
-        username: "override-user",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: "admin",
-        oidc: { identity_id: "identity-3", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-4",
-        username: "pending-user",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: "admin",
-        oidc: null,
-        pending_oidc: {
-          expected_username: "pending-user",
-          created_by_username: "local-user",
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "local-user",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
           created_at: "2026-03-01T10:00:00Z",
-        },
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-5",
-        username: "unresolved-user",
-        role: "editor",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: false,
-        oidc_role_assignment: null,
-        oidc: { identity_id: "identity-5", provider_display_name: "Corporate login", last_login_at: null, inherited_role: null },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "inherited-user",
+          role: "editor",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-3",
+          username: "override-user",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: "admin",
+          oidc: { identity_id: "identity-3", provider_display_name: "Corporate login", last_login_at: null, inherited_role: "editor" },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-4",
+          username: "pending-user",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: "admin",
+          oidc: null,
+          pending_oidc: {
+            expected_username: "pending-user",
+            created_by_username: "local-user",
+            created_at: "2026-03-01T10:00:00Z",
+          },
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-5",
+          username: "unresolved-user",
+          role: "editor",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: false,
+          oidc_role_assignment: null,
+          oidc: { identity_id: "identity-5", provider_display_name: "Corporate login", last_login_at: null, inherited_role: null },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     vi.mocked(api.getOidcConfiguration).mockResolvedValue({
       configuration: {
+        no_refresh_session_limit_hours: 8,
         display_name: "Corporate login",
         issuer_url: "https://idp.example.test",
         client_id: "sambee",
@@ -1232,46 +1405,49 @@ describe("UserManagementSettings", () => {
 
   it("uses the centralized OIDC mapping dialog and closes change and move workflows with Escape", async () => {
     const restoreViewport = mockViewportWidth(1200);
-    vi.mocked(api.getUsers).mockResolvedValue([
-      {
-        id: "user-1",
-        username: "linked-admin",
-        role: "admin",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: {
-          identity_id: "identity-1",
-          user_id: "user-1",
-          provider_display_name: "Corporate login",
-          issuer: "https://idp.example.test",
-          subject: "provider-subject-1",
-          last_seen_username: "linked-admin",
-          last_groups: ["admins", "operators"],
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "linked-admin",
+          role: "admin",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: {
+            identity_id: "identity-1",
+            user_id: "user-1",
+            provider_display_name: "Corporate login",
+            issuer: "https://idp.example.test",
+            subject: "provider-subject-1",
+            last_seen_username: "linked-admin",
+            last_groups: ["admins", "operators"],
+            created_at: "2026-03-01T10:00:00Z",
+            last_login_at: null,
+          },
+          pending_oidc: null,
           created_at: "2026-03-01T10:00:00Z",
-          last_login_at: null,
-        },
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-      {
-        id: "user-2",
-        username: "unmapped-user",
-        role: "viewer",
-        is_active: true,
-        must_change_password: false,
-        has_local_password: true,
-        oidc_role_assignment: null,
-        oidc: null,
-        pending_oidc: null,
-        created_at: "2026-03-01T10:00:00Z",
-        updated_at: "2026-03-01T10:00:00Z",
-      },
-    ]);
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "unmapped-user",
+          role: "viewer",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
     vi.mocked(api.getOidcConfiguration).mockResolvedValue({
       configuration: {
+        no_refresh_session_limit_hours: 8,
         display_name: "Corporate login",
         issuer_url: "https://idp.example.test",
         client_id: "sambee",
@@ -1429,6 +1605,116 @@ describe("UserManagementSettings", () => {
     restoreViewport();
   });
 
+  it.each([
+    {
+      action: "Cancel pending OIDC mapping",
+      username: "pending-user",
+      method: "cancelPendingOidcMapping",
+      warning: "Cancel the pending OIDC mapping for pending-user?",
+    },
+    {
+      action: "Detach OIDC identity",
+      username: "linked-user",
+      method: "detachOidcIdentity",
+      warning: "Detach the OIDC identity from linked-user? This does not revoke IdP access.",
+    },
+  ] as const)("confirms $action only after explicit acceptance", async ({ action, username, method, warning }) => {
+    const restoreViewport = mockViewportWidth(1200);
+    vi.mocked(api.getUsers).mockResolvedValue(
+      createMockAdminUserList([
+        createMockAdminUser({
+          id: "user-1",
+          username: "pending-user",
+          role: "editor",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: null,
+          pending_oidc: { expected_username: "pending-user", created_by_username: "admin", created_at: "2026-03-01T10:00:00Z" },
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+        createMockAdminUser({
+          id: "user-2",
+          username: "linked-user",
+          role: "editor",
+          is_active: true,
+          must_change_password: false,
+          has_local_password: true,
+          oidc_role_assignment: null,
+          oidc: { identity_id: "identity-2", provider_display_name: "Corporate login", last_login_at: null },
+          pending_oidc: null,
+          created_at: "2026-03-01T10:00:00Z",
+          updated_at: "2026-03-01T10:00:00Z",
+        }),
+      ])
+    );
+    vi.mocked(api.getOidcConfiguration).mockResolvedValue({
+      configuration: {
+        no_refresh_session_limit_hours: 8,
+        display_name: "Corporate login",
+        issuer_url: "https://idp.example.test",
+        client_id: "sambee",
+        client_secret_configured: true,
+        scopes: ["openid"],
+        username_claim: "preferred_username",
+        name_claim: "name",
+        email_claim: "email",
+        groups_claim: "groups",
+        sign_in_mode: "oidc_or_password",
+        interactive_reauthentication_max_age_days: 30,
+        admission_mode: "all_idp_users",
+        admission_groups: [],
+        role_assignment_mode: "uniform",
+        uniform_role: "editor",
+        role_mappings: { admin: [], editor: [], viewer: [] },
+        auto_link_by_username: true,
+        configuration_revision: 2,
+        identity_mapping_revision: 1,
+      },
+      active_passwordless_user_count: 0,
+      auth_mode: "oidc_or_password",
+      auth_enforcement_disabled: false,
+      health: { status: "healthy", public_url_configured: false, public_url: null, redirect_uri: null, reasons: [] },
+    });
+    vi.mocked(api[method]).mockResolvedValue({ identity_mapping_revision: 1, pending_mappings: [] });
+    const user = userEvent.setup();
+    render(
+      <SambeeThemeProvider>
+        <UserManagementSettings />
+      </SambeeThemeProvider>
+    );
+
+    const openConfirmation = async () => {
+      await openUserActions(user, username);
+      await user.click(screen.getByRole("menuitem", { name: action }));
+      return screen.findByRole("dialog", { name: `${action}?` });
+    };
+
+    let dialog = await openConfirmation();
+    expect(within(dialog).getByText(warning)).toBeInTheDocument();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    expect(cancel).toHaveClass("MuiButton-outlined");
+    expect(within(dialog).getByRole("button", { name: action })).toHaveClass("MuiButton-contained", "MuiButton-colorError");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: `${action}?` })).not.toBeInTheDocument());
+    expect(api[method]).not.toHaveBeenCalled();
+
+    dialog = await openConfirmation();
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus());
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: `${action}?` })).not.toBeInTheDocument());
+    expect(api[method]).not.toHaveBeenCalled();
+
+    dialog = await openConfirmation();
+    await user.click(within(dialog).getByRole("button", { name: action }));
+    await waitFor(() => expect(api[method]).toHaveBeenCalledOnce());
+    expect(api[method]).toHaveBeenCalledWith(username === "pending-user" ? "user-1" : "user-2", 1);
+    restoreViewport();
+  });
+
   it("lets the admin enter a new password for a reset", async () => {
     const user = userEvent.setup();
 
@@ -1457,7 +1743,7 @@ describe("UserManagementSettings", () => {
 
     await user.type(passwordInput, "BrandNewPass123!");
     expect(screen.getByText("On")).toBeInTheDocument();
-    await user.click(screen.getByLabelText(/require password change after next sign-in/i));
+    await user.click(screen.getByLabelText(/require change on next password sign-in/i));
     expect(screen.getByText("Off")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /set password/i }));
@@ -1586,19 +1872,21 @@ describe("UserManagementSettings", () => {
     expect(screen.getByRole("button", { name: /create user/i })).toHaveTextContent(/create user/i);
     expect(screen.getByRole("progressbar")).toBeInTheDocument();
 
-    resolveCreateUser({
-      id: "user-2",
-      username: "new-admin",
-      role: "editor",
-      is_active: true,
-      must_change_password: true,
-      has_local_password: true,
-      oidc_role_assignment: null,
-      oidc: null,
-      pending_oidc: null,
-      created_at: "2026-03-01T10:00:00Z",
-      updated_at: "2026-03-01T10:00:00Z",
-      temporary_password: null,
+    await act(async () => {
+      resolveCreateUser({
+        id: "user-2",
+        username: "new-admin",
+        role: "editor",
+        is_active: true,
+        must_change_password: true,
+        has_local_password: true,
+        oidc_role_assignment: null,
+        oidc: null,
+        pending_oidc: null,
+        created_at: "2026-03-01T10:00:00Z",
+        updated_at: "2026-03-01T10:00:00Z",
+        temporary_password: null,
+      });
     });
   });
 });

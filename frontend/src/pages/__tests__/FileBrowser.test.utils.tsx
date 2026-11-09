@@ -4,8 +4,8 @@
  *          FileBrowser-interactions.test.tsx, FileBrowser-viewer.test.tsx
  */
 
-import { render } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { act, render } from "@testing-library/react";
+import { createMemoryRouter, Outlet, RouterProvider, useLocation } from "react-router-dom";
 import { LocalePreferencesProvider } from "../../i18n/LocalePreferencesProvider";
 import { SambeeThemeProvider } from "../../theme/ThemeContext";
 import FileBrowser from "../FileBrowser";
@@ -27,18 +27,41 @@ export {
 
 // Helper function to render FileBrowser component with routing
 export const renderBrowser = (initialPath = "/browse") => {
-  return render(
-    <LocalePreferencesProvider>
-      <SambeeThemeProvider>
-        <MemoryRouter initialEntries={[initialPath]}>
-          <RouterLocationProbe />
-          <Routes>
-            <Route path="/browse/:targetType/:targetId/*" element={<FileBrowser />} />
-            <Route path="/browse" element={<FileBrowser />} />
-            <Route path="/login" element={<div>Login Page</div>} />
-          </Routes>
-        </MemoryRouter>
-      </SambeeThemeProvider>
-    </LocalePreferencesProvider>
+  const router = createMemoryRouter(
+    [
+      {
+        element: (
+          <>
+            <RouterLocationProbe />
+            <Outlet />
+          </>
+        ),
+        children: [
+          { path: "/browse/:targetType/:targetId/*", element: <FileBrowser /> },
+          { path: "/browse", element: <FileBrowser /> },
+          { path: "/login", element: <div>Login Page</div> },
+        ],
+      },
+    ],
+    { initialEntries: [initialPath] }
   );
+  return {
+    ...render(
+      <LocalePreferencesProvider>
+        <SambeeThemeProvider>
+          <RouterProvider router={router} />
+        </SambeeThemeProvider>
+      </LocalePreferencesProvider>
+    ),
+    router,
+  };
+};
+
+export const renderBrowserAndFlush = async (initialPath = "/browse") => {
+  let result: ReturnType<typeof renderBrowser> | undefined;
+  await act(async () => {
+    result = renderBrowser(initialPath);
+  });
+  if (!result) throw new Error("FileBrowser did not mount during act");
+  return result;
 };

@@ -1,18 +1,20 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale } from "../../../i18n";
 import { CONNECTION_TYPE_LOCAL, LOCAL_DRIVE_PREFIX } from "../../../services/backendRouter";
+import { createMockConnection } from "../../../test/fixtures/connections";
 import { SambeeThemeProvider } from "../../../theme/ThemeContext";
 import { ConnectionSelector } from "../ConnectionSelector";
 
 describe("ConnectionSelector", () => {
   afterEach(async () => {
+    cleanup();
     await setLocale("en");
   });
 
   const connections = [
-    {
+    createMockConnection({
       id: "server-1",
       name: "Office Share",
       type: "smb",
@@ -22,8 +24,8 @@ describe("ConnectionSelector", () => {
       username: "alex",
       created_at: "2026-03-11T00:00:00Z",
       updated_at: "2026-03-11T00:00:00Z",
-    },
-    {
+    }),
+    createMockConnection({
       id: `${LOCAL_DRIVE_PREFIX}c`,
       name: "Local Disk (C:)",
       type: CONNECTION_TYPE_LOCAL,
@@ -33,7 +35,7 @@ describe("ConnectionSelector", () => {
       username: "",
       created_at: "2026-03-11T00:00:00Z",
       updated_at: "2026-03-11T00:00:00Z",
-    },
+    }),
   ];
 
   it.each([
@@ -50,7 +52,9 @@ describe("ConnectionSelector", () => {
     );
 
     const trigger = screen.getByRole("combobox", { name: "Select connection" });
-    trigger.focus();
+    await act(async () => {
+      trigger.focus();
+    });
 
     await user.keyboard(sequence);
 
@@ -72,5 +76,25 @@ describe("ConnectionSelector", () => {
 
     expect(screen.getByRole("combobox", { name: "[Šéĺéćť ćóńńéćťíóń]" })).toBeInTheDocument();
     expect(screen.getByText("[Šéĺéćť ćóńńéćťíóń]")).toBeInTheDocument();
+  });
+
+  it("keeps Local Drives settings reachable when Companion needs an update", async () => {
+    const user = userEvent.setup();
+    const openSettings = vi.fn();
+    render(
+      <SambeeThemeProvider>
+        <ConnectionSelector
+          connections={connections}
+          selectedConnectionId="server-1"
+          onConnectionChange={vi.fn()}
+          companionStatus="update_required"
+          onOpenConnectionsSettings={openSettings}
+        />
+      </SambeeThemeProvider>
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "Select connection" }));
+    await user.click(screen.getByText("Manage Local Drives..."));
+    expect(openSettings).toHaveBeenCalledOnce();
   });
 });
