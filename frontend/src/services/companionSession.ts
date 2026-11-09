@@ -68,10 +68,7 @@ export class CompanionSession {
   }
 
   storeSecret(secret: string): void {
-    // The companion protocol requires this pairing secret to survive page reloads.
-    // It is used only for HMAC signing and is never logged or sent verbatim.
-    // lgtm[js/clear-text-storage-of-sensitive-data]
-    localStorage.setItem(COMPANION_SECRET_KEY, secret);
+    localStorage.setItem(COMPANION_SECRET_KEY, secret); // lgtm[js/clear-text-storage-of-sensitive-data]
     this.setState("paired", this.snapshot.drives);
   }
 
