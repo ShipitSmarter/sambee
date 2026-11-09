@@ -28,6 +28,15 @@ pub(super) const PAIRING_NOT_FOUND_CODE: &str = "companion_pairing_not_found";
 pub(super) struct AuthLogContext<'a> {
     pub(super) method: &'a str,
 }
+
+pub(super) struct SignedRequestCredentials {
+    pub(super) origin: String,
+    pub(super) key: String,
+    pub(super) signature: String,
+    pub(super) timestamp: String,
+    pub(super) nonce: String,
+    pub(super) body_hash: String,
+}
 pub struct AuthState {}
 impl AuthState {
     pub fn new() -> Self {
@@ -131,7 +140,14 @@ pub async fn require_auth_or_query(State(state): State<Arc<AppState>>, request: 
     };
     match validate_signature(
         &state,
-        (origin, key, sig, ts, nonce, body_sha256),
+        SignedRequestCredentials {
+            origin,
+            key,
+            signature: sig,
+            timestamp: ts,
+            nonce,
+            body_hash: body_sha256,
+        },
         request.uri(),
         &context,
         Some(&body_hash),
@@ -141,7 +157,7 @@ pub async fn require_auth_or_query(State(state): State<Arc<AppState>>, request: 
     }
 }
 
-fn extract_auth_credentials(request: &Request<axum::body::Body>) -> Result<(String, String, String, String, String, String), ApiError> {
+fn extract_auth_credentials(request: &Request<axum::body::Body>) -> Result<SignedRequestCredentials, ApiError> {
     let origin = request
         .headers()
         .get("origin")
@@ -156,51 +172,40 @@ fn extract_auth_credentials(request: &Request<axum::body::Body>) -> Result<(Stri
             .map(str::to_owned)
             .ok_or_else(|| ApiError::Forbidden(message.to_string()))
     };
-    Ok((
+    Ok(SignedRequestCredentials {
         origin,
-        header(KEY_HEADER, "Missing X-Companion-Key header")?,
-        header(SIGNATURE_HEADER, "Missing X-Companion-Signature header")?,
-        header(TIMESTAMP_HEADER, "Missing X-Companion-Timestamp header")?,
-        header(NONCE_HEADER, "Missing X-Companion-Nonce header")?,
-        header(BODY_HASH_HEADER, "Missing X-Companion-Body-SHA256 header")?,
-    ))
+        key: header(KEY_HEADER, "Missing X-Companion-Key header")?,
+        signature: header(SIGNATURE_HEADER, "Missing X-Companion-Signature header")?,
+        timestamp: header(TIMESTAMP_HEADER, "Missing X-Companion-Timestamp header")?,
+        nonce: header(NONCE_HEADER, "Missing X-Companion-Nonce header")?,
+        body_hash: header(BODY_HASH_HEADER, "Missing X-Companion-Body-SHA256 header")?,
+    })
 }
 
 pub(super) fn validate_signed_request(
     state: &AppState,
-    origin: &str,
-    key: &str,
-    signature: &str,
-    timestamp: &str,
-    nonce: &str,
-    body_hash: &str,
+    credentials: SignedRequestCredentials,
     uri: &Uri,
     context: &AuthLogContext,
 ) -> Result<(), ApiError> {
-    validate_signature(
-        state,
-        (
-            origin.to_string(),
-            key.to_string(),
-            signature.to_string(),
-            timestamp.to_string(),
-            nonce.to_string(),
-            body_hash.to_string(),
-        ),
-        uri,
-        context,
-        None,
-    )
+    validate_signature(state, credentials, uri, context, None)
 }
 
 fn validate_signature(
     state: &AppState,
-    credentials: (String, String, String, String, String, String),
+    credentials: SignedRequestCredentials,
     uri: &Uri,
     context: &AuthLogContext,
     actual_body_hash: Option<&str>,
 ) -> Result<(), ApiError> {
-    let (origin, key, signature, timestamp_str, nonce, body_hash) = credentials;
+    let SignedRequestCredentials {
+        origin,
+        key,
+        signature,
+        timestamp: timestamp_str,
+        nonce,
+        body_hash,
+    } = credentials;
     let origin = require_normalized_browser_origin(&origin)?;
     let registered_key = state
         .pairing

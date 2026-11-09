@@ -304,12 +304,14 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>, origi
     let context = auth::AuthLogContext { method: "GET" };
     if auth::validate_signed_request(
         &state,
-        &origin,
-        &auth_message.public_key,
-        &auth_message.signature,
-        &auth_message.timestamp,
-        &auth_message.nonce,
-        &auth_message.body_sha256,
+        auth::SignedRequestCredentials {
+            origin,
+            key: auth_message.public_key,
+            signature: auth_message.signature,
+            timestamp: auth_message.timestamp,
+            nonce: auth_message.nonce,
+            body_hash: auth_message.body_sha256,
+        },
         &uri,
         &context,
     )
