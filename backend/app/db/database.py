@@ -91,7 +91,8 @@ def init_db() -> None:
     from app.models.app_secret import AppSecret  # noqa: F401 - Required for table creation
     from app.models.archive_operation import ArchiveOperation  # noqa: F401 - Required for table creation
     from app.models.audit import AuditEvent  # noqa: F401 - Required for table creation
-    from app.models.companion_uri_token_jti import CompanionUriTokenJti  # noqa: F401 - Required for table creation
+    from app.models.companion_uri_token_jti import CompanionDirectoryPolicyGrant, CompanionUriTokenJti  # noqa: F401 - Required for table creation
+    from app.models.download_intent import DownloadIntent  # noqa: F401 - Required for table creation
     from app.models.edit_lock import EditLock  # noqa: F401 - Required for table creation
     from app.models.oidc import (  # noqa: F401 - Required for table creation
         OidcBrowserSession,
@@ -104,6 +105,7 @@ def init_db() -> None:
     from app.models.recent_directory import RecentDirectory  # noqa: F401 - Required for table creation
     from app.models.recent_file import RecentFile  # noqa: F401 - Required for table creation
     from app.models.system_settings import SystemSetting  # noqa: F401 - Required for table creation
+    from app.models.theme import StoredTheme  # noqa: F401 - Required for table creation
     from app.models.transfer_operation import TransferOperation  # noqa: F401 - Required for table creation
     from app.models.user_settings import UserSetting  # noqa: F401 - Required for table creation
 

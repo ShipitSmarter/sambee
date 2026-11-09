@@ -67,11 +67,15 @@ updates:
       - dependencies
       - python
     ignore:
-      # pydantic-core is a transitive dependency pinned exactly by the direct
-      # pydantic requirement. Dependabot lockfile-only bumps here can become
-      # impossible to install under --require-hashes until a newer pydantic
-      # release adopts that core version.
+      # Update the Pydantic family manually with pip-compile. Dependabot can
+      # update pydantic without updating its exact pydantic-core dependency.
+      - dependency-name: "pydantic"
       - dependency-name: "pydantic-core"
+      - dependency-name: "pydantic-settings"
+      # SQLModel 0.0.47 requires SQLAlchemy<2.1. Revisit when SQLModel
+      # supports the newer series.
+      - dependency-name: "sqlalchemy"
+        versions: [">=2.1.0"]
     groups:
       backend-python-dev-tools:
         patterns:
@@ -106,6 +110,20 @@ updates:
           - "ruff"
           - "smbprotocol"
 
+  - package-ecosystem: pip
+    directory: "/backend/build-tools"
+    commit-message:
+      prefix: "deps(build)"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:15"
+      timezone: UTC
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - python
+
   - package-ecosystem: npm
     directory: "/frontend"
     commit-message:
@@ -120,6 +138,9 @@ updates:
     labels:
       - dependencies
       - frontend
+    ignore:
+      # Biome upgrades must migrate shared schemas and both npm projects.
+      - dependency-name: "@biomejs/biome"
     groups:
       frontend-npm:
         patterns:
@@ -135,6 +156,9 @@ updates:
     labels:
       - dependencies
       - companion
+    ignore:
+      # Keep this pin aligned with the frontend and shared configurations.
+      - dependency-name: "@biomejs/biome"
     patterns:
       - "@tauri-apps/*"
     multi-ecosystem-group: companion-tauri

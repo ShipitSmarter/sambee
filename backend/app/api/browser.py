@@ -1,19 +1,23 @@
 import asyncio
 import json
+import secrets
+import threading
 import unicodedata
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Literal, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from app.api._smb_helpers import build_smb_backend, disconnect_backend_safely, require_share_name
+from app.api._smb_helpers import build_smb_backend, disconnect_backend_safely, file_target_http_error, require_share_name
 from app.api.companion import (
     COMPANION_ERROR_LOCK_LOST,
     _generate_lock_capability,
@@ -29,6 +33,7 @@ from app.core.security import (
     get_current_user_with_auth_check,
     oauth2_scheme_optional,
 )
+from app.core.system_setting_definitions import SystemSettingKey
 from app.db.database import get_session
 from app.models.archive import ArchiveDirectoryListing, ArchiveEntryInfo, ArchiveIdentity
 from app.models.connection import Connection
@@ -40,6 +45,7 @@ from app.models.file import (
     ContentTransferResult,
     CopyMoveRequest,
     CreateItemRequest,
+    DirectoryIssueDetail,
     DirectoryListing,
     DirectorySearchResult,
     FileInfo,
@@ -69,6 +75,12 @@ from app.models.transfer_operation import (
 )
 from app.models.user import User
 from app.services.archive.execution import resolve_archive_inspection_topology_plan
+from app.services.archive.temporary_download import (
+    DOWNLOAD_FILENAME,
+    TemporaryArchiveSizeLimitExceeded,
+    create_temporary_download,
+)
+from app.services.archive.zip_creation_source import ZipArchiveCreationSource
 from app.services.archive.zip_reader import ArchiveFormatError, ZipReader
 from app.services.connection_access import get_accessible_connection_or_404, require_connection_write_access
 from app.services.content_transfer import (
@@ -87,7 +99,13 @@ from app.services.cross_connection import (
     cross_connection_move,
     final_target_policy_check,
 )
-from app.services.history_common import LOCAL_DRIVE_PREFIX, normalize_recent_history_path
+from app.services.directory_index import MAX_QUERY_BYTES
+from app.services.history_common import (
+    LOCAL_DRIVE_PREFIX,
+    directory_match_rank,
+    normalize_history_search_text,
+    normalize_recent_history_path,
+)
 from app.services.lock_manager import remove_expired_file_locks
 from app.services.recent_directories import (
     MAX_RECENT_DIRECTORY_RESULTS,
@@ -105,17 +123,22 @@ from app.services.recent_files import (
     search_recent_files,
     should_record_recent_file,
 )
+from app.services.system_settings import get_integer_setting_value
 from app.services.target_resolution import TargetResolutionDisposition, TargetResolutionPolicy, TargetSnapshot, resolve_target_mutation
 from app.storage.smb import SMBBackend
+from app.storage.smb_errors import SMB_RECOVERY_RETRY_SECONDS, SMBConnectionRetired
 
 router = APIRouter()
 logger = get_logger(__name__)
 
 DIRECTORY_LIST_ROUTE_TIMEOUT_SECONDS = 35.0
+DIRECTORY_SEARCH_RETRY_SECONDS = 5
 TRANSFER_RECEIPT_TTL_SECONDS = 5 * 60
 TRANSFER_OPERATION_TTL = timedelta(seconds=TRANSFER_RECEIPT_TTL_SECONDS)
 TRANSFER_OPERATION_PROGRESS_PERSIST_INTERVAL_BYTES = 1024 * 1024
 TRANSFER_UNAVAILABLE_DETAIL = "Transfers are unavailable in this release"
+DOWNLOAD_SESSION_TTL_SECONDS = 90
+MAX_COMPANION_DOWNLOAD_SESSIONS = 1024
 EDIT_LOCK_LOST_CODE: Literal["edit_lock_lost"] = "edit_lock_lost"
 EDIT_LOCK_LOST_MESSAGE = "Lock not found or expired"
 
@@ -149,6 +172,54 @@ _transfer_in_flight: dict[tuple[str, str], tuple[str, asyncio.Future[_InFlightTr
 _transfer_receipt_lock = asyncio.Lock()
 _transfer_cancellations: dict[tuple[str, str], asyncio.Event] = {}
 _transfer_cancellation_lock = asyncio.Lock()
+_download_sessions: dict[str, tuple[float, str, str, int]] = {}
+_download_session_lock = asyncio.Lock()
+
+
+class CompanionDownloadSessionRequest(BaseModel):
+    drive: str
+
+
+class CompanionDownloadSessionResponse(BaseModel):
+    token: str
+
+
+class CompanionDownloadSessionLimit(BaseModel):
+    size_limit_bytes: int
+
+
+@router.post("/companion-download/session", response_model=CompanionDownloadSessionResponse)
+async def issue_companion_download_session(
+    body: CompanionDownloadSessionRequest,
+    current_user: User = Depends(get_current_user_with_auth_check),
+) -> CompanionDownloadSessionResponse:
+    """Issue a short-lived, single-use capability scoped to a local drive."""
+    if not body.drive or len(body.drive) > 128:
+        raise HTTPException(status_code=400, detail="Invalid local drive")
+    token = secrets.token_urlsafe(32)
+    size_limit = get_integer_setting_value(SystemSettingKey.TEMPORARY_ARCHIVE_DOWNLOAD_SIZE_BYTES)
+    async with _download_session_lock:
+        now = monotonic()
+        _download_sessions.update({key: session for key, session in _download_sessions.items() if session[0] > now})
+        if len(_download_sessions) >= MAX_COMPANION_DOWNLOAD_SESSIONS:
+            raise HTTPException(status_code=429, detail="Too many active download sessions")
+        _download_sessions[token] = (now + DOWNLOAD_SESSION_TTL_SECONDS, current_user.username, body.drive, size_limit)
+    return CompanionDownloadSessionResponse(token=token)
+
+
+@router.post("/companion-download/session/{token}/consume", response_model=CompanionDownloadSessionLimit)
+async def consume_companion_download_session(
+    token: str,
+    body: CompanionDownloadSessionRequest,
+    current_user: User = Depends(get_current_user_with_auth_check),
+) -> CompanionDownloadSessionLimit:
+    """Return the configured cap once to the authenticated Companion session."""
+    async with _download_session_lock:
+        session = _download_sessions.get(token)
+        if session is None or session[0] <= monotonic() or session[1:3] != (current_user.username, body.drive):
+            raise HTTPException(status_code=403, detail="Download session expired or invalid")
+        del _download_sessions[token]
+    return CompanionDownloadSessionLimit(size_limit_bytes=session[3])
 
 
 def _transfer_fingerprint(body: CopyMoveRequest) -> str:
@@ -332,12 +403,12 @@ async def _verify_remote_recent_history_target(
         raise ValueError(f"Only {target_label} can be recorded in recent-{history_label} history")
 
 
-@router.post("/recent-directories", response_model=RecentDirectoryRead)
+@router.post("/recent-directories", response_model=RecentDirectoryRead | None)
 async def create_recent_directory(
     payload: RecentDirectoryRecordRequest,
     current_user: User = Depends(get_current_user_with_auth_check),
     session: Session = Depends(get_session),
-) -> RecentDirectoryRead:
+) -> RecentDirectoryRead | None:
     """Record a directory only after the client successfully navigated to it."""
 
     set_user(current_user.username)
@@ -390,9 +461,13 @@ async def get_recent_directories(
     session: Session = Depends(get_session),
 ) -> RecentDirectorySearchRead:
     set_user(current_user.username)
+    try:
+        results = search_recent_directories(query=q, limit=limit, current_user=current_user, session=session)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return RecentDirectorySearchRead(
-        results=search_recent_directories(query=q, limit=limit, current_user=current_user, session=session),
-        result_limit=min(limit, MAX_RECENT_DIRECTORY_RESULTS),
+        results=results,
+        result_limit=get_recent_file_result_limit(limit=limit, session=session),
     )
 
 
@@ -481,8 +556,12 @@ async def get_recent_files(
 ) -> RecentFileSearchRead:
     set_user(current_user.username)
     result_limit = get_recent_file_result_limit(limit=limit, session=session)
+    try:
+        results = search_recent_files(query=q, limit=result_limit, current_user=current_user, session=session)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return RecentFileSearchRead(
-        results=search_recent_files(query=q, limit=result_limit, current_user=current_user, session=session),
+        results=results,
         result_limit=result_limit,
     )
 
@@ -505,7 +584,12 @@ def _raise_recent_target_error(
     record: RecentFile | None = None,
     session: Session,
 ) -> NoReturn:
-    if record is not None:
+    if record is not None and code in {
+        "recent_file_target_missing",
+        "recent_file_target_not_file",
+        "recent_file_invalid_path",
+        "recent_file_connection_removed",
+    }:
         session.delete(record)
         session.commit()
     raise HTTPException(status_code=status_code, detail={"code": code, "message": message})
@@ -589,6 +673,13 @@ async def validate_recent_file_target(
             code="recent_file_target_missing",
             message="The recent file no longer exists.",
             record=record,
+            session=session,
+        )
+    except PermissionError:
+        _raise_recent_target_error(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="recent_file_access_denied",
+            message="Access to this recent file was denied. Check your permissions and retry.",
             session=session,
         )
     except TimeoutError:
@@ -717,6 +808,104 @@ async def list_archive_directory(
         )
 
 
+def _temporary_archive_response(artifact: Path) -> StreamingResponse:
+    async def stream_artifact() -> AsyncIterator[bytes]:
+        try:
+            with artifact.open("rb") as handle:
+                while chunk := await asyncio.to_thread(handle.read, 256 * 1024):
+                    yield chunk
+        finally:
+            artifact.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        stream_artifact(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{DOWNLOAD_FILENAME}"'},
+    )
+
+
+class ZipSelectionDownloadRequest(BaseModel):
+    archive_path: str
+    paths: list[str]
+
+
+@router.post("/{connection_id}/archive/download-selection")
+async def download_zip_selection_archive(
+    connection_id: uuid.UUID,
+    body: ZipSelectionDownloadRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user_with_auth_check),
+    session: Session = Depends(get_session),
+) -> StreamingResponse:
+    """Repackage selected safe ZIP members through the portable creator."""
+    connection = _get_connection_or_404(session, current_user, connection_id)
+    backend = build_smb_backend(connection, backend_factory=SMBBackend)
+    reader = None
+    artifact = None
+    try:
+        await backend.connect()
+        archive_info = await backend.get_file_info(body.archive_path)
+        if archive_info.type != FileType.FILE or archive_info.size is None:
+            raise ArchiveFormatError("Archive source must be a regular file")
+        reader = await backend.open_random_access_reader(body.archive_path)
+        source = ZipArchiveCreationSource(ZipReader(reader, archive_info.size))
+        await source.validate_projection()
+        artifact = await create_temporary_download(
+            source, body.paths, get_integer_setting_value(SystemSettingKey.TEMPORARY_ARCHIVE_DOWNLOAD_SIZE_BYTES), request.is_disconnected
+        )
+        if await request.is_disconnected():
+            raise asyncio.CancelledError()
+    except (ArchiveFormatError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except TemporaryArchiveSizeLimitExceeded as exc:
+        raise HTTPException(status_code=413, detail="temporary_archive_size_limit_exceeded") from exc
+    except BaseException:
+        if artifact is not None:
+            artifact.unlink(missing_ok=True)
+        raise
+    finally:
+        if reader is not None:
+            await reader.close()
+        await disconnect_backend_safely(backend, logger=logger, context=f"ZIP selection download {connection_id}")
+    assert artifact is not None
+    return _temporary_archive_response(artifact)
+
+
+@router.post("/{connection_id}/download-selection")
+async def download_selection_archive(
+    connection_id: uuid.UUID,
+    paths: list[str],
+    request: Request,
+    current_user: User = Depends(get_current_user_with_auth_check),
+    session: Session = Depends(get_session),
+) -> StreamingResponse:
+    """Build a complete selected-root ZIP in private storage before streaming it."""
+    connection = _get_connection_or_404(session, current_user, connection_id)
+    backend = build_smb_backend(connection, backend_factory=SMBBackend)
+    artifact = None
+    try:
+        await backend.connect()
+        artifact = await create_temporary_download(
+            backend, paths, get_integer_setting_value(SystemSettingKey.TEMPORARY_ARCHIVE_DOWNLOAD_SIZE_BYTES), request.is_disconnected
+        )
+        if await request.is_disconnected():
+            raise asyncio.CancelledError()
+    except (ArchiveFormatError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except TemporaryArchiveSizeLimitExceeded as exc:
+        raise HTTPException(status_code=413, detail="temporary_archive_size_limit_exceeded") from exc
+    except BaseException:
+        if artifact is not None:
+            artifact.unlink(missing_ok=True)
+        raise
+    finally:
+        await disconnect_backend_safely(backend, logger=logger, context=f"selection download {connection_id}")
+
+    assert artifact is not None
+
+    return _temporary_archive_response(artifact)
+
+
 #
 # list_directory
 #
@@ -753,24 +942,46 @@ async def list_directory(
         logger.debug(f"Successfully listed directory: connection_id={connection_id}, path='{path}', items={len(listing.items)}")
         return listing
 
+    except FileNotFoundError as error:
+        _remove_from_directory_cache(str(connection_id), path or "")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "directory_not_found", "message": "The folder was not found. It may have been moved or deleted."},
+        ) from error
+    except NotADirectoryError as error:
+        _remove_from_directory_cache(str(connection_id), path or "")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "not_a_directory", "message": "This item is not a folder."},
+        ) from error
+    except PermissionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "directory_access_denied", "message": "You do not have permission to open this folder."},
+        ) from error
+    except SMBConnectionRetired as error:
+        raise file_target_http_error(error, requires_file=False) from error
     except asyncio.TimeoutError:
-        logger.error(
-            f"Timed out listing directory: connection_id={connection_id}, path='{path}', host={connection.host}, share={connection.share_name}"
-        )
+        logger.warning("SMB directory listing timed out. Active work remains owned until its worker exits.")
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Directory listing timed out. The remote share did not respond in time.",
+            detail={
+                "code": "directory_timeout",
+                "message": "Directory listing timed out. Check the connection and retry.",
+                "recoverable": True,
+                "retry_after_ms": SMB_RECOVERY_RETRY_SECONDS * 1000,
+            },
+            headers={"Retry-After": str(SMB_RECOVERY_RETRY_SECONDS)},
         )
     except Exception as e:
         logger.error(
-            f"Failed to list directory: connection_id={connection_id}, path='{path}', "
-            f"host={connection.host}, share={connection.share_name}, "
-            f"error={type(e).__name__}: {e}",
+            "Directory listing failed. Check the connection and retry.",
+            extra={"event": "directory_listing_failed", "operation": "list_directory", "error_type": type(e).__name__},
             exc_info=True,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list directory: {str(e)}",
+            detail={"code": "directory_unavailable", "message": "The folder could not be opened. Check the connection and try again."},
         )
 
 
@@ -845,16 +1056,8 @@ async def get_file_info(
         logger.debug(f"Successfully retrieved file info: connection_id={connection_id}, path='{path}', type={file_info.type}")
         return file_info
 
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Path not found: {path}",
-        )
-    except TimeoutError:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="File info request timed out. The remote share did not respond in time.",
-        )
+    except (FileNotFoundError, PermissionError, NotADirectoryError, TimeoutError) as error:
+        raise file_target_http_error(error, requires_file=False) from error
     except Exception as e:
         logger.error(
             f"Failed to get file info: connection_id={connection_id}, path='{path}', "
@@ -862,10 +1065,7 @@ async def get_file_info(
             f"error={type(e).__name__}: {e}",
             exc_info=True,
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get file info: {str(e)}",
-        )
+        raise file_target_http_error(e, requires_file=False) from e
 
 
 #
@@ -874,14 +1074,15 @@ async def get_file_info(
 @router.get("/{connection_id}/directories", response_model=DirectorySearchResult)
 async def search_directories(
     connection_id: uuid.UUID,
-    q: str = Query("", description="Search query for directory names"),
+    q: str = Query("", max_length=MAX_QUERY_BYTES, description="Directory search text; shared UTF-8 byte and term limits apply"),
     include_dot_directories: bool = Query(False, description="Whether to include directories whose path contains dot-prefixed segments"),
+    include_issue_details: bool = Query(False, description="Include bounded directory issue details for the status dialog"),
     current_user: User = Depends(get_current_user_with_auth_check),
     session: Session = Depends(get_session),
 ) -> DirectorySearchResult:
     """Search for directories across the entire connection.
 
-    Returns matching directory paths from the in-memory cache.
+    Returns matching directory paths from the source index.
     If the cache is not yet built, triggers an initial scan and returns
     partial results. The cache_state field indicates indexing status.
     """
@@ -891,8 +1092,16 @@ async def search_directories(
 
     connection = _get_connection_or_404(session, current_user, connection_id)
 
+    from app.core.directory_index_contract import CONTRACT_VERSION
+    from app.services.directory_index import search_terms
+
     try:
-        from app.services.directory_cache import get_directory_cache_manager
+        search_terms(q.replace("\\", "/"))
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+
+    try:
+        from app.services.directory_cache import SQLiteConnectionDirectoryCache, get_directory_cache_manager
 
         cache_manager = get_directory_cache_manager()
         cache = await cache_manager.get_or_create_cache(
@@ -903,26 +1112,72 @@ async def search_directories(
             password=decrypt_password(connection.password_encrypted),
             port=connection.port or 445,
             path_prefix=connection.path_prefix or "/",
+            source_revision=connection.updated_at.isoformat(),
         )
 
-        results, total_matches = cache.search(q, include_dot_directories=include_dot_directories) if q else ([], 0)
+        if isinstance(cache, SQLiteConnectionDirectoryCache):
+            cancelled = threading.Event()
+            try:
+                response = await asyncio.to_thread(
+                    cache.search_index, q, include_dot_directories=include_dot_directories, cancelled=cancelled
+                )
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            details, incomplete = (
+                cache.directory_issue_details() if response.issue_count and response.coverage == "partial" else ([], False)
+            )
+            return DirectorySearchResult(
+                results=[row.path for row in response.results],
+                match_ranks={row.path: row.match_rank for row in response.results},
+                matched_term_counts={row.path: row.matched_term_count for row in response.results},
+                total_matches=response.total_matches,
+                cache_state=cache.state.value,
+                directory_count=response.directory_count,
+                search_contract_version=CONTRACT_VERSION,
+                accepted_revision=response.accepted_revision,
+                coverage=response.coverage,
+                coverage_issue_count=response.issue_count,
+                issue_details_available=bool(details),
+                issue_details=[DirectoryIssueDetail.model_validate(detail) for detail in details] if include_issue_details else None,
+                issue_details_incomplete=incomplete,
+                last_verified_at_ms=response.last_verified_at_ms,
+                status_message=cache.scan_error,
+                monitoring_state=cache.monitoring_state,
+                retry_after_ms=cache.retry_after_ms,
+                scan_progress=cache.scan_progress,
+            )
+
+        results, total_matches = await asyncio.to_thread(cache.search, q, include_dot_directories=include_dot_directories) if q else ([], 0)
+        normalized_query = normalize_history_search_text(q.replace("\\", "/").strip())
 
         return DirectorySearchResult(
             results=results,
+            match_ranks={path: directory_match_rank(path, normalized_query) for path in results},
             total_matches=total_matches,
             cache_state=cache.state.value,
             directory_count=cache.directory_count,
         )
 
-    except Exception as e:
-        logger.error(
-            f"Failed to search directories: connection_id={connection_id}, query='{q}', include_dot_directories={include_dot_directories}, error={type(e).__name__}: {e}",
-            exc_info=True,
-        )
+    except HTTPException:
+        raise
+    except (TimeoutError, InterruptedError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "directory_temporarily_unavailable",
+                "message": str(error),
+                "recoverable": True,
+                "retry_after_ms": DIRECTORY_SEARCH_RETRY_SECONDS * 1000,
+            },
+            headers={"Retry-After": str(DIRECTORY_SEARCH_RETRY_SECONDS)},
+        ) from error
+    except Exception as error:
+        logger.error("Directory search failed (%s).", type(error).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to search directories: {str(e)}",
-        )
+            detail="Directory search failed. Check connection access and local index storage, then retry.",
+        ) from error
 
 
 # ============================================================================
@@ -997,6 +1252,7 @@ def _validate_browser_lock_control(lock: EditLock, body: BrowserEditLockControlR
 async def acquire_browser_edit_lock(
     connection_id: uuid.UUID,
     path: str = Query(..., description="Path to the file to lock"),
+    check_write_access: bool = Query(False, description="Verify existing-file write permission before acquiring a lock"),
     current_user: User = Depends(get_current_user_with_auth_check),
     session: Session = Depends(get_session),
 ) -> BrowserEditLockResponse:
@@ -1006,6 +1262,21 @@ async def acquire_browser_edit_lock(
 
     connection = _get_connection_or_404(session, current_user, connection_id)
     require_connection_write_access(current_user, connection, action="acquire_browser_lock", path=path)
+
+    if check_write_access:
+        backend = build_smb_backend(connection, backend_factory=SMBBackend)
+        try:
+            await backend.connect()
+            await backend.check_write_access(path)
+        except (FileNotFoundError, PermissionError, NotADirectoryError, IsADirectoryError, TimeoutError) as error:
+            raise file_target_http_error(error) from error
+        except Exception as error:
+            logger.exception("Failed to check file write access: connection_id=%s, path=%s", connection_id, path)
+            raise file_target_http_error(error) from error
+        finally:
+            await disconnect_backend_safely(
+                backend, logger=logger, context=f"write access check: connection_id={connection_id}, path='{path}'"
+            )
 
     remove_expired_file_locks(session, connection_id, path)
     existing = _get_active_lock(connection_id, path, session)
@@ -1232,10 +1503,20 @@ async def upload_file(
 
         await backend.connect()
         try:
-            bytes_written = await backend.write_file(path, file.file)
+            if editor_operation_id:
+                try:
+                    bytes_written = await backend.write_file(path, file.file)
+                except Exception as error:
+                    raise file_target_http_error(error) from error
+            else:
+                bytes_written = await backend.write_file(path, file.file)
 
-            # Re-read metadata after write for the response
-            updated_info = await backend.get_file_info(path)
+            last_modified = None
+            try:
+                updated_info = await backend.get_file_info(path)
+                last_modified = updated_info.modified_at.isoformat() if updated_info.modified_at else None
+            except Exception:
+                logger.warning("Upload completed, but updated file metadata is unavailable", exc_info=True)
         finally:
             await disconnect_backend_safely(
                 backend,
@@ -1248,8 +1529,12 @@ async def upload_file(
             status="ok",
             path=path,
             size=bytes_written,
-            last_modified=updated_info.modified_at.isoformat() if updated_info.modified_at else None,
+            last_modified=last_modified,
         )
+    except HTTPException:
+        raise
+    except SMBConnectionRetired as error:
+        raise file_target_http_error(error) from error
     except TimeoutError:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -1728,6 +2013,10 @@ async def execute_transfer_operation(
         async def check_cancellation_before_commit() -> None:
             check_cancellation()
 
+        def cancellation_requested() -> bool:
+            session.refresh(operation)
+            return operation.cancellation_requested
+
         if operation.kind == "move":
             transfer_result = await cross_connection_move(
                 source_backend,
@@ -1736,6 +2025,7 @@ async def execute_transfer_operation(
                 operation.destination_path,
                 on_progress=persist_progress,
                 before_destination_commit=check_cancellation_before_commit,
+                cancellation=cancellation_requested,
                 target_resolution_policy=TargetResolutionPolicy(operation.target_resolution_policy),
             )
         else:
@@ -1778,6 +2068,7 @@ async def execute_transfer_operation(
                 source="unchanged",
                 destination="mutated" if exc.destination_mutated else "unchanged",
             ),
+            replaced=exc.replaced,
             error=ContentTransferError(code="source_changed", detail=str(exc)),
         )
     except SourceDeleteError as exc:
@@ -1790,12 +2081,13 @@ async def execute_transfer_operation(
             replaced=exc.replaced,
             error=ContentTransferError(code="source_delete_failed", detail=str(exc)),
         )
-    except SourceDeletionOutcomeUnknown:
+    except SourceDeletionOutcomeUnknown as exc:
         result = ContentTransferResult(
             status="outcome_unknown",
-            effects=ContentTransferEffects(source="unknown", destination="unknown"),
+            effects=ContentTransferEffects(source="unknown", destination="mutated"),
+            replaced=exc.replaced,
         )
-    except TransferOperationCancelled:
+    except (TransferOperationCancelled, TransferCancelled):
         result = ContentTransferResult(
             status="cancelled",
             effects=ContentTransferEffects(source="unchanged", destination="unchanged"),
@@ -1809,6 +2101,18 @@ async def execute_transfer_operation(
     finally:
         await disconnect_backend_safely(source_backend, logger=logger, context=f"transfer operation source {operation.id}")
         await disconnect_backend_safely(destination_backend, logger=logger, context=f"transfer operation destination {operation.id}")
+    if result.effects.destination == "mutated":
+        _add_to_directory_cache(str(connection_id), operation.destination_path)
+    logger.info(
+        "Transfer outcome: operation_id=%s source_connection=%s destination_connection=%s source=%s destination=%s status=%s effects=%s",
+        operation.id,
+        operation.source_connection_id,
+        connection_id,
+        operation.source_path,
+        operation.destination_path,
+        result.status,
+        result.effects.model_dump(),
+    )
     _record_transfer_operation_result(session, operation, result)
     return result
 
@@ -1870,6 +2174,8 @@ async def delete_item(
 
         logger.info(f"Deleted item: connection_id={connection_id}, path='{path}', user={current_user.username}")
 
+    except SMBConnectionRetired as error:
+        raise file_target_http_error(error) from error
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2063,6 +2369,8 @@ async def rename_item(
         logger.info(f"Renamed item: connection_id={connection_id}, '{path}' -> '{new_name}', user={current_user.username}")
         return file_info
 
+    except SMBConnectionRetired as error:
+        raise file_target_http_error(error) from error
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2183,6 +2491,8 @@ async def create_item(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="Create timed out. The remote share did not respond in time.",
         )
+    except SMBConnectionRetired as error:
+        raise file_target_http_error(error) from error
     except OSError as e:
         logger.error(
             f"Failed to create item: connection_id={connection_id}, path='{new_item_path}', error={type(e).__name__}: {e}",
@@ -2421,6 +2731,7 @@ async def copy_item(
                 overwrite=False,
                 target_resolution_policy=policy,
                 cancellation=cancellation.is_set if cancellation is not None else None,
+                transfer_attempt_id=str(body.transfer_attempt_id) if body.transfer_attempt_id else None,
             )
         else:
             require_connection_write_access(current_user, connection, action="copy_destination", path=dest)
@@ -2492,6 +2803,8 @@ async def copy_item(
         await _record_transfer_http_error(current_user, body, conflict)
         raise conflict
     except SourceChangedError as exc:
+        if exc.destination_mutated:
+            _add_to_directory_cache(str(body.dest_connection_id) if is_cross_connection else str(connection_id), dest)
         return await _record_transfer_receipt(
             current_user,
             body,
@@ -2501,6 +2814,7 @@ async def copy_item(
                     source="unchanged",
                     destination="mutated" if exc.destination_mutated else "unchanged",
                 ),
+                replaced=exc.replaced,
                 error=ContentTransferError(code="source_changed", detail=str(exc)),
             ),
         )
@@ -2522,6 +2836,10 @@ async def copy_item(
     except HTTPException as error:
         await _record_transfer_http_error(current_user, body, error)
         raise
+    except SMBConnectionRetired as error:
+        response = file_target_http_error(error)
+        await _record_transfer_http_error(current_user, body, response)
+        raise response from error
     except TimeoutError:
         await _raise_recorded_transfer_http_error(
             current_user,
@@ -2596,6 +2914,7 @@ async def move_item(
                 str(body.dest_connection_id),
                 target_resolution_policy=TargetResolutionPolicy(body.normalized_target_resolution_policy),
                 cancellation=cancellation.is_set if cancellation is not None else None,
+                transfer_attempt_id=str(body.transfer_attempt_id) if body.transfer_attempt_id else None,
             )
             return await _record_transfer_receipt(current_user, body, copied)
 
@@ -2658,6 +2977,22 @@ async def move_item(
             body,
             ContentTransferResult(status="cancelled", effects=ContentTransferEffects(source="unchanged", destination="unchanged")),
         )
+    except SourceChangedError as exc:
+        if exc.destination_mutated:
+            _add_to_directory_cache(str(body.dest_connection_id) if is_cross_connection else str(connection_id), dest)
+        return await _record_transfer_receipt(
+            current_user,
+            body,
+            ContentTransferResult(
+                status="failed",
+                effects=ContentTransferEffects(
+                    source="unchanged",
+                    destination="mutated" if exc.destination_mutated else "unchanged",
+                ),
+                replaced=exc.replaced,
+                error=ContentTransferError(code="source_changed", detail=str(exc)),
+            ),
+        )
     except RegularFileTransferRequiredError as exc:
         unsupported = HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
         await _record_transfer_http_error(current_user, body, unsupported)
@@ -2673,6 +3008,10 @@ async def move_item(
     except HTTPException as error:
         await _record_transfer_http_error(current_user, body, error)
         raise
+    except SMBConnectionRetired as error:
+        response = file_target_http_error(error)
+        await _record_transfer_http_error(current_user, body, response)
+        raise response from error
     except TimeoutError:
         await _raise_recorded_transfer_http_error(
             current_user,
@@ -2711,6 +3050,63 @@ async def move_item(
 # Cross-connection copy/move helpers
 # ============================================================================
 
+CROSS_CONNECTION_PROGRESS_INTERVAL_SECONDS = 0.25
+
+
+def _cross_connection_progress(
+    dst_conn_id: str, dest_path: str, transfer_attempt_id: str | None, pending: set[asyncio.Task[None]]
+) -> Callable[[int, int | None], None]:
+    from app.api.websocket import notify_transfer_progress
+
+    dest_parent = str(PurePosixPath(dest_path).parent)
+    if dest_parent == ".":
+        dest_parent = ""
+    item_name = PurePosixPath(dest_path).name
+    last_broadcast = 0.0
+
+    def on_progress(bytes_transferred: int, total_bytes: int | None) -> None:
+        nonlocal last_broadcast
+        now = monotonic()
+        if pending or now - last_broadcast < CROSS_CONNECTION_PROGRESS_INTERVAL_SECONDS:
+            return
+        last_broadcast = now
+        task = asyncio.get_running_loop().create_task(
+            notify_transfer_progress(dst_conn_id, dest_parent, bytes_transferred, total_bytes, item_name, transfer_attempt_id)
+        )
+        pending.add(task)
+
+        def on_done(completed: asyncio.Task[None]) -> None:
+            pending.discard(completed)
+            if not completed.cancelled() and (error := completed.exception()) is not None:
+                logger.warning("Transfer byte progress notification failed for destination %s: %s", dest_path, error)
+
+        task.add_done_callback(on_done)
+
+    return on_progress
+
+
+def _notify_cross_connection_complete(
+    dst_conn_id: str, dest_path: str, transfer_attempt_id: str | None, pending: set[asyncio.Task[None]]
+) -> None:
+    from app.api.websocket import notify_transfer_progress
+
+    dest_parent = str(PurePosixPath(dest_path).parent)
+    in_flight = tuple(pending)
+
+    async def send_completion() -> None:
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
+        try:
+            await notify_transfer_progress(
+                dst_conn_id, "" if dest_parent == "." else dest_parent, -1, -1, PurePosixPath(dest_path).name, transfer_attempt_id
+            )
+        except Exception as error:
+            logger.warning("Transfer completion notification failed for destination %s: %s", dest_path, error)
+
+    task = asyncio.get_running_loop().create_task(send_completion())
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+
 
 async def _cross_connection_copy(
     src_conn: Connection,
@@ -2722,6 +3118,7 @@ async def _cross_connection_copy(
     overwrite: bool = False,
     target_resolution_policy: TargetResolutionPolicy | None = None,
     cancellation: Callable[[], bool] | None = None,
+    transfer_attempt_id: str | None = None,
 ) -> ContentTransferResult:
     """Perform a cross-connection copy with WebSocket progress reporting.
 
@@ -2729,48 +3126,12 @@ async def _cross_connection_copy(
     destination, and broadcasts byte-level progress via WebSocket.
     """
 
-    from app.api.websocket import notify_transfer_progress
-
     source_backend = build_smb_backend(src_conn, backend_factory=SMBBackend)
     dest_backend = build_smb_backend(dst_conn, backend_factory=SMBBackend)
+    pending: set[asyncio.Task[None]] = set()
 
     await source_backend.connect()
     await dest_backend.connect()
-
-    # Determine the destination parent directory for progress events.
-    dest_parent = str(PurePosixPath(dest_path).parent)
-    if dest_parent == ".":
-        dest_parent = ""
-    # Item name for progress display
-    item_name = PurePosixPath(dest_path).name
-
-    # Throttle progress broadcasts to avoid flooding the WebSocket
-    # (~4 updates/s is plenty for a smooth progress bar).
-    _last_broadcast: list[float] = [0.0]
-    _min_broadcast_interval_s: float = 0.25
-
-    def on_progress(bytes_transferred: int, total_bytes: int | None) -> None:
-        """Schedule a WS broadcast (non-blocking from sync context)."""
-        import time
-
-        now = time.monotonic()
-        if now - _last_broadcast[0] < _min_broadcast_interval_s:
-            return
-        _last_broadcast[0] = now
-
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(
-                notify_transfer_progress(
-                    dst_conn_id,
-                    dest_parent,
-                    bytes_transferred,
-                    total_bytes,
-                    item_name,
-                )
-            )
-        except RuntimeError:
-            pass  # No running event loop — skip this broadcast
 
     try:
         transfer_result = await cross_connection_copy(
@@ -2778,7 +3139,7 @@ async def _cross_connection_copy(
             dest_backend,
             source_path,
             dest_path,
-            on_progress=on_progress,
+            on_progress=_cross_connection_progress(dst_conn_id, dest_path, transfer_attempt_id, pending),
             overwrite=overwrite,
             target_resolution_policy=target_resolution_policy,
             cancellation=cancellation,
@@ -2790,16 +3151,7 @@ async def _cross_connection_copy(
             )
 
         # Send a final 100 % broadcast
-        try:
-            await notify_transfer_progress(
-                dst_conn_id,
-                dest_parent,
-                -1,
-                -1,
-                item_name,
-            )
-        except Exception:
-            pass
+        _notify_cross_connection_complete(dst_conn_id, dest_path, transfer_attempt_id, pending)
 
         # Update directory cache for the destination connection
         _add_to_directory_cache(dst_conn_id, dest_path)
@@ -2831,11 +3183,13 @@ async def _cross_connection_move(
     *,
     target_resolution_policy: TargetResolutionPolicy | None = None,
     cancellation: Callable[[], bool] | None = None,
+    transfer_attempt_id: str | None = None,
 ) -> ContentTransferResult:
     """Move across SMB connections using a retained source handle when available."""
 
     source_backend = build_smb_backend(src_conn, backend_factory=SMBBackend)
     dest_backend = build_smb_backend(dst_conn, backend_factory=SMBBackend)
+    pending: set[asyncio.Task[None]] = set()
     await source_backend.connect()
     await dest_backend.connect()
     try:
@@ -2845,29 +3199,54 @@ async def _cross_connection_move(
                 dest_backend,
                 source_path,
                 dest_path,
+                on_progress=_cross_connection_progress(dst_conn_id, dest_path, transfer_attempt_id, pending),
                 target_resolution_policy=target_resolution_policy,
                 cancellation=cancellation,
             )
         except SourceDeleteError as error:
             if not error.destination_mutated:
                 raise
+            logger.warning(
+                "Move source retained: source_connection=%s destination_connection=%s source=%s destination=%s attempt_id=%s phase=source_delete effects=unchanged/mutated replaced=%s detail=%s",
+                src_conn.id,
+                dst_conn.id,
+                source_path,
+                dest_path,
+                transfer_attempt_id,
+                error.replaced,
+                error,
+            )
             _add_to_directory_cache(dst_conn_id, dest_path)
+            _notify_cross_connection_complete(dst_conn_id, dest_path, transfer_attempt_id, pending)
             return ContentTransferResult(
                 status="completed_with_source_retained",
                 effects=ContentTransferEffects(source="unchanged", destination="mutated"),
                 replaced=error.replaced,
                 error=ContentTransferError(code="source_delete_failed", detail=str(error)),
             )
-        except SourceDeletionOutcomeUnknown:
+        except SourceDeletionOutcomeUnknown as error:
+            logger.warning(
+                "Move source deletion uncertain: source_connection=%s destination_connection=%s source=%s destination=%s attempt_id=%s phase=source_delete effects=unknown/mutated replaced=%s; inspect both locations before another move",
+                src_conn.id,
+                dst_conn.id,
+                source_path,
+                dest_path,
+                transfer_attempt_id,
+                error.replaced,
+            )
+            _add_to_directory_cache(dst_conn_id, dest_path)
+            _notify_cross_connection_complete(dst_conn_id, dest_path, transfer_attempt_id, pending)
             return ContentTransferResult(
                 status="outcome_unknown",
-                effects=ContentTransferEffects(source="unknown", destination="unknown"),
+                effects=ContentTransferEffects(source="unknown", destination="mutated"),
+                replaced=error.replaced,
             )
         if transfer_result.bytes_written is None:
             return ContentTransferResult(
                 status="skipped",
                 effects=ContentTransferEffects(source="unchanged", destination="unchanged"),
             )
+        _notify_cross_connection_complete(dst_conn_id, dest_path, transfer_attempt_id, pending)
         _remove_from_directory_cache(str(src_conn.id), source_path)
         _add_to_directory_cache(dst_conn_id, dest_path)
         return ContentTransferResult(
@@ -3018,12 +3397,12 @@ def _rename_in_directory_cache(connection_id: str, old_path: str, new_path: str)
 # _add_to_directory_cache
 #
 def _add_to_directory_cache(connection_id: str, path: str) -> None:
-    """Add a newly created directory to the directory cache, if it exists.
+    """Reconcile a mutation destination, which can be a file or directory.
 
     Silently ignores errors — cache updates must never break the main flow.
     """
 
-    from app.services.directory_cache import get_directory_cache_manager
+    from app.services.directory_cache import SQLiteConnectionDirectoryCache, get_directory_cache_manager
 
     try:
         cache_manager = get_directory_cache_manager()
@@ -3031,6 +3410,9 @@ def _add_to_directory_cache(connection_id: str, path: str) -> None:
         if cache is None:
             return
 
-        cache.add_directories([path])
+        if isinstance(cache, SQLiteConnectionDirectoryCache):
+            cache.observe_parent(path.strip("/").rpartition("/")[0])
+        else:
+            cache.add_directories([path])
     except Exception:
         pass

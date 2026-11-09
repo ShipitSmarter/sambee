@@ -1,23 +1,54 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { Dialog } from "@mui/material";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
+import { createMemoryRouter, RouterProvider, useLocation, useNavigate } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SambeeThemeProvider } from "../../../theme";
+import { SettingsCategoryContent } from "../SettingsCategoryContent";
 import SettingsDialog from "../SettingsDialog";
+import type { SettingsCategory } from "../settingsCategories";
+import { scheduleSettingsPagePrefetch } from "../settingsPageLoaders";
+
+const networkModule = vi.hoisted(() => {
+  let resolve!: () => void;
+  const ready = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  return { ready, resolve, load: vi.fn() };
+});
+
+vi.mock("../../../pages/NetworkSettings", async () => {
+  networkModule.load();
+  await networkModule.ready;
+  return { NetworkSettings: () => <div>Network Settings Content</div> };
+});
 
 vi.mock("../settingsDataSources", () => ({
   prefetchSettingsDataForItems: vi.fn(),
 }));
 
+vi.mock("../settingsPageLoaders", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../settingsPageLoaders")>()),
+  scheduleSettingsPagePrefetch: vi.fn(),
+}));
+
 // Mock the API module
 vi.mock("../../../services/api", () => ({
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
     getCurrentUser: vi.fn(),
   },
 }));
 
 // Mock the consolidated settings pages since they're rendered by the dialog
 vi.mock("../../../pages/PreferencesSettings", () => ({
-  AppearanceSettings: () => <div>Appearance Settings Content</div>,
+  AppearanceSettings: () => (
+    <div>
+      Appearance Settings Content
+      <input aria-label="Appearance preference" />
+    </div>
+  ),
 }));
 
 vi.mock("../../../pages/AccountSettings", () => ({
@@ -52,6 +83,10 @@ vi.mock("../../../pages/AdvancedSettings", () => ({
   AdvancedSettings: () => <div>System Settings Content</div>,
 }));
 
+vi.mock("../../../pages/DirectorySearchSettings", () => ({
+  DirectorySearchSettings: () => <div>Directory Search Settings Content</div>,
+}));
+
 vi.mock("../../../pages/AboutSettings", () => ({
   AboutSettings: () => <div>About Settings Content</div>,
 }));
@@ -71,10 +106,12 @@ describe("SettingsDialog Component", () => {
     return render(<SambeeThemeProvider>{ui}</SambeeThemeProvider>);
   };
 
-  it("does not check user status when dialog is closed", () => {
-    renderWithTheme(<SettingsDialog open={false} onClose={mockOnClose} />);
+  it("does not check user status when dialog is closed", async () => {
+    await act(async () => {
+      renderWithTheme(<SettingsDialog open={false} onClose={mockOnClose} />);
+    });
 
-    expect(api.getCurrentUser).not.toHaveBeenCalled();
+    expect(api.getCurrentUser).toHaveBeenCalledTimes(1);
   });
 
   it("checks user status and displays appearance settings when opened", async () => {
@@ -87,7 +124,7 @@ describe("SettingsDialog Component", () => {
 
     // Should show Appearance by default
     expect(screen.getByText("Appearance")).toBeInTheDocument();
-    expect(screen.getByText("Appearance Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Appearance Settings Content")).toBeInTheDocument();
   });
 
   it("uses an explicitly sized paper instead of MUI fullWidth mode", async () => {
@@ -146,6 +183,7 @@ describe("SettingsDialog Component", () => {
     expect(authenticationOption.querySelector("svg")).toBeInTheDocument();
     expect(userManagementOption).toBeInTheDocument();
     expect(systemOption).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /^directory search$/i }).querySelector("svg")).toBeInTheDocument();
     expect(aboutOption).toBeInTheDocument();
     expect(aboutOption.querySelector("svg")).toBeInTheDocument();
     expect(screen.getByText("Administration")).toBeInTheDocument();
@@ -182,7 +220,7 @@ describe("SettingsDialog Component", () => {
     const connectionsOption = screen.getByRole("option", { name: /^connections$/i });
     await user.click(connectionsOption);
 
-    expect(screen.getByText("Connections Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Connections Settings Content")).toBeInTheDocument();
   });
 
   it("renders Account settings when selected", async () => {
@@ -191,7 +229,7 @@ describe("SettingsDialog Component", () => {
 
     await user.click(await screen.findByRole("option", { name: /^account$/i }));
 
-    expect(screen.getByText("Account Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Account Settings Content")).toBeInTheDocument();
   });
 
   it("renders Authentication settings when selected", async () => {
@@ -201,7 +239,7 @@ describe("SettingsDialog Component", () => {
 
     await user.click(await screen.findByRole("option", { name: /^authentication$/i }));
 
-    const authenticationContent = screen.getByText("Authentication Settings Content");
+    const authenticationContent = await screen.findByText("Authentication Settings Content");
     expect(authenticationContent).toBeInTheDocument();
   });
 
@@ -216,7 +254,7 @@ describe("SettingsDialog Component", () => {
     const fileBrowserOption = screen.getByRole("option", { name: /file browser/i });
     await user.click(fileBrowserOption);
 
-    expect(screen.getByText("File Browser Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("File Browser Settings Content")).toBeInTheDocument();
   });
 
   it("switches to Local Drives when its top-level settings item is clicked", async () => {
@@ -230,7 +268,7 @@ describe("SettingsDialog Component", () => {
     const localDrivesOption = screen.getByRole("option", { name: /local drives/i });
     await user.click(localDrivesOption);
 
-    expect(screen.getByText("Local Drives Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Local Drives Settings Content")).toBeInTheDocument();
   });
 
   it("opens the requested consolidated initial category", async () => {
@@ -240,7 +278,122 @@ describe("SettingsDialog Component", () => {
       expect(api.getCurrentUser).toHaveBeenCalled();
     });
 
-    expect(screen.getByText("Connections Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Connections Settings Content")).toBeInTheDocument();
+  });
+
+  it("focuses the initial category on each opening", async () => {
+    const { rerender } = renderWithTheme(<SettingsDialog open={false} onClose={mockOnClose} initialCategory="connections" />);
+    rerender(
+      <SambeeThemeProvider>
+        <SettingsDialog open={true} onClose={mockOnClose} initialCategory="connections" />
+      </SambeeThemeProvider>
+    );
+    expect(await screen.findByRole("option", { name: /^connections$/i })).toHaveFocus();
+    rerender(
+      <SambeeThemeProvider>
+        <SettingsDialog open={false} onClose={mockOnClose} initialCategory="connections" />
+      </SambeeThemeProvider>
+    );
+    rerender(
+      <SambeeThemeProvider>
+        <SettingsDialog open={true} onClose={mockOnClose} initialCategory="account" />
+      </SambeeThemeProvider>
+    );
+    expect(await screen.findByRole("option", { name: /^account$/i })).toHaveFocus();
+  });
+
+  it("keeps initial category focus when Strict Mode replays modal effects", async () => {
+    renderWithTheme(
+      <StrictMode>
+        <SettingsDialog open={true} onClose={mockOnClose} initialCategory="connections" />
+      </StrictMode>
+    );
+
+    expect(await screen.findByText("Connections Settings Content")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /^connections$/i })).toHaveFocus();
+  });
+
+  it("synchronizes controlled category focus without waiting for a timer", async () => {
+    const { rerender } = renderWithTheme(
+      <SettingsDialog open={true} onClose={mockOnClose} initialCategory="connections" category="connections" />
+    );
+    expect(await screen.findByRole("option", { name: /^connections$/i })).toHaveFocus();
+    for (const category of ["account", "appearance", "connections"] as const) {
+      rerender(
+        <SambeeThemeProvider>
+          <SettingsDialog open={true} onClose={mockOnClose} initialCategory={category} category={category} />
+        </SambeeThemeProvider>
+      );
+      expect(screen.getByRole("option", { name: new RegExp(`^${category}$`, "i") })).toHaveFocus();
+    }
+  });
+
+  it("keeps category focus aligned through Back, Forward, and rapid history navigation", async () => {
+    function RoutedSettingsDialog() {
+      const location = useLocation();
+      const navigate = useNavigate();
+      const category = new URLSearchParams(location.search).get("settings") as SettingsCategory;
+      return (
+        <SettingsDialog
+          open={true}
+          onClose={mockOnClose}
+          initialCategory={category}
+          category={category}
+          onNavigate={(next) => void navigate({ search: `?settings=${next}` }, { flushSync: true })}
+        />
+      );
+    }
+    const router = createMemoryRouter([{ path: "/settings-test", element: <RoutedSettingsDialog /> }], {
+      initialEntries: ["/settings-test?settings=appearance", "/settings-test?settings=account", "/settings-test?settings=connections"],
+    });
+    renderWithTheme(<RouterProvider router={router} />);
+    expect(await screen.findByRole("option", { name: /^connections$/i })).toHaveFocus();
+    await act(() => router.navigate(-1));
+    expect(screen.getByRole("option", { name: /^account$/i })).toHaveFocus();
+    await act(() => router.navigate(1));
+    expect(screen.getByRole("option", { name: /^connections$/i })).toHaveFocus();
+    await act(() => {
+      void router.navigate(-1);
+      void router.navigate(-1);
+    });
+    expect(screen.getByRole("option", { name: /^appearance$/i })).toHaveFocus();
+  });
+
+  it("preserves form focus when available categories change after permissions load", async () => {
+    let resolveUser!: (user: Awaited<ReturnType<typeof api.getCurrentUser>>) => void;
+    vi.mocked(api.getCurrentUser).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveUser = resolve;
+      })
+    );
+    renderWithTheme(<SettingsDialog open={true} onClose={mockOnClose} />);
+    const input = await screen.findByRole("textbox", { name: "Appearance preference" });
+    act(() => input.focus());
+    await act(async () => resolveUser({ id: "admin-id", username: "admin", role: "admin" }));
+    await screen.findByRole("option", { name: /^about$/i });
+    expect(input).toHaveFocus();
+  });
+
+  it("does not steal focus from a nested dialog during category changes", async () => {
+    const renderDialogs = (category: SettingsCategory, nestedOpen: boolean) => (
+      <SambeeThemeProvider>
+        <SettingsDialog open={true} onClose={mockOnClose} initialCategory={category} category={category} />
+        <Dialog open={nestedOpen} aria-label="Nested settings dialog">
+          <input autoFocus aria-label="Nested preference" />
+        </Dialog>
+      </SambeeThemeProvider>
+    );
+    const { rerender } = render(renderDialogs("connections", false));
+    expect(await screen.findByRole("option", { name: /^connections$/i })).toHaveFocus();
+    const account = screen.getByRole("option", { name: /^account$/i });
+    rerender(renderDialogs("connections", true));
+    const input = await screen.findByRole("textbox", { name: "Nested preference" });
+    expect(input).toHaveFocus();
+    const focusCategory = vi.spyOn(account, "focus");
+    rerender(renderDialogs("account", true));
+    expect(focusCategory).not.toHaveBeenCalled();
+    expect(input).toHaveFocus();
+    focusCategory.mockRestore();
   });
 
   it("falls back to Appearance when an admin-only initial category is unavailable", async () => {
@@ -250,7 +403,7 @@ describe("SettingsDialog Component", () => {
       expect(api.getCurrentUser).toHaveBeenCalled();
     });
 
-    expect(screen.getByText("Appearance Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Appearance Settings Content")).toBeInTheDocument();
   });
 
   it("switches to Connections when a regular user clicks it", async () => {
@@ -262,12 +415,12 @@ describe("SettingsDialog Component", () => {
       expect(api.getCurrentUser).toHaveBeenCalled();
     });
 
-    expect(screen.getByText("Appearance Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Appearance Settings Content")).toBeInTheDocument();
 
     const connectionsOption = screen.getByRole("option", { name: /^connections$/i });
     await user.click(connectionsOption);
 
-    expect(screen.getByText("Connections Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Connections Settings Content")).toBeInTheDocument();
   });
 
   it("switches to User Management tab when admin clicks it", async () => {
@@ -283,7 +436,7 @@ describe("SettingsDialog Component", () => {
     const userManagementOption = await screen.findByRole("option", { name: /user management/i });
     await user.click(userManagementOption);
 
-    expect(screen.getByText("User Management Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("User Management Settings Content")).toBeInTheDocument();
   });
 
   it("switches to System when admin clicks it", async () => {
@@ -299,7 +452,19 @@ describe("SettingsDialog Component", () => {
     const systemOption = await screen.findByRole("option", { name: /system/i });
     await user.click(systemOption);
 
-    expect(screen.getByText("System Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("System Settings Content")).toBeInTheDocument();
+  });
+
+  it("opens Directory Search for admins but does not render it for regular users", async () => {
+    const denied = renderWithTheme(<SettingsCategoryContent item="admin-directory-search" isAdmin={false} />);
+    expect(screen.queryByText("Directory Search Settings Content")).not.toBeInTheDocument();
+    expect(scheduleSettingsPagePrefetch).toHaveBeenLastCalledWith(expect.not.arrayContaining(["admin-directory-search"]));
+    denied.unmount();
+    vi.mocked(api.getCurrentUser).mockResolvedValue({ id: "admin-id", username: "admin", role: "admin" });
+    const user = userEvent.setup();
+    renderWithTheme(<SettingsDialog open onClose={mockOnClose} />);
+    await user.click(await screen.findByRole("option", { name: /^directory search$/i }));
+    expect(await screen.findByText("Directory Search Settings Content")).toBeInTheDocument();
   });
 
   it("switches to About when an admin clicks it", async () => {
@@ -309,7 +474,7 @@ describe("SettingsDialog Component", () => {
 
     await user.click(await screen.findByRole("option", { name: /^about$/i }));
 
-    expect(screen.getByText("About Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("About Settings Content")).toBeInTheDocument();
   });
 
   it("supports Home and End keyboard navigation in the category list", async () => {
@@ -322,16 +487,16 @@ describe("SettingsDialog Component", () => {
     });
 
     const connectionsOption = screen.getByRole("option", { name: /^connections$/i });
-    connectionsOption.focus();
+    act(() => connectionsOption.focus());
 
     await user.keyboard("{End}");
 
-    expect(screen.getByText("Local Drives Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Local Drives Settings Content")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /local drives/i })).toHaveFocus();
 
     await user.keyboard("{Home}");
 
-    expect(screen.getByText("Appearance Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Appearance Settings Content")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /appearance/i })).toHaveFocus();
   });
 
@@ -348,16 +513,64 @@ describe("SettingsDialog Component", () => {
     await screen.findByRole("option", { name: /system/i });
 
     const appearanceOption = screen.getByRole("option", { name: /appearance/i });
-    appearanceOption.focus();
+    act(() => appearanceOption.focus());
 
     await user.keyboard("{PageDown}");
 
-    expect(screen.getByText("About Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("About Settings Content")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /^about$/i })).toHaveFocus();
 
     await user.keyboard("{PageUp}");
 
-    expect(screen.getByText("Appearance Settings Content")).toBeInTheDocument();
+    expect(await screen.findByText("Appearance Settings Content")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /appearance/i })).toHaveFocus();
+  });
+
+  it("prefetches only permitted categories after the selected page renders, during idle time", async () => {
+    const cancel = vi.fn();
+    vi.mocked(scheduleSettingsPagePrefetch).mockReturnValueOnce(cancel);
+    const { unmount } = renderWithTheme(<SettingsDialog open={true} onClose={mockOnClose} />);
+    await screen.findByText("Appearance Settings Content");
+    expect(scheduleSettingsPagePrefetch).toHaveBeenCalledOnce();
+    expect(scheduleSettingsPagePrefetch).toHaveBeenCalledWith(["account", "file-browser", "text-editor", "connections", "local-drives"]);
+    unmount();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("does not load an admin-only category for a non-admin user", async () => {
+    await act(async () => {
+      renderWithTheme(<SettingsCategoryContent item="admin-network" isAdmin={false} />);
+    });
+
+    expect(networkModule.load).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Network Settings Content")).not.toBeInTheDocument();
+  });
+
+  it("keeps navigation available during category loading and ignores a late module after leaving", async () => {
+    vi.mocked(api.getCurrentUser).mockResolvedValue({ id: "admin-id", username: "admin", role: "admin" });
+    const user = userEvent.setup();
+    renderWithTheme(<SettingsDialog open={true} onClose={mockOnClose} />);
+
+    const networkOption = await screen.findByRole("option", { name: /^network$/i });
+    await user.click(networkOption);
+
+    expect(networkModule.load).toHaveBeenCalledOnce();
+    expect(screen.getByRole("status", { name: /loading/i })).toBeInTheDocument();
+    expect(networkOption).toHaveFocus();
+    expect(screen.getByRole("dialog")).toBeVisible();
+
+    const accountOption = screen.getByRole("option", { name: /^account$/i });
+    await user.click(accountOption);
+    expect(await screen.findByText("Account Settings Content")).toBeInTheDocument();
+
+    await act(async () => networkModule.resolve());
+    expect(screen.queryByText("Network Settings Content")).not.toBeInTheDocument();
+    expect(accountOption).toHaveFocus();
+
+    await user.click(networkOption);
+    expect(await screen.findByText("Network Settings Content")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /loading/i })).not.toBeInTheDocument();
+    expect(networkModule.load).toHaveBeenCalledOnce();
   });
 });

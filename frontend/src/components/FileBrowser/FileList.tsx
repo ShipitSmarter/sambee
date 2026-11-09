@@ -22,8 +22,10 @@ interface FileListProps {
   onFileClick: (file: FileEntry, index?: number) => void;
   onToggleItemSelection?: (file: FileEntry, index: number) => void;
   onSelectItem?: (file: FileEntry, index: number) => void;
+  onIconClick?: (file: FileEntry, index: number, extend: boolean, additive: boolean) => void;
+  onClearSelection?: () => void;
   rowVirtualizer: Virtualizer<HTMLDivElement, Element>;
-  parentRef: React.RefObject<HTMLDivElement>;
+  parentRef: React.RefObject<HTMLDivElement | null>;
   listContainerRef: (node: HTMLDivElement | null) => void;
   fileRowStyles: {
     iconBox: Record<string, unknown>;
@@ -52,6 +54,8 @@ export const FileList = React.memo(
     onFileClick,
     onToggleItemSelection,
     onSelectItem,
+    onIconClick,
+    onClearSelection,
     rowVirtualizer,
     parentRef,
     listContainerRef,
@@ -63,7 +67,7 @@ export const FileList = React.memo(
     const { t } = useTranslation();
     const listElementRef = useRef<HTMLDivElement>(null);
     const [itemMenu, setItemMenu] = useState<{
-      actions: CompactItemAction[];
+      actions: readonly CompactItemAction[];
       anchorPosition: { top: number; left: number };
       triggerElement: HTMLElement;
     } | null>(null);
@@ -95,12 +99,23 @@ export const FileList = React.memo(
 
     return (
       <Box
-        ref={(node) => {
+        ref={(node: HTMLDivElement | null) => {
           listElementRef.current = node;
           listContainerRef(node);
         }}
         data-testid="file-list-container"
         tabIndex={0}
+        onClick={(event) => {
+          if (
+            !useTouchSelectionControls &&
+            selectedFiles.size > 0 &&
+            event.button === 0 &&
+            event.target instanceof Element &&
+            !event.target.closest("[data-index]")
+          ) {
+            onClearSelection?.();
+          }
+        }}
         sx={{
           flex: 1,
           minWidth: 300,
@@ -152,7 +167,9 @@ export const FileList = React.memo(
                     index={virtualItem.index}
                     isSelected={virtualItem.index === focusedIndex}
                     isMultiSelected={selectedFiles.has(file.path)}
-                    selectionMode={useTouchSelectionControls && selectedFiles.size > 0}
+                    selectionMode={selectedFiles.size > 0}
+                    onIconClick={onIconClick}
+                    onDesktopBodyClick={onClearSelection ? () => onClearSelection() : undefined}
                     hasUnsavedLocalDraft={unsavedDraftPaths.has(file.path.startsWith("/") ? file.path : `/${file.path}`)}
                     virtualStart={virtualItem.start}
                     virtualSize={virtualItem.size}

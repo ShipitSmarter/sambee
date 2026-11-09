@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 import threading
@@ -7,6 +8,7 @@ from datetime import datetime
 from os import PathLike
 from os import stat_result as os_stat_result
 from pathlib import Path
+from time import monotonic
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -18,12 +20,25 @@ from sqlmodel import Session, select
 from starlette.types import Scope
 
 from app import __version__
-from app.api import admin, admin_auth, archive_operations, auth, browser, companion, connections, logs, system_settings, viewer, websocket
+from app.api import (
+    admin,
+    admin_auth,
+    archive_operations,
+    auth,
+    browser,
+    companion,
+    connections,
+    logs,
+    system_settings,
+    themes,
+    viewer,
+    websocket,
+)
 from app.api.archive_v2_errors import archive_v2_http_exception_handler, archive_v2_request_validation_exception_handler
 from app.core.config import consume_unsupported_config_settings, settings
 from app.core.environment import DEV_CORS_ORIGINS, IS_DEVELOPMENT, IS_PRODUCTION
 from app.core.exceptions import ConfigurationError, SambeeError
-from app.core.logging import SensitiveDataLogFilter, configure_uvicorn_loggers, log_error, set_request_id
+from app.core.logging import RecoveryLogFormatter, SensitiveDataLogFilter, configure_uvicorn_loggers, log_error, set_request_id
 from app.core.secrets import generate_admin_password
 from app.core.security import get_password_hash
 from app.db.database import DATABASE_FILE_PATH, engine, init_db
@@ -72,6 +87,8 @@ def bootstrap_admin_if_pristine(session: Session) -> tuple[User | None, str | No
 # This allows config.toml to use human-readable strings like "DEBUG" or "ERROR"
 log_level = getattr(logging, settings.log_level)
 logging.basicConfig(level=log_level, format=log_format, handlers=handlers)
+for handler in handlers:
+    handler.setFormatter(RecoveryLogFormatter(log_format))
 
 configure_uvicorn_loggers(
     handlers=handlers,
@@ -83,6 +100,7 @@ configure_uvicorn_loggers(
 
 # Reduce noise from third-party libraries (only show warnings/errors)
 logging.getLogger("smbprotocol").setLevel(logging.WARNING)
+logging.getLogger("smbclient").setLevel(logging.WARNING)
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
 logging.getLogger("pyvips").setLevel(logging.WARNING)
 
@@ -276,6 +294,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         system_settings_store.warm_cache()
         logger.info("System settings cache warmed")
 
+        from app.services.archive.temporary_download import cleanup_stale_artifacts
+
+        await asyncio.to_thread(cleanup_stale_artifacts)
+
         logger.info("Checking first-run administrator bootstrap state...")
         with Session(engine) as session:
             admin, admin_password = bootstrap_admin_if_pristine(session)
@@ -413,7 +435,7 @@ async def sambee_error_handler(request: Request, exc: SambeeError) -> JSONRespon
 async def log_requests(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     """Log all HTTP requests with request ID and user context"""
 
-    start_time = datetime.now()
+    start_time = monotonic()
 
     # Set request ID for this request context
     request_id = set_request_id()
@@ -436,7 +458,7 @@ async def log_requests(request: Request, call_next: Callable[[Request], Awaitabl
 
         return response
     except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds() * 1000
+        duration = (monotonic() - start_time) * 1000
         logger.error(
             f"❌ {request.method} {request.url.path} failed after {duration:.0f}ms: {e}{path_suffix}",
             exc_info=True,
@@ -460,6 +482,7 @@ else:
 
 # Include routers
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(themes.router, prefix="/api/themes", tags=["themes"])
 app.include_router(connections.router, prefix="/api", tags=["connections"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(admin_auth.router, prefix="/api/admin", tags=["admin-auth"])

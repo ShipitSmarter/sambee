@@ -3,13 +3,17 @@ import type { CurrentUserSettings, CurrentUserSettingsUpdate } from "../types";
 import api from "./api";
 import { isAuthRequired } from "./authConfig";
 import { authSession } from "./authSession";
+import { notifyCompanionSettingsChanged } from "./companionSettingsEvents";
 import { SETTING_SUCCESS_DISPLAY_MS } from "./settingSaveFeedback";
 
 export { SETTING_SUCCESS_DISPLAY_MS } from "./settingSaveFeedback";
 
 export type CurrentUserSettingsField = CurrentUserSettingsUpdate["field"];
 
-type ValueForField<Field extends CurrentUserSettingsField> = Extract<CurrentUserSettingsUpdate, { field: Field }>["value"];
+type CurrentUserSettingValues = {
+  [Field in CurrentUserSettingsField]: Extract<CurrentUserSettingsUpdate, { field: Field }>["value"];
+};
+type ValueForField<Field extends CurrentUserSettingsField> = CurrentUserSettingValues[Field];
 type CurrentUserSettingValue = CurrentUserSettingsUpdate["value"];
 
 export interface CurrentUserSetting<Field extends CurrentUserSettingsField> {
@@ -63,8 +67,6 @@ function getFieldValue<Field extends CurrentUserSettingsField>(
   switch (field) {
     case "appearance.theme_id":
       return settings.appearance.theme_id as ValueForField<Field>;
-    case "appearance.custom_themes":
-      return settings.appearance.custom_themes as ValueForField<Field>;
     case "localization.language":
       return settings.localization.language as ValueForField<Field>;
     case "localization.regional_locale":
@@ -95,9 +97,7 @@ function getFieldValue<Field extends CurrentUserSettingsField>(
 function setFieldValue(settings: CurrentUserSettings, update: CurrentUserSettingsUpdate): CurrentUserSettings {
   switch (update.field) {
     case "appearance.theme_id":
-      return { ...settings, appearance: { ...settings.appearance, theme_id: update.value } };
-    case "appearance.custom_themes":
-      return { ...settings, appearance: { ...settings.appearance, custom_themes: update.value } };
+      return { ...settings, appearance: { ...settings.appearance, theme_id: update.value, has_theme_override: true } };
     case "localization.language":
       return { ...settings, localization: { ...settings.localization, language: update.value } };
     case "localization.regional_locale":
@@ -146,14 +146,14 @@ class UserSettingsStore {
   constructor() {
     this.channel?.addEventListener("message", (event: MessageEvent<{ type?: unknown }>) => {
       if (event.data?.type === INVALIDATE_MESSAGE) {
-        void this.refresh();
+        void this.refresh().catch(() => undefined);
       }
     });
     authSession.subscribeToIdentity(() => this.clearForIdentityChange());
-    window.addEventListener("focus", () => void this.refresh());
+    window.addEventListener("focus", () => void this.refresh().catch(() => undefined));
     window.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
-        void this.refresh();
+        void this.refresh().catch(() => undefined);
       }
     });
   }
@@ -204,7 +204,7 @@ class UserSettingsStore {
         this.refreshPromise = null;
         if (this.queuedRefresh) {
           this.queuedRefresh = false;
-          void this.refresh();
+          void this.refresh().catch(() => undefined);
         }
       });
     return this.refreshPromise;
@@ -220,7 +220,12 @@ class UserSettingsStore {
     if (this.pendingFields.has(update.field)) {
       throw new Error("A write for this setting is already in progress.");
     }
-    if (this.hasConfirmedValue(update.field) && areCurrentUserSettingValuesEqual(update.value, this.getConfirmedValue(update.field))) {
+    const selectingInheritedTheme = update.field === "appearance.theme_id" && this.snapshot?.appearance.has_theme_override === false;
+    if (
+      this.hasConfirmedValue(update.field) &&
+      areCurrentUserSettingValuesEqual(update.value, this.getConfirmedValue(update.field)) &&
+      !selectingInheritedTheme
+    ) {
       return;
     }
     const identity = authSession.getIdentity();
@@ -261,6 +266,7 @@ class UserSettingsStore {
       this.setSaved(update.field);
       this.notify();
       this.channel?.postMessage({ type: INVALIDATE_MESSAGE });
+      if (result.field === "appearance.theme_id" || result.field.startsWith("localization.")) notifyCompanionSettingsChanged(true);
     } catch (error) {
       if (!this.ownsRequest(update.field, token, identity.epoch)) {
         return;
@@ -275,7 +281,7 @@ class UserSettingsStore {
       );
       this.notify();
       if (requestVersion === this.snapshotVersion) {
-        void this.refresh(true);
+        void this.refresh(true).catch(() => undefined);
       }
       throw error;
     } finally {
@@ -315,7 +321,7 @@ class UserSettingsStore {
     this.snapshotVersion += 1;
     this.queuedRefresh = false;
     this.notify();
-    void this.refresh();
+    void this.refresh(authSession.getAccessToken() !== null).catch(() => undefined);
   }
 
   private async canAccessCurrentUserSettings(): Promise<boolean> {
@@ -398,7 +404,7 @@ export function resetCurrentUserSettingsStoreForTests(): void {
 export function useCurrentUserSetting<Field extends CurrentUserSettingsField>(field: Field): CurrentUserSetting<Field> {
   useSyncExternalStore(userSettingsStore.subscribe, userSettingsStore.getSnapshot, userSettingsStore.getSnapshot);
   useEffect(() => {
-    void userSettingsStore.refresh();
+    void userSettingsStore.refresh().catch(() => undefined);
   }, []);
   return userSettingsStore.getValue(field);
 }

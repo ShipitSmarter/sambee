@@ -40,15 +40,15 @@ Create `docker-compose.yml` with this content:
 
 ```yaml
 services:
-	sambee:
-		image: ghcr.io/helgeklein/sambee:stable
-		restart: unless-stopped
-		volumes:
-			- ./data:/app/data
-			# Optional: uncomment when you create config.toml locally.
-			# - ./config.toml:/app/config.toml:ro
-		ports:
-			- 8000:8000
+  sambee:
+    image: ghcr.io/helgeklein/sambee:stable
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      # Optional: uncomment when you create config.toml locally.
+      # - ./config.toml:/app/config.toml:ro
+    ports:
+      - 8000:8000
 ```
 
 #### Select a Release Channel
@@ -58,10 +58,6 @@ Sambee has three different release channels. You select which to follow via the 
 - `stable` for the production channel.
 - `beta` for prerelease builds.
 - `test` for preview builds.
-
-{{< admonition type="tip" >}}
-While Sambee is in beta, the `stable` tag may not be available yet.
-{{< /admonition >}}
 
 ## 4. Optional: Create a Local Configuration File
 

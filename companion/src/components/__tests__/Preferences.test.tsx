@@ -51,6 +51,33 @@ vi.mock("../../lib/updateCheck", () => ({
 }));
 
 describe("Preferences", () => {
+  it("shows settings authority without a separate policy reset action", async () => {
+    getUserPreferencesMock.mockResolvedValue({
+      allowedServers: [],
+      uploadConflictAction: "ask",
+      autoStartOnLogin: false,
+      showNotifications: true,
+      companionUpdateChannel: "stable",
+      tempFileRetentionDays: 7,
+    });
+    isAutostartEnabledMock.mockResolvedValue(false);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "get_paired_origins") return [];
+      if (command === "get_synced_localization") return null;
+      if (command === "get_native_directory_policy_status")
+        return {
+          status: "synchronized",
+          authoritative_origin: "https://owner.example",
+          sections: { directory_index: { marker: "3" } },
+          message: null,
+        };
+    });
+    render(<Preferences onClose={vi.fn()} />);
+    expect(await screen.findByText("https://owner.example")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reset Policy Owner" })).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("reset_native_directory_policy_owner");
+  });
+
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();

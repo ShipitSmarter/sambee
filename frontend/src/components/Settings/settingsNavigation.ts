@@ -1,19 +1,8 @@
+import type { ParseKeys } from "i18next";
 import { translate } from "../../i18n";
+import { SETTINGS_CATEGORY_ORDER, type SettingsCategory } from "./settingsCategories";
 
-export type SettingsCategory =
-  | "appearance"
-  | "account"
-  | "file-browser"
-  | "text-editor"
-  | "connections"
-  | "local-drives"
-  | "admin-network"
-  | "admin-authentication"
-  | "admin-users"
-  | "admin-smb"
-  | "admin-file-search"
-  | "admin-system"
-  | "admin-about";
+export { SETTINGS_CATEGORY_ORDER, type SettingsCategory } from "./settingsCategories";
 export type SettingsNavItem = SettingsCategory;
 export type SettingsContentItem = SettingsNavItem;
 
@@ -29,7 +18,7 @@ export interface VisibleSettingsSection {
 
 interface SettingsCategoryMeta {
   label: string;
-  descriptionKey: string;
+  descriptionKey: Extract<ParseKeys, `settings.categories.${string}.description` | `settings.connectionsSubgroups.${string}.description`>;
   route: string;
   section: SettingsSection;
   adminOnly?: boolean;
@@ -47,6 +36,7 @@ export const SETTINGS_ROUTE_BY_CATEGORY: Record<SettingsCategory, string> = {
   "admin-users": "/settings/admin/users",
   "admin-smb": "/settings/admin/smb",
   "admin-file-search": "/settings/admin/file-search",
+  "admin-directory-search": "/settings/admin/directory-search",
   "admin-system": "/settings/admin/system",
   "admin-about": "/settings/admin/about",
 };
@@ -156,6 +146,15 @@ export const SETTINGS_CATEGORY_META: Record<SettingsCategory, SettingsCategoryMe
     section: "administration",
     adminOnly: true,
   },
+  "admin-directory-search": {
+    get label() {
+      return translate("settings.categories.adminDirectorySearch.label");
+    },
+    descriptionKey: "settings.categories.adminDirectorySearch.description",
+    route: SETTINGS_ROUTE_BY_CATEGORY["admin-directory-search"],
+    section: "administration",
+    adminOnly: true,
+  },
   "admin-system": {
     get label() {
       return translate("settings.categories.adminSystem.label");
@@ -176,22 +175,6 @@ export const SETTINGS_CATEGORY_META: Record<SettingsCategory, SettingsCategoryMe
   },
 };
 
-export const SETTINGS_CATEGORY_ORDER: SettingsCategory[] = [
-  "appearance",
-  "account",
-  "file-browser",
-  "text-editor",
-  "connections",
-  "local-drives",
-  "admin-network",
-  "admin-authentication",
-  "admin-users",
-  "admin-smb",
-  "admin-file-search",
-  "admin-system",
-  "admin-about",
-];
-
 export const DEFAULT_SETTINGS_CATEGORY: SettingsCategory = SETTINGS_CATEGORY_ORDER[0]!;
 
 export function getSettingsCategoryLabel(category: SettingsCategory): string {
@@ -206,7 +189,7 @@ export function getSettingsViewTitle(view: MobileSettingsView): string {
   return view === "main" ? translate("settings.shell.title") : getSettingsNavItemLabel(view);
 }
 
-export function getSettingsCategoryDescriptionKey(category: SettingsCategory): string {
+export function getSettingsCategoryDescriptionKey(category: SettingsCategory): SettingsCategoryMeta["descriptionKey"] {
   return SETTINGS_CATEGORY_META[category].descriptionKey;
 }
 

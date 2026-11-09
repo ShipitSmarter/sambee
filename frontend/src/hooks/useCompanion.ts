@@ -12,8 +12,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import companionService, { type DriveInfo, hasStoredSecret } from "../services/companion";
-import { syncCurrentLocalizationToCompanion } from "../services/companionLocalizationSync";
+import companionService, { type DriveInfo, getCompanionAuthProtocolStatus, hasStoredSecret } from "../services/companion";
 import { companionSession } from "../services/companionSession";
 import { logger } from "../services/logger";
 
@@ -27,6 +26,8 @@ export type CompanionStatus =
   | "pending_local_approval"
   /** The companion still recognizes this origin, but the browser secret is missing or invalid. */
   | "needs_repair"
+  /** Companion uses an incompatible authentication protocol. */
+  | "update_required"
   /** Paired and ready for authenticated requests. */
   | "paired"
   /** Currently performing initial detection. */
@@ -88,6 +89,13 @@ export function useCompanion(): UseCompanionResult {
         return;
       }
 
+      if (getCompanionAuthProtocolStatus(health) !== "compatible") {
+        setStatus("update_required");
+        setDrivesIfChanged([]);
+        return;
+      }
+
+      await companionSession.load();
       const storedSecret = hasStoredSecret();
       const pairStatus = await companionService.getPairStatus();
       const currentOriginPaired = pairStatus.status === "paired";
@@ -98,7 +106,7 @@ export function useCompanion(): UseCompanionResult {
         return;
       }
 
-      // Companion is reachable and the browser already has a shared secret.
+      // Companion is reachable and the browser already has a signing key.
       // Even if the companion's health flag is stale, a successful authenticated
       // drive fetch proves the pairing is still valid.
       if (storedSecret && currentOriginPaired) {
@@ -176,12 +184,11 @@ export function useCompanion(): UseCompanionResult {
   }, []);
 
   /**
-   * Complete pairing — stores the shared secret and refreshes drives.
+   * Complete pairing — registers the browser signing key and refreshes drives.
    */
   const confirmPairing = useCallback(
     async (pairingId: string) => {
       await companionService.confirmPairing(pairingId);
-      await syncCurrentLocalizationToCompanion();
       // After pairing, re-detect to load drives
       await detect();
     },

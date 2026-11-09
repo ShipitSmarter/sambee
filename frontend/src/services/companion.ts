@@ -13,13 +13,43 @@
  */
 
 import axios, { type AxiosInstance } from "axios";
+import { isApiError } from "../types";
+import { COMPANION_SETTINGS_VERSION, type CompanionSettingsStatus } from "../types/companionSettings";
 import { companionSession } from "./companionSession";
+import { notifyCompanionSettingsChanged } from "./companionSettingsEvents";
 import { logger } from "./logger";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /** The base URL for the companion's local API server. */
 export const COMPANION_BASE_URL = "http://localhost:21549/api";
+export const COMPANION_AUTH_PROTOCOL_VERSION = 2;
+const COMPANION_AUTH_SIGNATURE_MISMATCH_CODE = "companion_auth_signature_mismatch";
+const COMPANION_BROWSER_UPDATE_REQUIRED_CODE = "companion_browser_update_required";
+const COMPANION_PAIRING_NOT_FOUND_CODE = "companion_pairing_not_found";
+export type CompanionAuthProtocolStatus = "compatible" | "companion_update_required" | "browser_update_required";
+export type CompanionPairingErrorKind = "signature" | "pairing_required";
+
+export function isCompanionAuthSignatureMismatch(error: unknown): boolean {
+  if (!isApiError(error) || error.response?.status !== 403) return false;
+  return (
+    error.response.data?.code === COMPANION_AUTH_SIGNATURE_MISMATCH_CODE ||
+    error.response.data?.code === COMPANION_BROWSER_UPDATE_REQUIRED_CODE ||
+    error.response.data?.detail === "Invalid authentication"
+  );
+}
+
+export function isCompanionPairingMissing(error: unknown): boolean {
+  if (!isApiError(error) || error.response?.status !== 403) return false;
+  return error.response.data?.code === COMPANION_PAIRING_NOT_FOUND_CODE || error.response.data?.detail === "Not paired with this origin";
+}
+
+export function getCompanionAuthProtocolStatus(health: CompanionHealthResponse): CompanionAuthProtocolStatus {
+  const version = health.auth_protocol_version ?? 0;
+  if (version < COMPANION_AUTH_PROTOCOL_VERSION) return "companion_update_required";
+  if (version > COMPANION_AUTH_PROTOCOL_VERSION) return "browser_update_required";
+  return "compatible";
+}
 
 /** Timeout in milliseconds for the health-check probe. */
 const HEALTH_CHECK_TIMEOUT_MS = 1500;
@@ -45,6 +75,7 @@ export const COMPANION_PAIR_CONFIRMATION_PENDING_CODE = "pair_confirmation_pendi
 export interface CompanionHealthResponse {
   status: string;
   paired: boolean;
+  auth_protocol_version?: number;
 }
 
 /** Public pairing status for the current browser origin. */
@@ -59,17 +90,6 @@ export interface PairTestResponse {
   status: string;
   message: string;
   origin: string;
-}
-
-export interface CompanionLocalizationPayload {
-  language: string;
-  regional_locale: string;
-  updated_at: string;
-}
-
-export interface CompanionLocalizationSyncResponse extends CompanionLocalizationPayload {
-  applied: boolean;
-  source_origin: string;
 }
 
 /** Drive/volume information returned by the companion. */
@@ -93,12 +113,13 @@ interface PairInitiateResponse {
 
 interface PairInitiateRequest {
   nonce_browser: string;
+  public_key: string;
   origin?: string;
 }
 
 /** Pairing confirmation response from the companion. */
 interface PairConfirmResponse {
-  secret: string;
+  paired: boolean;
 }
 
 interface CompanionApiErrorResponse {
@@ -150,19 +171,14 @@ function isWaitingForCompanionConfirmation(error: unknown): boolean {
   );
 }
 
-// ── Secret Persistence ──────────────────────────────────────────────────────
+// ── Pairing Key Management ──────────────────────────────────────────────────
 
-/** Store the pairing secret. */
-function storeSecret(secret: string): void {
-  companionSession.storeSecret(secret);
-}
-
-/** Remove the stored pairing secret. */
+/** Remove the stored pairing key. */
 export function clearStoredSecret(): void {
   companionSession.clearPairing();
 }
 
-/** Check if we have a stored pairing secret. */
+/** Check if a signing key is available in this browser session. */
 export function hasStoredSecret(): boolean {
   return companionSession.hasSecret();
 }
@@ -185,7 +201,6 @@ class CompanionService {
     this.getPairStatus = this.getPairStatus.bind(this);
     this.unpairCurrentOrigin = this.unpairCurrentOrigin.bind(this);
     this.testPairing = this.testPairing.bind(this);
-    this.syncLocalization = this.syncLocalization.bind(this);
     this.getDrives = this.getDrives.bind(this);
     this.listDirectory = this.listDirectory.bind(this);
     this.getFileInfo = this.getFileInfo.bind(this);
@@ -195,13 +210,10 @@ class CompanionService {
   // ── Auth Header Construction ─────────────────────────────────────────────
 
   /**
-   * Build the HMAC auth headers required by non-public companion endpoints.
-   *
-   * Returns an object with `X-Companion-Secret` (HMAC digest) and
-   * `X-Companion-Timestamp` headers.
+   * Build signature auth headers required by non-public companion endpoints.
    */
-  private async buildAuthHeaders(): Promise<Record<string, string>> {
-    return companionSession.getSigningHeaders();
+  private async buildAuthHeaders(method: string, path: string): Promise<Record<string, string>> {
+    return companionSession.getSigningHeaders(method, `${COMPANION_BASE_URL}${path}`);
   }
 
   // ── Health ───────────────────────────────────────────────────────────────
@@ -232,7 +244,7 @@ class CompanionService {
    * the companion's nonce, and computes the 6-character pairing code.
    *
    * @returns Object with `pairingId`, `pairingCode`, and the internal
-   *          `nonceBrowser` (needed for logging/debugging only).
+   *          `nonceBrowser` used to derive the pairing code.
    */
   async initiatePairing(): Promise<{
     pairingId: string;
@@ -242,6 +254,7 @@ class CompanionService {
     const nonceBrowser = generateNonce();
     const requestBody: PairInitiateRequest = {
       nonce_browser: nonceBrowser,
+      public_key: await companionSession.preparePairing(),
       origin: window.location.origin || undefined,
     };
 
@@ -254,7 +267,7 @@ class CompanionService {
     const hash = await sha256Hex(combined);
     const pairingCode = hash.slice(0, 6).toUpperCase();
 
-    logger.info("Pairing initiated", { pairingId: pairing_id, pairingCode }, "companion");
+    logger.info("Pairing initiated", {}, "companion");
 
     return { pairingId: pairing_id, pairingCode, nonceBrowser };
   }
@@ -262,20 +275,22 @@ class CompanionService {
   /**
    * Confirm a pairing after both sides have verified the code.
    *
-   * Receives and stores the shared secret.
+   * Completes pairing and records the browser signing key as paired.
    */
   async confirmPairing(pairingId: string): Promise<void> {
     const deadline = Date.now() + PAIR_CONFIRM_MAX_WAIT_MS;
 
     while (true) {
       try {
-        const response = await this.client.post<PairConfirmResponse>("/pair/confirm", {
+        await this.client.post<PairConfirmResponse>("/pair/confirm", {
           pairing_id: pairingId,
+          public_key: await companionSession.getPublicKey(),
           origin: window.location.origin || undefined,
         });
 
-        storeSecret(response.data.secret);
-        logger.info("Pairing confirmed — secret stored", {}, "companion");
+        await companionSession.storePairing();
+        notifyCompanionSettingsChanged(true);
+        logger.info("Pairing confirmed — browser signing key registered", {}, "companion");
         return;
       } catch (error) {
         if (!isWaitingForCompanionConfirmation(error) || Date.now() >= deadline) {
@@ -305,22 +320,36 @@ class CompanionService {
 
   /** Remove the current browser origin from the companion. */
   async unpairCurrentOrigin(): Promise<void> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("DELETE", "/pair/current");
     await this.client.delete("/pair/current", { headers });
   }
 
   /** Validate the current browser's authenticated pairing with the companion. */
   async testPairing(): Promise<PairTestResponse> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("POST", "/pair/test");
     const response = await this.client.post<PairTestResponse>("/pair/test", undefined, { headers });
     return response.data;
   }
 
-  /** Synchronize the current browser localization to the companion. */
-  async syncLocalization(payload: CompanionLocalizationPayload): Promise<CompanionLocalizationSyncResponse> {
-    const headers = await this.buildAuthHeaders();
-    const response = await this.client.post<CompanionLocalizationSyncResponse>("/localization", payload, { headers });
-    return response.data;
+  async getSettingsStatus(options?: { signal?: AbortSignal }): Promise<CompanionSettingsStatus> {
+    const headers = await this.buildAuthHeaders("GET", "/settings");
+    return (await this.client.get<CompanionSettingsStatus>("/settings", { headers, ...options })).data;
+  }
+
+  async requestSettingsChallenge(options?: { signal?: AbortSignal }): Promise<CompanionSettingsStatus> {
+    const headers = await this.buildAuthHeaders("POST", "/settings/challenge");
+    return (await this.client.post<CompanionSettingsStatus>("/settings/challenge", undefined, { headers, ...options })).data;
+  }
+
+  async redeemSettingsGrant(grant: string, options?: { signal?: AbortSignal }): Promise<CompanionSettingsStatus> {
+    const headers = await this.buildAuthHeaders("POST", "/settings/redeem");
+    return (
+      await this.client.post<CompanionSettingsStatus>(
+        "/settings/redeem",
+        { version: COMPANION_SETTINGS_VERSION, grant },
+        { headers, ...options }
+      )
+    ).data;
   }
 
   // ── Drives ───────────────────────────────────────────────────────────────
@@ -328,10 +357,10 @@ class CompanionService {
   /**
    * Enumerate all accessible drives/volumes.
    *
-   * Requires an active pairing (HMAC auth).
+   * Requires an active public-key pairing.
    */
   async getDrives(): Promise<DriveInfo[]> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("GET", "/drives");
     const response = await this.client.get<DriveInfo[]>("/drives", { headers });
     return response.data;
   }
@@ -342,7 +371,7 @@ class CompanionService {
    * List directory contents on a local drive.
    */
   async listDirectory(driveId: string, path = ""): Promise<{ path: string; items: unknown[]; total: number }> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("GET", `/browse/${driveId}/list?${new URLSearchParams({ path })}`);
     const response = await this.client.get(`/browse/${driveId}/list`, {
       headers,
       params: { path },
@@ -354,7 +383,7 @@ class CompanionService {
    * Get file/directory metadata on a local drive.
    */
   async getFileInfo(driveId: string, path = ""): Promise<unknown> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("GET", `/browse/${driveId}/info?${new URLSearchParams({ path })}`);
     const response = await this.client.get(`/browse/${driveId}/info`, {
       headers,
       params: { path },
@@ -369,7 +398,7 @@ class CompanionService {
     targetPath: string,
     signal?: AbortSignal
   ): Promise<CompanionArchiveCreationResult> {
-    const headers = await this.buildAuthHeaders();
+    const headers = await this.buildAuthHeaders("POST", `/browse/${driveId}/archive`);
     const response = await this.client.post<CompanionArchiveCreationResult>(
       `/browse/${driveId}/archive`,
       { source_paths: sourcePaths, target_path: targetPath },
@@ -384,17 +413,24 @@ export default companionService;
 
 // ── WebSocket helpers ────────────────────────────────────────────────────────
 
-/**
- * Build an authenticated WebSocket URL for the companion.
- *
- * The browser WebSocket API does not support custom headers, so HMAC
- * credentials are passed as query parameters on the upgrade request.
- * Returns `null` if no pairing secret is stored.
- */
+/** Build the unauthenticated WebSocket endpoint URL. */
 export async function buildCompanionWsUrl(): Promise<string | null> {
   if (!companionSession.hasSecret()) return null;
+  return `${COMPANION_BASE_URL.replace(/^http/, "ws")}/ws`;
+}
 
-  // Derive ws:// URL from the HTTP base URL
-  const wsBase = COMPANION_BASE_URL.replace(/^http/, "ws");
-  return `${wsBase}/ws?${await companionSession.getSignedQuery()}`;
+/** Build the one-time authentication frame sent after the WebSocket opens. */
+export async function buildCompanionWsAuthMessage(): Promise<string | null> {
+  if (!companionSession.hasSecret()) return null;
+  const query = await companionSession.getSignedQuery("GET", `${COMPANION_BASE_URL}/ws`);
+  const params = new URLSearchParams(query);
+  return JSON.stringify({
+    type: "authenticate",
+    signature: params.get("sig"),
+    timestamp: params.get("ts"),
+    nonce: params.get("nonce"),
+    public_key: params.get("key"),
+    body_sha256: params.get("body_sha256"),
+    origin: params.get("origin"),
+  });
 }

@@ -23,12 +23,13 @@ import ArrowUpwardOutlinedIcon from "@mui/icons-material/ArrowUpwardOutlined";
 import { Box, Button, Checkbox, FormControl, FormControlLabel, FormLabel, Radio, RadioGroup, Typography } from "@mui/material";
 import type React from "react";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ConflictInfo } from "../../types";
+import { type ConflictInfo, FileType } from "../../types";
 import { dialogEnterKeyHandler } from "../../utils/keyboardUtils";
 import { formatLocalizedDateTime, formatLocalizedNumber } from "../../utils/localeFormatting";
 import { DialogNotice } from "../Dialog/DialogNotice";
 import { DialogReadOnlyField } from "../Dialog/DialogReadOnlyField";
 import { ResponsiveDialogShell } from "../Dialog/ResponsiveDialogShell";
+import { settingsUtilityButtonSx } from "../Settings/settingsButtonStyles";
 import { DialogIdentifierDisplay } from "./DialogIdentifierDisplay";
 import { validateItemName } from "./nameDialogStrings";
 import { OVERWRITE_CONFLICT_STRINGS as S } from "./overwriteConflictStrings";
@@ -38,7 +39,7 @@ import { OVERWRITE_CONFLICT_STRINGS as S } from "./overwriteConflictStrings";
 // ============================================================================
 
 export type ConflictResolution = "skip" | "overwrite" | "overwrite-older" | "rename";
-export type OverwriteOperation = "copy" | "move" | "extract";
+export type OverwriteOperation = "copy" | "move" | "extract" | "upload";
 
 export interface ConflictDecision {
   resolution: ConflictResolution;
@@ -65,6 +66,8 @@ export interface OverwriteConflictDialogProps {
   sourcePath?: string;
   /** Full target directory path, including its connection name. */
   targetDirectoryPath?: string;
+  /** Uploads may encounter folder/file type conflicts before any file progress exists. */
+  uploadKind?: "file" | "directory";
   onResolve: (decision: ConflictDecision) => void;
   onCancel: () => void;
 }
@@ -137,6 +140,7 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
   error = null,
   sourcePath: ownerSourcePath,
   targetDirectoryPath: ownerTargetDirectoryPath,
+  uploadKind,
   onResolve,
   onCancel,
 }) => {
@@ -145,7 +149,7 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
   const [renameDraft, setRenameDraft] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const targetNameRef = useRef<HTMLInputElement>(null);
-  const resolutionGroupRef = useRef<HTMLDivElement>(null);
+  const resolutionGroupRef = useRef<HTMLFieldSetElement>(null);
   const previousConflictIdentityRef = useRef<string | null>(null);
   const shouldFocusInitialControlRef = useRef(false);
   const shouldFocusRenameInputRef = useRef(false);
@@ -170,7 +174,11 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
   const displayedError = error ?? (hasAvailableResolution ? null : S.ERROR_NO_RESOLUTION_AVAILABLE);
   const description = (
     <Typography variant="body2" sx={{ color: "text.secondary" }}>
-      {S.ALREADY_EXISTS}
+      {uploadKind === "directory"
+        ? S.FOLDER_CONFLICT
+        : operation === "upload" && conflict?.existing_file.type === FileType.DIRECTORY
+          ? S.FILE_FOLDER_CONFLICT
+          : S.ALREADY_EXISTS}
     </Typography>
   );
 
@@ -257,13 +265,21 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
 
   const targetDetails = [
     { label: S.LABEL_PATH, value: joinDirectoryAndName(targetDirectory, existingTargetName), testId: "overwrite-conflict-target-path" },
-    { label: S.LABEL_MODIFIED, value: formatDate(conflict?.existing_file.modified_at) },
-    { label: S.LABEL_SIZE, value: formatBytes(conflict?.existing_file.size) },
+    ...(operation === "upload" && conflict?.existing_file.type === FileType.DIRECTORY
+      ? []
+      : [
+          { label: S.LABEL_MODIFIED, value: formatDate(conflict?.existing_file.modified_at) },
+          { label: S.LABEL_SIZE, value: formatBytes(conflict?.existing_file.size) },
+        ]),
   ];
   const sourceDetails = [
     { label: S.LABEL_PATH, value: sourcePath, testId: "overwrite-conflict-source-path" },
-    { label: S.LABEL_MODIFIED, value: formatDate(conflict?.incoming_file.modified_at) },
-    { label: S.LABEL_SIZE, value: formatBytes(conflict?.incoming_file.size) },
+    ...(operation === "upload" && (uploadKind === "directory" || conflict?.incoming_file.type === FileType.DIRECTORY)
+      ? []
+      : [
+          { label: S.LABEL_MODIFIED, value: formatDate(conflict?.incoming_file.modified_at) },
+          { label: S.LABEL_SIZE, value: formatBytes(conflict?.incoming_file.size) },
+        ]),
   ];
 
   return (
@@ -279,10 +295,15 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
       actionNotice={<DialogNotice message={displayedError} testId="overwrite-conflict-notice" />}
       actions={
         <>
-          <Button onClick={onCancel} disabled={isSubmittingOrPending}>
+          <Button onClick={onCancel} disabled={isSubmittingOrPending} variant="outlined" sx={settingsUtilityButtonSx}>
             {S.CANCEL_OPERATION(operation)}
           </Button>
-          <Button onClick={handleContinue} variant="contained" disabled={!canContinue}>
+          <Button
+            onClick={handleContinue}
+            variant="contained"
+            color={resolution === "overwrite" || resolution === "overwrite-older" ? "error" : "primary"}
+            disabled={!canContinue}
+          >
             {S.BUTTON_CONTINUE}
           </Button>
         </>
@@ -341,7 +362,13 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
             onChange={handleResolutionChange}
             sx={{ columnGap: 2, display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" } }}
           >
-            {allowedActions.includes("skip") && <FormControlLabel value="skip" control={<Radio size="small" />} label={S.BUTTON_SKIP} />}
+            {allowedActions.includes("skip") && (
+              <FormControlLabel
+                value="skip"
+                control={<Radio size="small" />}
+                label={uploadKind === "directory" ? S.BUTTON_SKIP_FOLDER : S.BUTTON_SKIP}
+              />
+            )}
             {allowedActions.includes("overwrite") && (
               <FormControlLabel value="overwrite" control={<Radio size="small" />} label={S.BUTTON_OVERWRITE} />
             )}
@@ -349,7 +376,11 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
               <FormControlLabel value="overwrite-older" control={<Radio size="small" />} label={S.BUTTON_OVERWRITE_ONLY_OLDER} />
             )}
             {allowedActions.includes("rename") && (
-              <FormControlLabel value="rename" control={<Radio size="small" />} label={S.BUTTON_RENAME} />
+              <FormControlLabel
+                value="rename"
+                control={<Radio size="small" />}
+                label={uploadKind === "directory" ? S.BUTTON_RENAME_FOLDER : S.BUTTON_RENAME}
+              />
             )}
           </RadioGroup>
         </FormControl>
@@ -372,7 +403,7 @@ const OverwriteConflictDialog: React.FC<OverwriteConflictDialogProps> = ({
           />
         </Box>
         {progress && (
-          <Typography variant="caption" display="block" sx={{ mt: 0.5, color: "text.secondary" }}>
+          <Typography variant="caption" sx={{ display: "block", mt: 0.5, color: "text.secondary" }}>
             {S.PROGRESS_CONTEXT(progress.current, progress.total, progress.conflictsSoFar)}
           </Typography>
         )}

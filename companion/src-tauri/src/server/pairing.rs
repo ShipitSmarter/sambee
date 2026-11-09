@@ -1,16 +1,18 @@
 //! Pairing protocol — Bluetooth-style numeric comparison.
 //!
-//! Establishes a shared secret between the Sambee frontend and the companion
-//! via a one-time user-confirmed exchange. The secret is stored in the OS
-//! keychain and used to authenticate all subsequent API requests.
+//! Establishes an origin-bound browser signing key via a one-time user-confirmed exchange.
+//! The Companion stores the browser public key in the OS keychain and verifies
+//! asymmetric signatures on subsequent API requests.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use super::DownloadIntent;
 
 #[derive(Clone, Copy)]
 pub enum VerifiedOriginRecordReason {
@@ -23,6 +25,13 @@ const KEYRING_SERVICE: &str = "sambee-companion";
 
 /// Reserved keyring account used to persist the list of paired origins.
 const KEYRING_PAIRED_ORIGINS_ACCOUNT: &str = "__paired_origins__";
+const KEYRING_SETTINGS_AUTHORITY_ACCOUNT: &str = "__settings_authority__";
+
+#[derive(Default)]
+pub struct SettingsAuthority {
+    pub origin: Option<String>,
+    pub generation: u64,
+}
 
 /// Maximum age of a pending pairing before it expires.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
@@ -52,7 +61,10 @@ pub struct PairingState {
     last_initiated_at: Mutex<Option<Instant>>,
     /// Origins that have completed pairing (cached from keychain).
     paired_origins: Mutex<Vec<String>>,
+    authority: Mutex<SettingsAuthority>,
+    pub(crate) download_intents: Mutex<HashMap<String, DownloadIntent>>,
 
+    used_request_nonces: Mutex<HashMap<String, Instant>>,
     pairing_window_cooldown: Duration,
     max_pending_pairings: usize,
 }
@@ -70,18 +82,79 @@ struct PendingPairing {
     origin: String,
     /// Whether the companion side has been confirmed by the user.
     companion_confirmed: bool,
+    /// Browser P-256 public key, encoded as SEC1 bytes.
+    public_key: Vec<u8>,
 }
 
 #[allow(dead_code)]
 impl PairingState {
+    pub fn settings_authority(&self) -> Result<MutexGuard<'_, SettingsAuthority>, String> {
+        self.authority
+            .lock()
+            .map_err(|_| "Settings authority is unavailable. Restart the Companion.".to_owned())
+    }
+
+    fn set_settings_authority(&self, origin: Option<&str>, removed_origin: Option<&str>) -> Result<(), String> {
+        let mut authority = self.settings_authority()?;
+        if removed_origin.is_some_and(|removed| authority.origin.as_deref() != Some(removed)) {
+            return Ok(());
+        }
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SETTINGS_AUTHORITY_ACCOUNT)
+            .map_err(|error| format!("Settings authority storage is unavailable. Check the keychain: {error}"))?;
+        let serialized = serde_json::to_string(&origin).map_err(|error| format!("Settings authority cannot be encoded: {error}"))?;
+        entry
+            .set_password(&serialized)
+            .map_err(|error| format!("Settings authority cannot be stored. Check the keychain: {error}"))?;
+        authority.origin = origin.map(str::to_owned);
+        authority.generation = authority.generation.wrapping_add(1);
+        Ok(())
+    }
+
+    pub fn migrate_settings_authority(&self, legacy_origin: Option<&str>) -> Result<(), String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SETTINGS_AUTHORITY_ACCOUNT)
+            .map_err(|error| format!("Settings authority storage is unavailable: {error}"))?;
+        match entry.get_password() {
+            Ok(value) => {
+                let origin: Option<String> = serde_json::from_str(&value)
+                    .map_err(|error| format!("Settings authority is invalid. Pair the intended server again: {error}"))?;
+                let valid = origin.filter(|origin| self.is_origin_paired(origin));
+                self.set_settings_authority(valid.as_deref(), None)
+            }
+            Err(keyring::Error::NoEntry) => {
+                let origins = self.get_paired_origins();
+                let selected = legacy_origin
+                    .filter(|origin| origins.iter().any(|paired| paired == origin))
+                    .or_else(|| if origins.len() == 1 { Some(origins[0].as_str()) } else { None });
+                self.set_settings_authority(selected, None)
+            }
+            Err(error) => Err(format!("Settings authority cannot be read. Unlock the keychain: {error}")),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             last_initiated_at: Mutex::new(None),
             paired_origins: Mutex::new(Vec::new()),
+            authority: Mutex::new(SettingsAuthority::default()),
+            download_intents: Mutex::new(HashMap::new()),
+            used_request_nonces: Mutex::new(HashMap::new()),
             pairing_window_cooldown: PAIRING_WINDOW_COOLDOWN,
             max_pending_pairings: MAX_PENDING_PAIRINGS,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_authority(&self, origin: Option<&str>) {
+        if let Some(origin) = origin {
+            let mut origins = self.paired_origins.lock().unwrap();
+            if !origins.iter().any(|paired| paired == origin) {
+                origins.push(origin.to_owned());
+            }
+        }
+        let mut authority = self.settings_authority().unwrap();
+        authority.origin = origin.map(str::to_owned);
+        authority.generation += 1;
     }
 
     #[cfg(test)]
@@ -90,6 +163,9 @@ impl PairingState {
             pending: Mutex::new(HashMap::new()),
             last_initiated_at: Mutex::new(None),
             paired_origins: Mutex::new(Vec::new()),
+            authority: Mutex::new(SettingsAuthority::default()),
+            download_intents: Mutex::new(HashMap::new()),
+            used_request_nonces: Mutex::new(HashMap::new()),
             pairing_window_cooldown,
             max_pending_pairings,
         }
@@ -105,6 +181,17 @@ impl PairingState {
     pub fn is_origin_paired(&self, origin: &str) -> bool {
         let origins = self.paired_origins.lock().unwrap();
         origins.contains(&origin.to_string())
+    }
+
+    pub fn consume_request_nonce(&self, nonce: &str) -> bool {
+        let mut nonces = self.used_request_nonces.lock().unwrap();
+        let now = Instant::now();
+        nonces.retain(|_, seen_at| now.duration_since(*seen_at) < Duration::from_secs(60));
+        if nonces.contains_key(nonce) {
+            return false;
+        }
+        nonces.insert(nonce.to_owned(), now);
+        true
     }
 
     /// Return all currently paired origins.
@@ -137,7 +224,12 @@ impl PairingState {
 
     /// Start a new pairing: store the browser nonce, generate companion nonce,
     /// return the pairing ID and companion nonce.
-    pub fn initiate(&self, nonce_browser_hex: &str, origin: &str) -> Result<(String, String, String), PairingInitiateError> {
+    pub fn initiate_with_key(
+        &self,
+        nonce_browser_hex: &str,
+        public_key_b64: &str,
+        origin: &str,
+    ) -> Result<(String, String, String), PairingInitiateError> {
         let nonce_browser = hex::decode(nonce_browser_hex)
             .map_err(|_| PairingInitiateError::Validation("Invalid hex encoding for nonce_browser".to_string()))?;
 
@@ -146,6 +238,11 @@ impl PairingState {
                 "nonce_browser must be 32 bytes (64 hex chars)".to_string(),
             ));
         }
+
+        let public_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, public_key_b64)
+            .map_err(|_| PairingInitiateError::Validation("Invalid public key encoding".to_string()))?;
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&public_key)
+            .map_err(|_| PairingInitiateError::Validation("Invalid P-256 public key".to_string()))?;
 
         // Clean up expired pairings before applying guardrails.
         let mut pending = self.pending.lock().unwrap();
@@ -191,6 +288,7 @@ impl PairingState {
                 created_at: Instant::now(),
                 origin: origin.to_string(),
                 companion_confirmed: false,
+                public_key,
             },
         );
         *last_initiated_at = Some(Instant::now());
@@ -247,9 +345,8 @@ impl PairingState {
         Ok(())
     }
 
-    /// Complete the pairing: verify the companion confirmed, generate shared secret,
-    /// store it in the keychain, and return it to the browser.
-    pub fn confirm(&self, pairing_id: &str, origin: &str) -> Result<String, String> {
+    /// Complete the pairing and store the browser public key in the OS keychain.
+    pub fn confirm(&self, pairing_id: &str, origin: &str, public_key_b64: &str) -> Result<(), String> {
         let mut pending = self.pending.lock().unwrap();
 
         let pairing = pending.get(pairing_id).ok_or_else(|| "Unknown or expired pairing".to_string())?;
@@ -271,23 +368,26 @@ impl PairingState {
             return Err("Waiting for companion confirmation".to_string());
         }
 
+        let public_key = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, public_key_b64)
+            .map_err(|_| "Invalid public key encoding".to_string())?;
+        if public_key != pairing.public_key {
+            return Err("Public key does not match the pairing request".to_string());
+        }
+
         drop(pending); // Release lock before keychain operations
 
-        // Generate shared secret
-        let secret_bytes: Vec<u8> = (0..32).map(|_| rand_byte()).collect();
-        let secret_hex = hex::encode(&secret_bytes);
-
-        // Store in OS keychain
-        if let Err(e) = store_secret_in_keychain(&pairing.origin, &secret_hex) {
-            warn!("Failed to store secret in keychain: {e}");
-            return Err(format!("Failed to store pairing secret: {e}"));
+        if let Err(e) = store_public_key_in_keychain(&pairing.origin, public_key_b64) {
+            warn!("Failed to store public key in keychain: {e}");
+            return Err(format!("Failed to store pairing key: {e}"));
         }
 
         // Add to cached paired origins
         self.record_verified_origin(&pairing.origin, VerifiedOriginRecordReason::PairingCompleted);
 
+        self.set_settings_authority(Some(&pairing.origin), None)?;
+
         info!("Pairing completed: origin={}", pairing.origin);
-        Ok(secret_hex)
+        Ok(())
     }
 
     /// Load paired origins from the keychain on startup.
@@ -302,7 +402,7 @@ impl PairingState {
 
         let mut verified_origins = Vec::new();
         for origin in stored_origins {
-            if get_secret_from_keychain(&origin).is_ok() {
+            if get_public_key_from_keychain(&origin).is_ok() {
                 verified_origins.push(origin);
             } else {
                 warn!("Skipping paired origin without readable secret in keychain");
@@ -320,9 +420,9 @@ impl PairingState {
         info!("Pairing state initialized with {} paired origin(s)", verified_origins.len());
     }
 
-    /// Retrieve the stored secret for an origin from the keychain.
-    pub fn get_secret_for_origin(&self, origin: &str) -> Option<String> {
-        get_secret_from_keychain(origin).ok()
+    /// Retrieve the stored public key for an origin from the keychain.
+    pub fn get_public_key_for_origin(&self, origin: &str) -> Option<String> {
+        get_public_key_from_keychain(origin).ok()
     }
 
     /// Get a pending pairing by ID (for the companion UI to display the code).
@@ -357,14 +457,16 @@ impl PairingState {
 
     /// Remove pairing for a specific origin.
     pub fn unpair(&self, origin: &str) -> Result<(), String> {
+        self.set_settings_authority(None, Some(origin))?;
         // Remove from keychain
-        if let Err(e) = delete_secret_from_keychain(origin) {
+        if let Err(e) = delete_public_key_from_keychain(origin) {
             warn!("Failed to remove secret from keychain for {origin}: {e}");
         }
 
         // Remove from cached list
         let mut origins = self.paired_origins.lock().unwrap();
         origins.retain(|o| o != origin);
+        self.download_intents.lock().unwrap().retain(|_, intent| intent.origin != origin);
         if let Err(e) = store_paired_origins_in_keychain(&origins) {
             warn!("Failed to persist paired origins list after unpair: {e}");
         }
@@ -386,7 +488,7 @@ fn compute_pairing_code(nonce_browser: &[u8], nonce_companion: &[u8]) -> String 
 // ─── Keychain operations ─────────────────────────────────────────────────────
 
 /// Store a pairing secret in the OS keychain.
-fn store_secret_in_keychain(origin: &str, secret: &str) -> Result<(), String> {
+fn store_public_key_in_keychain(origin: &str, secret: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, origin).map_err(|e| format!("Keyring entry creation failed: {e}"))?;
     entry
         .set_password(secret)
@@ -419,14 +521,14 @@ fn load_paired_origins_from_keychain() -> Result<Vec<String>, String> {
 }
 
 /// Retrieve a pairing secret from the OS keychain.
-fn get_secret_from_keychain(origin: &str) -> Result<String, String> {
+fn get_public_key_from_keychain(origin: &str) -> Result<String, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, origin).map_err(|e| format!("Keyring entry creation failed: {e}"))?;
     entry.get_password().map_err(|e| format!("Keyring get_password failed: {e}"))
 }
 
 /// Delete a pairing secret from the OS keychain.
 #[allow(dead_code)]
-fn delete_secret_from_keychain(origin: &str) -> Result<(), String> {
+fn delete_public_key_from_keychain(origin: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, origin).map_err(|e| format!("Keyring entry creation failed: {e}"))?;
     entry.delete_credential().map_err(|e| format!("Keyring delete failed: {e}"))
 }
@@ -455,9 +557,21 @@ mod tests {
     fn rejects_second_pending_pairing_for_same_origin() {
         let pairing = PairingState::new_with_limits(Duration::ZERO, 1);
 
-        pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
 
-        let err = pairing.initiate(NONCE_B, "https://sambee.example").unwrap_err();
+        let err = pairing
+            .initiate_with_key(
+                NONCE_B,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap_err();
         assert!(matches!(err, PairingInitiateError::RateLimited(_)));
         assert!(err.to_string().contains("already waiting for approval"));
     }
@@ -466,9 +580,21 @@ mod tests {
     fn rejects_new_pairing_while_another_origin_is_pending() {
         let pairing = PairingState::new_with_limits(Duration::ZERO, 1);
 
-        pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
 
-        let err = pairing.initiate(NONCE_B, "https://other.example").unwrap_err();
+        let err = pairing
+            .initiate_with_key(
+                NONCE_B,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://other.example",
+            )
+            .unwrap_err();
         assert!(matches!(err, PairingInitiateError::RateLimited(_)));
         assert!(err.to_string().contains("Another pairing request"));
     }
@@ -477,16 +603,32 @@ mod tests {
     fn enforces_short_cooldown_between_pairing_windows() {
         let pairing = PairingState::new_with_limits(Duration::from_millis(50), 1);
 
-        let (pairing_id, _, _) = pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        let (pairing_id, _, _) = pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
         pairing.cancel(&pairing_id, "https://sambee.example").unwrap();
 
-        let err = pairing.initiate(NONCE_B, "https://sambee.example").unwrap_err();
+        let err = pairing
+            .initiate_with_key(
+                NONCE_B,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap_err();
         assert!(matches!(err, PairingInitiateError::RateLimited(_)));
         assert!(err.to_string().contains("too recently"));
 
         sleep(Duration::from_millis(60));
 
-        let result = pairing.initiate(NONCE_C, "https://sambee.example");
+        let result = pairing.initiate_with_key(
+            NONCE_C,
+            "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+            "https://sambee.example",
+        );
         assert!(result.is_ok());
     }
 
@@ -494,7 +636,13 @@ mod tests {
     fn returns_origin_for_pending_pairing_id() {
         let pairing = PairingState::new_with_limits(Duration::ZERO, 1);
 
-        let (pairing_id, _, _) = pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        let (pairing_id, _, _) = pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
 
         assert_eq!(pairing.get_pending_origin(&pairing_id).as_deref(), Some("https://sambee.example"));
         assert!(pairing.get_pending_origin("missing-id").is_none());
@@ -504,10 +652,22 @@ mod tests {
     fn rejects_confirm_for_different_origin() {
         let pairing = PairingState::new_with_limits(Duration::ZERO, 1);
 
-        let (pairing_id, _, _) = pairing.initiate(NONCE_A, "https://sambee.example").unwrap();
+        let (pairing_id, _, _) = pairing
+            .initiate_with_key(
+                NONCE_A,
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+                "https://sambee.example",
+            )
+            .unwrap();
         pairing.companion_confirm(&pairing_id).unwrap();
 
-        let err = pairing.confirm(&pairing_id, "https://other.example").unwrap_err();
+        let err = pairing
+            .confirm(
+                &pairing_id,
+                "https://other.example",
+                "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=",
+            )
+            .unwrap_err();
         assert!(err.contains("does not belong to this origin"));
         assert_eq!(pairing.get_pending_origin(&pairing_id).as_deref(), Some("https://sambee.example"));
     }

@@ -13,7 +13,9 @@ from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import Response
 
+from app.api._smb_helpers import prepare_file_streamer
 from app.models.file import FileInfo, FileType
 from app.services.pdf_inspector import PDFScreenAnalysis
 from app.services.pdf_normalizer import PDFNormalizationError
@@ -130,6 +132,49 @@ def mock_smb_viewer_backend(mock_text_file):
 
 class TestViewerFile:
     """Test cases for the file viewer endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_prepared_stream_closes_after_a_late_read_failure(self):
+        """After the first chunk, a failure terminates the stream rather than replacing headers."""
+        backend = AsyncMock()
+
+        async def late_failure(_path):
+            yield b"first chunk"
+            raise FileNotFoundError("private storage detail")
+
+        backend.read_file = late_failure
+        stream = await prepare_file_streamer(backend, "document.txt")
+        assert await anext(stream) == b"first chunk"
+        with pytest.raises(FileNotFoundError):
+            await anext(stream)
+        backend.disconnect.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "error,status_code,code",
+        [
+            (FileNotFoundError("private path"), 404, "item_not_found"),
+            (PermissionError("private path"), 403, "file_access_denied"),
+            (TimeoutError("private path"), 504, "file_timeout"),
+        ],
+    )
+    def test_read_failure_after_metadata_is_structured(self, client, auth_headers_user, test_connection, error, status_code, code):
+        async def failed_read(_path):
+            raise error
+            yield b""
+
+        with patch("app.api.viewer.SMBBackend") as backend_class:
+            backend = backend_class.return_value
+            backend.connect = AsyncMock()
+            backend.disconnect = AsyncMock()
+            backend.get_file_info = AsyncMock(
+                return_value=FileInfo(name="document.txt", path="document.txt", type=FileType.FILE, mime_type="text/plain")
+            )
+            backend.read_file = failed_read
+            response = client.get(f"/api/viewer/{test_connection.id}/file", headers=auth_headers_user, params={"path": "document.txt"})
+        assert response.status_code == status_code
+        assert response.json()["detail"]["code"] == code
+        assert "private path" not in response.text
+        backend.disconnect.assert_awaited_once()
 
     def test_view_text_file_success(self, client, auth_headers_user, test_connection, mock_smb_viewer_backend):
         """Test successful text file viewer."""
@@ -447,8 +492,8 @@ class TestViewerFile:
                 params={"path": "/folder"},
             )
 
-            # Returns 400 Bad Request when path is a directory, not a file
-            assert response.status_code == 400
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "not_a_file"
 
     def test_view_file_with_special_chars_in_name(self, client, auth_headers_user, test_connection):
         """Test viewing a file with a Unicode filename."""
@@ -482,6 +527,21 @@ class TestViewerFile:
                 "%E2%80%94%20App%20Dev%20Best%20Practices.pdf"
             )
 
+    @pytest.mark.parametrize("mime_type,filename", [("text/html", "unsafe.html"), ("image/svg+xml", "unsafe.svg")])
+    def test_active_document_is_downloaded(self, client, auth_headers_user, test_connection, mime_type, filename):
+        active_file = FileInfo(name=filename, path=f"/{filename}", type=FileType.FILE, size=4, mime_type=mime_type)
+        with patch("app.api.viewer.SMBBackend") as mock:
+            backend_instance = AsyncMock()
+            backend_instance.get_file_info.return_value = active_file
+            backend_instance.read_file = lambda path, **kwargs: AsyncIteratorMock([b"test"])
+            mock.return_value = backend_instance
+
+            response = client.get(f"/api/viewer/{test_connection.id}/file", headers=auth_headers_user, params={"path": active_file.path})
+
+        assert response.status_code == 200
+        assert response.headers["content-disposition"].startswith("attachment;")
+        assert response.headers["x-content-type-options"] == "nosniff"
+
     def test_content_disposition_encodes_unicode_and_control_characters(self):
         """Filename encoding must stay ASCII-only and prevent header injection."""
         from app.utils.content_disposition import build_content_disposition
@@ -506,8 +566,8 @@ class TestViewerFile:
                 params={"path": "/document.txt"},
             )
 
-            assert response.status_code == 500
-            assert "connection failed" in response.json()["detail"].lower()
+            assert response.status_code == 503
+            assert response.json()["detail"]["code"] == "file_unavailable"
 
     def test_view_file_not_found_on_smb(self, client, auth_headers_user, test_connection):
         """Test handling when file doesn't exist on SMB share."""
@@ -542,12 +602,104 @@ class TestViewerFile:
             )
 
             assert response.status_code == 504
-            assert response.json()["detail"] == "Timeout reading file from network share"
+            assert response.json()["detail"]["code"] == "file_timeout"
             backend_instance.disconnect.assert_called_once()
 
 
 class TestDownloadFile:
     """Test cases for the file download endpoint."""
+
+    @pytest.mark.parametrize("mode", ["normalized_pdf", "native_download"])
+    def test_preparation_read_failure_is_safe(self, client, auth_headers_user, test_connection, mock_pdf_file, mode):
+        """A source failure before headers returns a safe structured error."""
+
+        async def failed_read(_path):
+            if mode == "normalized_pdf":
+                yield b"%PDF-1.4"
+            raise FileNotFoundError("private storage detail")
+
+        with (
+            patch("app.api.viewer.SMBBackend") as backend_class,
+            patch("app.api.viewer.is_pdf_normalization_available", return_value=True),
+            patch("app.api.viewer.pdf_derivative_cache.get", return_value=None),
+        ):
+            backend = backend_class.return_value = AsyncMock()
+            backend.get_file_info.return_value = mock_pdf_file
+            backend.read_file = failed_read
+            if mode == "native_download":
+                issued = client.post(
+                    "/api/viewer/download-intents",
+                    headers=auth_headers_user,
+                    json={"connection_id": str(test_connection.id), "path": "document.pdf"},
+                )
+                assert issued.status_code == 200
+                response = client.get(issued.json()["url"])
+            else:
+                response = client.get(
+                    f"/api/viewer/{test_connection.id}/file",
+                    headers=auth_headers_user,
+                    params={"path": "document.pdf", "pdf_variant": "normalized"},
+                )
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "item_not_found"
+        assert "private storage detail" not in response.text
+        backend.disconnect.assert_awaited()
+
+    def test_browser_download_intent_streams_once(self, client, auth_headers_user, test_connection, mock_text_file):
+        with patch("app.api.viewer.SMBBackend") as mock:
+            backend_instance = AsyncMock()
+            backend_instance.get_file_info.return_value = mock_text_file
+            backend_instance.read_file = lambda path, **kwargs: AsyncIteratorMock([b"first", b"second"])
+            mock.return_value = backend_instance
+
+            issued = client.post(
+                "/api/viewer/download-intents",
+                headers=auth_headers_user,
+                json={"connection_id": str(test_connection.id), "path": "/document.txt"},
+            )
+            assert issued.status_code == 200
+            url = issued.json()["url"]
+            assert "/document.txt" not in url
+            assert client.get(url).content == b"firstsecond"
+            assert client.get(url).status_code == 404
+
+    def test_large_file_intent_does_not_read_or_limit_file_bytes(self, client, auth_headers_user, test_connection, mock_text_file):
+        with patch("app.api.viewer.SMBBackend") as backend_mock:
+            backend = AsyncMock()
+            backend.get_file_info.return_value = mock_text_file.model_copy(update={"size": 5 * 1024**3})
+            backend_mock.return_value = backend
+
+            response = client.post(
+                "/api/viewer/download-intents",
+                headers=auth_headers_user,
+                json={"connection_id": str(test_connection.id), "path": "/large.bin"},
+            )
+            assert response.status_code == 200
+            backend.read_file.assert_not_called()
+
+    def test_browser_archive_member_intent_uses_raw_stream(self, client, auth_headers_user, test_connection, mock_text_file):
+        with (
+            patch("app.api.viewer.SMBBackend") as backend_mock,
+            patch("app.api.viewer.ZipReader") as reader_mock,
+            patch("app.api.viewer.stream_archive_member", new_callable=AsyncMock) as stream_mock,
+        ):
+            backend = AsyncMock()
+            backend.get_file_info.return_value = mock_text_file
+            backend_mock.return_value = backend
+            reader_mock.return_value.validate_member_in_record_order = AsyncMock()
+            stream_mock.return_value = Response(content=b"member", headers={"Content-Disposition": "attachment"})
+
+            issued = client.post(
+                "/api/viewer/download-intents",
+                headers=auth_headers_user,
+                json={"connection_id": str(test_connection.id), "path": "archive.zip", "member_path": "inner/member.txt"},
+            )
+            assert issued.status_code == 200
+            reader_mock.return_value.validate_member_in_record_order.assert_awaited_once_with("inner/member.txt")
+            response = client.get(issued.json()["url"])
+            assert response.status_code == 200
+            assert response.content == b"member"
+            assert stream_mock.await_args.args[:6] == (test_connection.id, "archive.zip", "inner/member.txt", True, "raw", "original")
 
     def test_download_file_success(self, client, auth_headers_user, test_connection, mock_text_file):
         """Test successful file download."""
@@ -647,8 +799,8 @@ class TestDownloadFile:
                 params={"path": "/folder"},
             )
 
-            # Returns 400 Bad Request when path is a directory, not a file
-            assert response.status_code == 400
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "not_a_file"
 
     def test_download_nonexistent_connection(self, client, auth_headers_user):
         """Test download with non-existent connection ID."""
@@ -709,7 +861,7 @@ class TestDownloadFile:
             )
 
             assert response.status_code == 504
-            assert response.json()["detail"] == "Timeout reading file from network share"
+            assert response.json()["detail"]["code"] == "file_timeout"
             backend_instance.disconnect.assert_called_once()
 
 

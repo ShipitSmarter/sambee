@@ -10,6 +10,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # ─────────────────────────────────────────────────────────────────────
   # Detect which components changed
@@ -42,6 +46,8 @@ jobs:
         }
         backend_extras = {
           "Dockerfile",
+          ".github/workflows/lint.yml",
+          "scripts/test",
           "scripts/verify-backend-lockfiles.py",
           "scripts/verify-python-runtime-image.py",
           ".github/actions/setup-runtime-python/action.yml",
@@ -117,7 +123,7 @@ jobs:
         else:
             raise SystemExit(f"Unsupported event for change detection: {event_name}")
 
-        backend = any(name.startswith("backend/") or name in backend_extras for name in filenames)
+        backend = any(name.startswith("backend/") or name.endswith(".py") or name in backend_extras for name in filenames)
         frontend = any(name.startswith("frontend/") or name in frontend_extras for name in filenames)
         companion = any(name.startswith("companion/") or name in companion_extras for name in filenames)
 
@@ -152,6 +158,9 @@ jobs:
     - name: Ruff check
       run: cd backend && ruff check app tests/test_verify_backend_lockfiles_script.py ../scripts/verify-backend-lockfiles.py
 
+    - name: Ruff executable-script check
+      run: python -m ruff check --select EXE . .github
+
     - name: Ruff format check
       run: cd backend && ruff format --check app tests/test_verify_backend_lockfiles_script.py ../scripts/verify-backend-lockfiles.py
 
@@ -170,7 +179,7 @@ jobs:
       uses: ./.github/actions/sync-version-check
 
     - name: Set up Node.js
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: '24'
         cache: 'npm'
@@ -224,7 +233,7 @@ jobs:
         components: clippy, rustfmt
 
     - name: Cache Rust build artifacts
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         workspaces: companion/src-tauri -> target
 
@@ -235,7 +244,7 @@ jobs:
       run: cd companion/src-tauri && cargo fmt --check
 
     - name: Set up Node.js
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: '24'
         cache: 'npm'

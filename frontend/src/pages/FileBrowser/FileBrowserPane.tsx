@@ -14,10 +14,12 @@
  * @see FileBrowser — the parent page-level orchestrator
  */
 
-import RefreshIcon from "@mui/icons-material/Refresh";
-import { alpha, Box, Chip, CircularProgress, FormControlLabel, IconButton, Switch, useTheme } from "@mui/material";
-import React, { useMemo } from "react";
+import BlockOutlinedIcon from "@mui/icons-material/BlockOutlined";
+import CloudUploadOutlinedIcon from "@mui/icons-material/CloudUploadOutlined";
+import { alpha, Box, Button, CircularProgress, FormControlLabel, Switch, Typography, useTheme } from "@mui/material";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { CompactBadge as Chip } from "../../components/CompactBadge";
 import { BreadcrumbsNavigation } from "../../components/FileBrowser/BreadcrumbsNavigation";
 import { BrowserViewerPicker } from "../../components/FileBrowser/BrowserViewerPicker";
 import { CompactCreateMenu } from "../../components/FileBrowser/CompactCreateMenu";
@@ -25,12 +27,14 @@ import type { CompactItemAction } from "../../components/FileBrowser/CompactItem
 import { CompactSelectionActions } from "../../components/FileBrowser/CompactSelectionActions";
 import ConfirmDeleteDialog from "../../components/FileBrowser/ConfirmDeleteDialog";
 import CreateItemDialog from "../../components/FileBrowser/CreateItemDialog";
+import { FileBrowserAlerts } from "../../components/FileBrowser/FileBrowserAlerts";
 import { FileList } from "../../components/FileBrowser/FileList";
 import RenameDialog from "../../components/FileBrowser/RenameDialog";
 import { STATUS_BAR_HEIGHT } from "../../components/FileBrowser/StatusBar";
 import type { SearchProvider } from "../../components/FileBrowser/search";
 import type { UnifiedSearchBarModeOption } from "../../components/FileBrowser/UnifiedSearchBar";
 import { UnifiedSearchBar } from "../../components/FileBrowser/UnifiedSearchBar";
+import { formatNoticeTarget, OperationNotifications } from "../../components/OperationNotifications";
 import { DRAFT_RECOVERY_CHANGED_EVENT, getUnsavedDraftsForConnection } from "../../services/draftRecovery";
 import { COMPACT_LAYOUT_SIZE } from "../../theme/constants";
 import type { Connection, FileEntry } from "../../types";
@@ -110,6 +114,11 @@ export interface FileBrowserPaneProps {
   getCompactItemActions?: (context: FileOperationPolicyContext) => readonly CompactItemAction[];
   /** Builds bulk actions for an immutable selection context. */
   getCompactSelectionActions?: (context: FileOperationPolicyContext) => readonly FileOperationAction[];
+  dropTargetLabel?: string;
+  dropUnavailableReason?: string | null;
+  onFileDrop?: (event: React.DragEvent<HTMLElement>) => void;
+  onOpenLocalDrivesSettings?: () => void;
+  onReload?: () => void;
 }
 
 // ============================================================================
@@ -141,10 +150,41 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
   getCompactCreateActions,
   getCompactItemActions,
   getCompactSelectionActions,
+  dropTargetLabel,
+  dropUnavailableReason,
+  onFileDrop,
+  onOpenLocalDrivesSettings,
+  onReload,
 }) => {
   const theme = useTheme();
   const { t } = useTranslation();
   const isDualMode = paneMode === "dual";
+  const [fileDragActive, setFileDragActive] = useState(false);
+  const dragDepthRef = useRef(0);
+  const dragLocationRef = useRef("");
+
+  useEffect(() => {
+    const clearDrag = () => {
+      dragDepthRef.current = 0;
+      setFileDragActive(false);
+    };
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") clearDrag();
+    };
+    const onWindowLeave = (event: DragEvent) => {
+      if (!event.relatedTarget) clearDrag();
+    };
+    window.addEventListener("dragend", clearDrag);
+    window.addEventListener("drop", clearDrag);
+    window.addEventListener("dragleave", onWindowLeave);
+    window.addEventListener("keydown", onEscape);
+    return () => {
+      window.removeEventListener("dragend", clearDrag);
+      window.removeEventListener("drop", clearDrag);
+      window.removeEventListener("dragleave", onWindowLeave);
+      window.removeEventListener("keydown", onEscape);
+    };
+  }, []);
 
   /** Only show the selection highlight on the focused row when this pane is active. */
   const showSelectionHighlight = !isDualMode || isActive;
@@ -183,6 +223,7 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
     // Handlers
     handleFileClick,
     toggleItemSelection,
+    selectItemFromIcon,
     selectItem,
     handleClearSelection,
     getItemsByPaths,
@@ -195,6 +236,13 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
     closeBrowserViewerPicker,
     confirmBrowserViewerPicker,
   } = pane;
+  useEffect(() => {
+    const location = `${connectionId}:${currentPath}`;
+    if (dragLocationRef.current === location) return;
+    dragLocationRef.current = location;
+    dragDepthRef.current = 0;
+    setFileDragActive(false);
+  }, [connectionId, currentPath]);
 
   const currentConnection = useMemo(() => connections.find((connection) => connection.id === connectionId), [connections, connectionId]);
   const [liveDirectoryUpdates, setLiveDirectoryUpdates] = useLiveDirectoryUpdatesPreference(connectionId);
@@ -432,7 +480,6 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
           pane.navigateArchiveToPath(path.slice(archivePrefix.length));
           return;
         }
-        pane.closeArchive();
       }
       pane.navigateToPath(path);
     },
@@ -450,7 +497,53 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
   if (!connectionId) return null;
 
   return (
-    <Box data-pane-id={paneId} sx={paneContainerSx} onClick={handlePaneClick} onFocusCapture={handlePaneFocus} onKeyDown={undefined}>
+    <Box
+      data-pane-id={paneId}
+      sx={[paneContainerSx, { position: "relative" }]}
+      onClick={handlePaneClick}
+      onFocusCapture={handlePaneFocus}
+      onKeyDown={undefined}
+    >
+      <OperationNotifications
+        suppressed={Boolean(pane.directoryUnavailable)}
+        notices={[
+          ...(pane.notification
+            ? [
+                {
+                  ...pane.notification,
+                  id: `${paneId}:${pane.notification.id}`,
+                  action: pane.companionPairingError ? (
+                    <>
+                      {pane.companionPairingError === "signature" && (
+                        <Button color="inherit" onClick={onReload}>
+                          {t("settings.localDrives.reloadButton")}
+                        </Button>
+                      )}
+                      <Button color="inherit" onClick={onOpenLocalDrivesSettings}>
+                        {t("settings.localDrives.headerTitle")}
+                      </Button>
+                    </>
+                  ) : undefined,
+                  onRetry: pane.companionPairingError ? undefined : pane.notification.onRetry,
+                },
+              ]
+            : []),
+          ...(pane.directoryMonitorError
+            ? [
+                {
+                  id: `${paneId}:monitor`,
+                  message: pane.directoryMonitorErrorSummary ?? pane.directoryMonitorError,
+                  occurrence: pane.directoryMonitorErrorOccurrence,
+                  severity: "warning" as const,
+                  failureKey: JSON.stringify([connectionId, currentPath]),
+                  targetLabel: formatNoticeTarget(connectionName, currentPath),
+                  onRetry: pane.handleRefresh,
+                },
+              ]
+            : []),
+        ]}
+        onDismiss={pane.dismissNotification}
+      />
       <Box
         aria-live="polite"
         aria-atomic="true"
@@ -488,18 +581,13 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
               sx={{ ml: 1, flexShrink: 0 }}
             />
           )}
-          <IconButton
-            aria-label={t("fileBrowser.shortcuts.refresh")}
-            disabled={loading}
-            onClick={pane.handleRefresh}
-            size="small"
-            sx={{ mr: 1 }}
-            title={t("fileBrowser.shortcuts.refresh")}
-          >
-            <RefreshIcon fontSize="small" />
-          </IconButton>
+          {pane.directoryMonitorError && (
+            <Button size="small" onClick={pane.handleRefresh} sx={{ ml: "auto" }}>
+              {t("common.actions.monitoringStopped")}
+            </Button>
+          )}
           <FormControlLabel
-            sx={{ flexShrink: 0 }}
+            sx={{ flexShrink: 0, ml: pane.directoryMonitorError ? 1 : "auto" }}
             control={
               <Switch size="small" checked={liveDirectoryUpdates} onChange={(event) => setLiveDirectoryUpdates(event.target.checked)} />
             }
@@ -541,12 +629,54 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
       )}
 
       {/* File list or loading indicator */}
+      {useCompactLayout && pane.directoryMonitorError && (
+        <Box sx={{ px: 2 }}>
+          <Button size="small" onClick={pane.handleRefresh}>
+            {t("common.actions.monitoringStopped")}
+          </Button>
+        </Box>
+      )}
       {loading ? (
         <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>
           <CircularProgress />
         </Box>
+      ) : pane.directoryUnavailable && pane.error ? (
+        <FileBrowserAlerts
+          error={pane.error}
+          companionPairingError={pane.companionPairingError}
+          onOpenLocalDrivesSettings={onOpenLocalDrivesSettings}
+          onReload={onReload}
+          onRetry={pane.handleRefresh}
+          loadingConnections={false}
+          connectionsCount={connections.length}
+          backendAvailabilityStatus="available"
+        />
       ) : (
         <Box
+          onDragEnter={(event) => {
+            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            event.preventDefault();
+            dragDepthRef.current++;
+            setFileDragActive(true);
+          }}
+          onDragOver={(event) => {
+            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = dropUnavailableReason ? "none" : "copy";
+          }}
+          onDragLeave={(event) => {
+            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+            if (dragDepthRef.current === 0 || !event.relatedTarget) setFileDragActive(false);
+          }}
+          onDrop={(event) => {
+            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            dragDepthRef.current = 0;
+            setFileDragActive(false);
+            onFileDrop?.(event);
+          }}
           sx={{
             display: "flex",
             gap: 2,
@@ -554,8 +684,57 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
             minHeight: 0,
             mb: 0,
             flexDirection: "column",
+            position: "relative",
+            outline: fileDragActive && !dropUnavailableReason ? `2px solid ${theme.palette.primary.main}` : undefined,
+            outlineOffset: -2,
           }}
         >
+          {fileDragActive && (
+            <Box
+              role="status"
+              aria-label={dropUnavailableReason ?? [t("fileBrowser.transfers.dropToUpload"), dropTargetLabel].filter(Boolean).join(" ")}
+              sx={{
+                position: "absolute",
+                top: "50%",
+                left: "50%",
+                transform: "translate(-50%, -50%)",
+                zIndex: 2,
+                pointerEvents: "none",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 1,
+                width: "min(280px, calc(100% - 32px))",
+                minHeight: 116,
+                px: 2,
+                py: 2,
+                borderRadius: 1,
+                bgcolor: dropUnavailableReason
+                  ? theme.palette.background.paper
+                  : theme.palette.mode === "dark"
+                    ? theme.palette.grey[800]
+                    : theme.palette.text.primary,
+                color: dropUnavailableReason
+                  ? theme.palette.text.primary
+                  : theme.palette.mode === "dark"
+                    ? theme.palette.text.primary
+                    : theme.palette.background.paper,
+                boxShadow: theme.shadows[8],
+                border: dropUnavailableReason ? `1px solid ${theme.palette.divider}` : undefined,
+                textAlign: "center",
+              }}
+            >
+              {dropUnavailableReason ? (
+                <BlockOutlinedIcon aria-hidden="true" sx={{ fontSize: 32, color: "text.secondary" }} />
+              ) : (
+                <CloudUploadOutlinedIcon aria-hidden="true" sx={{ fontSize: 32, color: "primary.main" }} />
+              )}
+              <Typography sx={{ fontSize: "1rem", fontWeight: 600, lineHeight: 1.35 }}>
+                {dropUnavailableReason ?? t("fileBrowser.transfers.dropToUpload")}
+              </Typography>
+            </Box>
+          )}
           <FileList
             files={sortedFiles}
             showEmptyState={error === null}
@@ -568,6 +747,8 @@ export const FileBrowserPane: React.FC<FileBrowserPaneProps> = ({
             onFileClick={handleFileClick}
             onToggleItemSelection={toggleItemSelection}
             onSelectItem={selectItem}
+            onIconClick={useTouchSelectionControls ? undefined : selectItemFromIcon}
+            onClearSelection={handleClearSelection}
             rowVirtualizer={rowVirtualizer}
             parentRef={parentRef}
             listContainerRef={listContainerRef}

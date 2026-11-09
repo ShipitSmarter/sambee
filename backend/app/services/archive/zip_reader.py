@@ -7,7 +7,7 @@ import struct
 import zlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from app.storage.base import RandomAccessReader
@@ -28,7 +28,6 @@ _INFOZIP_UNICODE_PATH_FIELD_ID = 0x7075
 _INFOZIP_UNICODE_PATH_VERSION = 1
 _READABLE_METHODS = {0, 8, 12}
 _ARCHIVE_IO_CHUNK_BYTES = 256 * 1024
-ARCHIVE_INLINE_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
 _UNIX_HOST_SYSTEM = 3
 _UNIX_FILE_TYPE_MASK = 0o170000
 _UNIX_DIRECTORY_FILE_TYPE = 0o040000
@@ -103,13 +102,7 @@ class ArchiveInspectionManifestMember:
         return "readable" if self.compression_method in _READABLE_METHODS else "unavailable"
 
     def is_inline_preview_eligible(self) -> bool:
-        return (
-            not self.is_directory
-            and self.is_safe
-            and self.has_supported_file_type
-            and self.preview_state == "readable"
-            and self.uncompressed_size <= ARCHIVE_INLINE_PREVIEW_MAX_BYTES
-        )
+        return not self.is_directory and self.is_safe and self.has_supported_file_type and self.preview_state == "readable"
 
 
 @dataclass(frozen=True)
@@ -252,6 +245,7 @@ def _has_supported_file_type(version_made_by: int, external_attributes: int) -> 
 
 
 def _dos_datetime(date_value: int, time_value: int) -> datetime | None:
+    """Interpret DOS-only dates as UTC, consistently with the Companion reader."""
     year = ((date_value >> 9) & 0x7F) + 1980
     month = (date_value >> 5) & 0x0F
     day = date_value & 0x1F
@@ -259,7 +253,7 @@ def _dos_datetime(date_value: int, time_value: int) -> datetime | None:
     minute = (time_value >> 5) & 0x3F
     second = (time_value & 0x1F) * 2
     try:
-        return datetime(year, month, day, hour, minute, second)
+        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
     except ValueError:
         return None
 
@@ -636,8 +630,10 @@ class ZipReader:
     async def validate_entry(self, entry: ZipEntry) -> ValidatedZipEntry:
         """Validate one selected readable entry without resolving its path again."""
 
-        if entry.encrypted or entry.compression_method not in _READABLE_METHODS:
-            raise ArchiveFormatError("Archive member uses an unavailable codec or blocked feature")
+        if entry.encrypted:
+            raise ArchiveFormatError("Archive member is encrypted. Use an archive tool with the password to open it")
+        if entry.compression_method not in _READABLE_METHODS:
+            raise ArchiveFormatError("Archive member uses unsupported compression. Use another archive tool to open it")
         return await self._validate_entry(entry)
 
     async def _validate_entry(self, entry: ZipEntry) -> ValidatedZipEntry:

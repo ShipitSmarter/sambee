@@ -97,8 +97,16 @@ export interface WriteFileRequest {
 
 export type TargetResolutionPolicy = "ask" | "skip" | "replace" | "replace_older";
 
+export class ExpiredEditLockError extends Error {
+  constructor() {
+    super("Lock not found or expired");
+    this.name = "ExpiredEditLockError";
+  }
+}
+
 export interface StorageTextWriteOptions {
   mimeType?: string;
+  reacquireExpiredLock?: boolean;
 }
 
 export interface StorageEditSession {
@@ -111,6 +119,8 @@ export interface StorageEditSession {
 export type StorageEditStartResult =
   | { kind: "acquired"; session: StorageEditSession }
   | { kind: "read-only" }
+  | { kind: "locked" }
+  | { kind: "permission-denied" }
   | { kind: "unsupported" }
   | { kind: "unavailable" };
 
@@ -132,6 +142,7 @@ export interface SameBackendTransferRequest {
   targetName?: string;
   targetResolutionPolicy: TargetResolutionPolicy;
   idempotencyKey: string;
+  transferAttemptId?: string;
   signal?: AbortSignal;
 }
 
@@ -149,9 +160,9 @@ export type ContentTransferResult =
       effects: { source: "unchanged" | "mutated"; destination: "unchanged" | "mutated" };
       error: { code: "source_delete_failed"; detail: string };
     }
-  | { status: "outcome_unknown"; replaced: false; effects: { source: "unchanged" | "unknown"; destination: "unknown" } }
-  | { status: "failed"; replaced: false; effects: StorageMutationEffects; error: StorageOperationError }
-  | { status: "cancelled"; replaced: false; effects: StorageMutationEffects };
+  | { status: "outcome_unknown"; replaced: boolean; effects: StorageMutationEffects }
+  | { status: "failed"; replaced: boolean; effects: StorageMutationEffects; error: StorageOperationError }
+  | { status: "cancelled"; replaced: boolean; effects: StorageMutationEffects };
 
 export type StorageOperationError =
   | { code: "unavailable"; reason: "read-only" | "unpaired" | "unsupported" | "missing-target" | "source_size_unknown" }
@@ -185,6 +196,7 @@ export interface StorageArchiveCreateRequest {
   sources: readonly ResolvedStorageItemLocation[];
   destination: ResolvedStorageDirectoryLocation;
   name: string;
+  selectedMemberPaths?: readonly string[];
 }
 
 export interface StorageArchivePreparation {

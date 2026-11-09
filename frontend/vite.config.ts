@@ -1,11 +1,13 @@
 import type { ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { createLogger, defineConfig } from "vite";
 
 const FRONTEND_DIR = dirname(fileURLToPath(import.meta.url));
+const WORKER_CHARACTER_DECODER = createRequire(import.meta.url).resolve("decode-named-character-reference");
 const WORKSPACE_ROOT = resolve(FRONTEND_DIR, "..");
 const BACKEND_PROXY_TARGET = "http://localhost:8000";
 const BACKEND_PROXY_TIMEOUT_MS = 60_000;
@@ -106,6 +108,9 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     dedupe: ["react", "react-dom"],
+    alias: {
+      "decode-named-character-reference": WORKER_CHARACTER_DECODER,
+    },
   },
   server: {
     host: "0.0.0.0",
@@ -163,6 +168,13 @@ export default defineConfig({
   },
   worker: {
     format: "es",
+    plugins: () => [{
+      name: "worker-character-decoder",
+      enforce: "pre",
+      resolveId(source) {
+        if (source === "decode-named-character-reference") return WORKER_CHARACTER_DECODER;
+      },
+    }],
   },
   optimizeDeps: {
     // Crawl lazy-loaded route modules during startup so navigation does not
@@ -179,20 +191,14 @@ export default defineConfig({
     exclude: OPTIMIZE_DEPS_EXCLUDE,
   },
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks(id) {
-          // Avoid forcing React and MUI into separate chunks because their
-          // runtime linkage can create circular chunks in production builds.
-          if (id.includes("react-markdown") || id.includes("remark-gfm") || id.includes("rehype-highlight")) {
-            return "markdown";
-          }
-
-          if (id.includes("react-pdf")) {
-            return "pdf";
-          }
-
-          return undefined;
+        codeSplitting: {
+          groups: [
+            { name: "preload-helper", test: /^\0vite[\\/]preload-helper\.js$/ },
+            { name: "pdf-core", test: /[\\/]node_modules[\\/]pdfjs-dist[\\/]build[\\/]pdf\.mjs$/ },
+            { name: "pdf-viewer", test: /[\\/]node_modules[\\/]pdfjs-dist[\\/]web[\\/]pdf_viewer\.mjs$/ },
+          ],
         },
       },
     },

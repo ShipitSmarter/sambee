@@ -4,11 +4,14 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, inspect, text
 from sqlalchemy.engine import Connection, Engine
 
 from app.core.logging import get_logger
+from app.core.system_setting_definitions import SystemSettingKey
+from app.core.usernames import USERNAME_COLLISION_CONSTRAINT, USERNAME_KEY_FUNCTION
 from app.models.connection import generate_unique_connection_slug
+from app.models.system_settings import FileSearchSettings
 
 logger = get_logger(__name__)
 
@@ -966,6 +969,120 @@ def _apply_per_field_system_settings_migration(connection: Connection) -> None:
         connection.execute(text("DELETE FROM systemsetting WHERE key = :key"), {"key": legacy_key})
 
 
+def _apply_download_intent_token_version_migration(connection: Connection) -> None:
+    inspector = inspect(connection)
+    if not inspector.has_table("download_intent"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("download_intent")}
+    if "token_version" not in columns:
+        connection.execute(text("ALTER TABLE download_intent ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"))
+    connection.execute(text("DELETE FROM download_intent"))
+
+
+def _apply_oidc_no_refresh_sessions_migration(connection: Connection) -> None:
+    from sqlmodel import SQLModel
+
+    from app.models.oidc import OidcBrowserSession  # noqa: F401 - Registers metadata
+
+    if not inspect(connection).has_table("oidcproviderconfiguration"):
+        return
+    configuration_columns = {column["name"] for column in inspect(connection).get_columns("oidcproviderconfiguration")}
+    if "no_refresh_session_limit_hours" not in configuration_columns:
+        connection.execute(
+            text("ALTER TABLE oidcproviderconfiguration ADD COLUMN no_refresh_session_limit_hours INTEGER NOT NULL DEFAULT 8")
+        )
+    if inspect(connection).has_table("oidcflow"):
+        flow_columns = {column["name"] for column in inspect(connection).get_columns("oidcflow")}
+        if "test_refresh_token_returned" not in flow_columns:
+            connection.execute(text("ALTER TABLE oidcflow ADD COLUMN test_refresh_token_returned BOOLEAN"))
+    if connection.dialect.name != "sqlite":
+        raise RuntimeError("OIDC browser-session migration requires SQLite")
+    if not inspect(connection).has_table("oidcbrowsersession"):
+        return
+    table = SQLModel.metadata.tables["oidcbrowsersession"]
+    previous_columns = [column["name"] for column in inspect(connection).get_columns(table.name)]
+    if "capability" in previous_columns:
+        return
+    replacement_metadata = MetaData()
+    SQLModel.metadata.tables["user"].to_metadata(replacement_metadata)
+    SQLModel.metadata.tables["oidcproviderconfiguration"].to_metadata(replacement_metadata)
+    replacement = table.to_metadata(replacement_metadata, name="oidcbrowsersession__no_refresh")
+    replacement.indexes.clear()
+    replacement.create(connection)
+    copied_columns = ", ".join(f'"{name}"' for name in previous_columns)
+    connection.execute(
+        text(
+            f'INSERT INTO "oidcbrowsersession__no_refresh" ({copied_columns}, "capability") '
+            f'SELECT {copied_columns}, :capability FROM "oidcbrowsersession"'
+        ),
+        {"capability": "renewable"},
+    )
+    connection.execute(text('DROP TABLE "oidcbrowsersession"'))
+    connection.execute(text('ALTER TABLE "oidcbrowsersession__no_refresh" RENAME TO "oidcbrowsersession"'))
+    for index in table.indexes:
+        index.create(bind=connection, checkfirst=True)
+
+
+def _apply_case_insensitive_usernames_migration(connection: Connection) -> None:
+    """Index all names while preventing new collisions without rejecting legacy ones."""
+    if not inspect(connection).has_table("user"):
+        return
+    columns = {column["name"] for column in inspect(connection).get_columns("user")}
+    if "username_key" not in columns:
+        connection.execute(
+            text(f'ALTER TABLE "user" ADD COLUMN username_key VARCHAR GENERATED ALWAYS AS ({USERNAME_KEY_FUNCTION}(username)) VIRTUAL')
+        )
+    connection.execute(text('CREATE INDEX IF NOT EXISTS ix_user_username_key ON "user" (username_key)'))
+    connection.execute(
+        text(f"""
+        CREATE TRIGGER IF NOT EXISTS user_username_key_insert
+        BEFORE INSERT ON "user"
+        WHEN EXISTS (SELECT 1 FROM "user" WHERE username_key = NEW.username_key)
+        BEGIN SELECT RAISE(ABORT, '{USERNAME_COLLISION_CONSTRAINT}'); END
+    """)
+    )
+    connection.execute(
+        text(f"""
+        CREATE TRIGGER IF NOT EXISTS user_username_key_update
+        BEFORE UPDATE OF username ON "user"
+        WHEN NEW.username_key != OLD.username_key
+            AND EXISTS (SELECT 1 FROM "user" WHERE username_key = NEW.username_key AND id != OLD.id)
+        BEGIN SELECT RAISE(ABORT, '{USERNAME_COLLISION_CONSTRAINT}'); END
+    """)
+    )
+
+
+def _apply_history_usage_score_migration(connection: Connection) -> None:
+    """Give existing history records a neutral initial frequency score."""
+    for table in ("recentfile", "recentdirectory"):
+        inspector = inspect(connection)
+        if inspector.has_table(table) and "usage_score" not in {column["name"] for column in inspector.get_columns(table)}:
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN usage_score FLOAT NOT NULL DEFAULT 1"))
+
+    inspector = inspect(connection)
+    if not inspector.has_table("systemsetting") or not inspector.has_table("recentdirectory"):
+        return
+    saved_limit = connection.execute(
+        text("SELECT value FROM systemsetting WHERE key = :key"),
+        {"key": SystemSettingKey.FILE_SEARCH_RETENTION_LIMIT.value},
+    ).scalar_one_or_none()
+    if saved_limit is None:
+        return
+    retention_limit = FileSearchSettings(retention_limit=int(saved_limit)).retention_limit
+    connection.execute(
+        text("""
+            DELETE FROM recentdirectory WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY user_id ORDER BY last_visited_at DESC, created_at DESC, id DESC
+                    ) AS retention_rank FROM recentdirectory
+                ) WHERE retention_rank > :retention_limit
+            )
+        """),
+        {"retention_limit": retention_limit},
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="ensure_connection_slugs", apply=_apply_connection_slug_migration),
     Migration(version=2, name="add_user_role_and_session_fields", apply=_apply_user_role_migration),
@@ -1004,6 +1121,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=33, name="add_archive_operation_member_selection", apply=_apply_archive_operation_member_selection_migration),
     Migration(version=34, name="add_transfer_operations", apply=_apply_transfer_operations_migration),
     Migration(version=35, name="split_system_setting_policy_blobs", apply=_apply_per_field_system_settings_migration),
+    Migration(version=36, name="add_download_intent_token_version", apply=_apply_download_intent_token_version_migration),
+    Migration(version=37, name="add_oidc_no_refresh_sessions", apply=_apply_oidc_no_refresh_sessions_migration),
+    Migration(version=38, name="case_insensitive_usernames", apply=_apply_case_insensitive_usernames_migration),
+    Migration(version=39, name="add_history_usage_score", apply=_apply_history_usage_score_migration),
 )
 
 
@@ -1017,7 +1138,7 @@ def run_migrations(engine: Engine) -> None:
                 continue
 
             logger.info(f"Applying schema migration {migration.version}: {migration.name}")
-            rebuilds_referenced_table = migration.version in {12, 15, 32} and connection.dialect.name == "sqlite"
+            rebuilds_referenced_table = migration.version in {12, 15, 32, 37} and connection.dialect.name == "sqlite"
             if rebuilds_referenced_table:
                 connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
                 connection.commit()

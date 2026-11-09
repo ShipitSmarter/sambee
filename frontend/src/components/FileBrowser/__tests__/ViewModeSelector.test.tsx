@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale } from "../../../i18n";
@@ -7,6 +7,7 @@ import { ViewModeSelector } from "../ViewModeSelector";
 
 describe("ViewModeSelector", () => {
   afterEach(async () => {
+    cleanup();
     await setLocale("en");
   });
 
@@ -21,6 +22,38 @@ describe("ViewModeSelector", () => {
 
     expect(screen.getByRole("button", { name: "[Ṽíéŵ ḿóďé óṕťíóńš]" })).toBeInTheDocument();
     expect(screen.getByText("[Ďéťåíĺš]")).toBeInTheDocument();
+  });
+
+  it("keeps the pill background while keyboard-focused", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <SambeeThemeProvider>
+        <ViewModeSelector viewMode="list" onViewModeChange={vi.fn()} />
+      </SambeeThemeProvider>
+    );
+
+    const trigger = screen.getByRole("button", { name: "View mode options" });
+    const backgroundBeforeFocus = window.getComputedStyle(trigger).backgroundColor;
+
+    await user.tab();
+
+    expect(trigger).toHaveClass("Mui-focusVisible");
+    expect(window.getComputedStyle(trigger).backgroundColor).toBe(backgroundBeforeFocus);
+  });
+
+  it("describes the view-mode menu trigger", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <SambeeThemeProvider>
+        <ViewModeSelector viewMode="list" onViewModeChange={vi.fn()} />
+      </SambeeThemeProvider>
+    );
+
+    await user.hover(screen.getByRole("button", { name: "View mode options" }));
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("View mode options");
   });
 
   it.each([

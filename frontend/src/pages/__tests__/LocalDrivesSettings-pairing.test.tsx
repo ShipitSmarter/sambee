@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPANION_PAIRING_DIALOG_COPY, LOCAL_DRIVES_PAGE_COPY } from "../../components/Settings/localDrivesCopy";
 import { clearCachedAsyncData } from "../../hooks/useCachedAsyncData";
 import { SambeeThemeProvider } from "../../theme";
@@ -26,6 +26,8 @@ vi.mock("../../services/logger", () => ({
 vi.mock("../../services/api", () => ({
   __esModule: true,
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
+    getCurrentUser: () => Promise.resolve({ role: "editor" }),
     getCompanionDownloads: mockGetCompanionDownloads,
   },
 }));
@@ -43,6 +45,13 @@ vi.mock("../../services/companion", () => ({
   },
   clearStoredSecret: vi.fn(),
   hasStoredSecret: mockHasStoredSecret,
+  getCompanionAuthProtocolStatus: (health: { auth_protocol_version?: number }) =>
+    (health.auth_protocol_version ?? 0) < 2
+      ? "companion_update_required"
+      : health.auth_protocol_version === 2
+        ? "compatible"
+        : "browser_update_required",
+  isCompanionAuthSignatureMismatch: vi.fn(() => false),
 }));
 
 function mockNavigatorDevice() {
@@ -61,11 +70,15 @@ function mockNavigatorDevice() {
 }
 
 describe("LocalDrivesSettings pairing dialog integration", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   beforeEach(() => {
+    vi.stubGlobal("isSecureContext", true);
+    vi.stubGlobal("crypto", { subtle: {} });
     vi.clearAllMocks();
     clearCachedAsyncData();
     mockNavigatorDevice();
-    mockCheckHealth.mockResolvedValue({ status: "ok", paired: false });
+    mockCheckHealth.mockResolvedValue({ status: "ok", paired: false, auth_protocol_version: 2 });
     mockGetPairStatus.mockResolvedValue({
       current_origin: window.location.origin,
       current_origin_paired: false,

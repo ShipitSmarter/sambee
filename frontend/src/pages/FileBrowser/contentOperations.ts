@@ -3,12 +3,21 @@ import { logger } from "../../services/logger";
 import { publishRecentFilesChanged } from "../../services/recentFilesSync";
 import type { StorageArchiveOperationCoordinator } from "../../services/storageArchiveOperations";
 import type { ContentTransferResult, StorageBackendRegistry, TargetResolutionPolicy } from "../../services/storageContracts";
-import { transferAcrossStorageBackends } from "../../services/storageTransferOperations";
+import {
+  downloadPhysicalFile,
+  downloadPhysicalSelection,
+  downloadVirtualFile,
+  downloadZipSelection,
+  publishBrowserFile,
+  transferAcrossStorageBackends,
+} from "../../services/storageTransferOperations";
 import { type ConflictInfo, type DirectoryListing, type FileInfo, FileType, isApiError } from "../../types";
+import { randomUuid } from "../../utils/randomUuid";
 import { startZipArchiveExtraction } from "./archiveExtractionExecution";
 import type {
   ArchiveExtractionExecution,
   ArchiveExtractionRequest,
+  BrowserItem,
   ContentItemHandle,
   ContentLocation,
   ContentProviderRegistry,
@@ -17,6 +26,54 @@ import type {
   VirtualLocation,
 } from "./contentProviders";
 import { physicalItemHandle, physicalLocation } from "./contentProviders";
+
+export { publishBrowserFile };
+
+export async function downloadContentSelection(
+  items: readonly BrowserItem[],
+  _providers: ContentProviderRegistry,
+  signal: AbortSignal
+): Promise<void> {
+  const item = items[0];
+  if (!item || !items.every((selected) => selected.entry.is_readable)) throw new Error("Select readable items to download");
+  const virtualSource = item.handle.kind === "virtual" ? item.handle.location.source.path : null;
+  if (items.length > 1 || item.entry.type === FileType.DIRECTORY) {
+    if (item.handle.kind === "physical" && items.every((selected) => selected.handle.kind === "physical")) {
+      await downloadPhysicalSelection(
+        item.handle.location.connectionId,
+        items.map((selected) => selected.handle.path),
+        signal
+      );
+    } else if (
+      item.handle.kind === "virtual" &&
+      item.handle.location.providerId === "zip" &&
+      items.every(
+        (selected) =>
+          selected.handle.kind === "virtual" &&
+          selected.handle.location.providerId === "zip" &&
+          selected.handle.location.source.path === virtualSource
+      )
+    ) {
+      await downloadZipSelection(
+        item.handle.location.connectionId,
+        item.handle.location.source.path,
+        items.map((selected) => selected.handle.path),
+        signal
+      );
+    } else throw new Error("Selected download sources are incompatible");
+  } else if (item.handle.kind === "physical") {
+    await downloadPhysicalFile(item.handle.location.connectionId, item.handle.path, item.entry.name, signal);
+  } else {
+    if (item.handle.location.providerId !== "zip") throw new Error("Unsupported virtual download source");
+    await downloadVirtualFile(
+      item.handle.location.connectionId,
+      item.handle.location.source.path,
+      item.handle.path,
+      item.entry.name,
+      signal
+    );
+  }
+}
 
 export interface ArchiveExtractionAvailability {
   available: boolean;
@@ -84,6 +141,8 @@ export interface TransferRequest {
   targetResolutionPolicy?: TargetResolutionPolicy;
   signal?: AbortSignal;
   onProgress?: (bytesTransferred: number, totalBytes: number | null) => void;
+  onAttemptStart?: (transferAttemptId: string) => void;
+  onAttemptSettled?: (transferAttemptId: string) => void;
 }
 
 export interface TransferTreeRequest extends TransferRequest {
@@ -145,7 +204,8 @@ function validateDirectoryListing(path: string, listing: DirectoryListing): bool
 const PERMANENT_RECENT_NATIVE_OPEN_FAILURE_CODES = new Set([
   "recent_file_target_missing",
   "recent_file_target_not_file",
-  "recent_file_native_launch_failed",
+  "item_not_found",
+  "not_a_file",
 ]);
 
 function isPhysicalLocation(location: ContentLocation): location is PhysicalLocation {
@@ -194,7 +254,8 @@ function getOperationErrorCode(error: unknown): string | null {
   if (!isApiError(error)) {
     return null;
   }
-  const code = error.response?.data?.code;
+  const detail = error.response?.data?.detail;
+  const code = typeof detail === "object" && detail !== null && "code" in detail ? detail.code : error.response?.data?.code;
   return typeof code === "string" ? code : null;
 }
 
@@ -310,7 +371,7 @@ export async function executeTransfer(request: TransferRequest, environment: Con
     path: request.source.path,
   });
   const destination = environment.storageRegistry.resolveDirectory(request.destination);
-  const idempotencyKey = crypto.randomUUID();
+  const idempotencyKey = randomUuid();
   const targetResolutionPolicy = request.targetResolutionPolicy ?? "ask";
   const targetName = request.targetName ?? source.path.split("/").pop() ?? "";
   const requiresStreamRelay = source.target.kind !== destination.target.kind;
@@ -337,15 +398,22 @@ export async function executeTransfer(request: TransferRequest, environment: Con
     );
   }
   const backend = environment.storageRegistry.getBackend(source.target);
+  const transferAttemptId = randomUuid();
   const transfer = {
     source,
     destination,
     targetName: request.targetName,
     targetResolutionPolicy,
     idempotencyKey,
+    transferAttemptId,
     signal: request.signal,
   };
-  return request.kind === "move" ? backend.moveWithinBackend(transfer) : backend.copyWithinBackend(transfer);
+  request.onAttemptStart?.(transferAttemptId);
+  try {
+    return await (request.kind === "move" ? backend.moveWithinBackend(transfer) : backend.copyWithinBackend(transfer));
+  } finally {
+    request.onAttemptSettled?.(transferAttemptId);
+  }
 }
 
 export async function executeTransferTree(
@@ -362,6 +430,16 @@ export async function executeTransferTree(
   }
 
   const sourceRoot = request.source.path;
+  const operationId = randomUuid();
+  const operationContext = {
+    operationId,
+    kind: request.kind,
+    sourceConnectionId: request.source.location.connectionId,
+    destinationConnectionId: request.destination.connectionId,
+    sourceRoot,
+    destinationParent: request.destination.path,
+  };
+  logger.debug("Directory transfer started", operationContext, "browser");
   const rootName = request.targetName ?? sourceRoot.split("/").pop() ?? "";
   let policy = request.targetResolutionPolicy ?? "ask";
   let completed = 0;
@@ -369,6 +447,9 @@ export async function executeTransferTree(
   let sourceRetained = false;
   let destinationMutated = false;
   let sourceMutated = false;
+  let sourceUnknown = false;
+  let destinationUnknown = false;
+  let replaced = false;
 
   const reportProgress = () => request.onTreeProgress?.(completed, discovered);
   const isMissing = (error: unknown) => isApiError(error) && error.response?.status === 404;
@@ -388,6 +469,7 @@ export async function executeTransferTree(
     return new Map(listing.items.map((item) => [item.name, item]));
   };
   const createDirectory = async (connectionId: string, parentPath: string, name: string) => {
+    logger.debug("Directory transfer request", { ...operationContext, phase: "create", connectionId, parentPath, name }, "browser");
     const resolved = environment.storageRegistry.resolveDirectory({ connectionId, path: parentPath });
     const result = await environment.storageRegistry
       .getBackend(resolved.target)
@@ -396,17 +478,27 @@ export async function executeTransferTree(
     destinationMutated = true;
   };
   const partialEffects = () => ({
-    source: sourceMutated ? ("mutated" as const) : ("unchanged" as const),
-    destination: destinationMutated ? ("mutated" as const) : ("unchanged" as const),
+    source: sourceMutated ? ("mutated" as const) : sourceUnknown ? ("unknown" as const) : ("unchanged" as const),
+    destination: destinationMutated ? ("mutated" as const) : destinationUnknown ? ("unknown" as const) : ("unchanged" as const),
   });
-  const cancelledTreeResult = (): ContentTransferResult => ({ status: "cancelled", replaced: false, effects: partialEffects() });
+  const cancelledTreeResult = (): ContentTransferResult => ({ status: "cancelled", replaced, effects: partialEffects() });
   const recordChildEffects = (result: ContentTransferResult) => {
     sourceMutated ||= result.effects.source === "mutated";
     destinationMutated ||= result.effects.destination === "mutated";
+    sourceUnknown ||= result.effects.source === "unknown";
+    destinationUnknown ||= result.effects.destination === "unknown";
+    replaced ||= result.replaced;
   };
   const preservePartialEffects = (result: ContentTransferResult): ContentTransferResult => {
-    if (result.status === "outcome_unknown") return result;
-    return { ...result, effects: partialEffects() };
+    if (result.status === "skipped") return result;
+    if (result.status === "completed_with_source_retained") {
+      const effects = partialEffects();
+      if (effects.source === "unknown" || effects.destination === "unknown") {
+        return { status: "outcome_unknown", replaced, effects };
+      }
+      return { ...result, replaced, effects: { source: effects.source, destination: effects.destination } };
+    }
+    return { ...result, replaced, effects: partialEffects() };
   };
   const decide = async (
     incoming: FileInfo,
@@ -473,6 +565,20 @@ export async function executeTransferTree(
             destination: physicalLocation(request.destination.connectionId, destinationParent),
             targetName: currentTargetName,
             targetResolutionPolicy: currentPolicy,
+            onAttemptStart: (transferAttemptId) => {
+              logger.debug(
+                "Directory transfer request",
+                {
+                  ...operationContext,
+                  phase: "transfer",
+                  transferAttemptId,
+                  sourcePath,
+                  destinationPath: `${destinationParent}/${currentTargetName}`.replace(/^\//, ""),
+                },
+                "browser"
+              );
+              request.onAttemptStart?.(transferAttemptId);
+            },
           },
           environment
         );
@@ -503,7 +609,7 @@ export async function executeTransferTree(
       logger.warn("Directory transfer received an invalid source listing", { sourcePath }, "browser");
       return {
         status: "failed",
-        replaced: false,
+        replaced,
         effects: partialEffects(),
         error: { code: "validation", reason: "invalid-directory-listing" },
       };
@@ -539,7 +645,7 @@ export async function executeTransferTree(
         }
         const result = await transferFile(childSourcePath, destinationPath, targetName);
         recordChildEffects(result);
-        if (result.status === "outcome_unknown") return result;
+        if (result.status === "outcome_unknown") return preservePartialEffects(result);
         if (result.status === "completed_with_source_retained") {
           sourceRetained = true;
         } else if (result.status !== "completed" && result.status !== "skipped") {
@@ -550,6 +656,7 @@ export async function executeTransferTree(
       reportProgress();
     }
     if (request.kind === "move") {
+      logger.debug("Directory transfer request", { ...operationContext, phase: "remove_empty_directory", sourcePath }, "browser");
       const sourceDirectory = environment.storageRegistry.resolveItem({
         connectionId: request.source.location.connectionId,
         path: sourcePath,
@@ -598,26 +705,27 @@ export async function executeTransferTree(
   if (rootTarget.status === "skipped")
     return { status: "skipped", replaced: false, effects: { source: "unchanged", destination: "unchanged" } };
   const result = await walk(sourceRoot, rootTarget.path);
-  return result ?? completedTreeResult(request.kind, sourceRetained, destinationMutated, sourceMutated);
+  return result ?? completedTreeResult(request.kind, sourceRetained, destinationMutated, sourceMutated, replaced);
 }
 
 function completedTreeResult(
   kind: "copy" | "move",
   sourceRetained: boolean,
   destinationMutated: boolean,
-  sourceMutated: boolean
+  sourceMutated: boolean,
+  replaced: boolean
 ): ContentTransferResult {
   if (kind === "move" && sourceRetained) {
     return {
       status: "completed_with_source_retained",
-      replaced: false,
+      replaced,
       effects: { source: sourceMutated ? "mutated" : "unchanged", destination: destinationMutated ? "mutated" : "unchanged" },
       error: { code: "source_delete_failed", detail: "Some source directories still contain skipped or concurrently created entries." },
     };
   }
   return {
     status: "completed",
-    replaced: false,
+    replaced,
     effects: {
       source: kind === "move" && sourceMutated ? "mutated" : "unchanged",
       destination: destinationMutated ? "mutated" : "unchanged",
@@ -655,7 +763,20 @@ export function getCreateContainerAvailability(
   if (request.sources.length === 0) {
     return unavailable("empty-selection");
   }
-  if (!request.sources.every(isPhysicalItem)) {
+  const virtualSource = request.sources[0]!.kind === "virtual" ? request.sources[0] : null;
+  if (
+    virtualSource
+      ? virtualSource.location.providerId !== "zip" ||
+        !request.sources.every(
+          (source) =>
+            source.kind === "virtual" &&
+            source.location.providerId === "zip" &&
+            source.location.connectionId === virtualSource.location.connectionId &&
+            source.location.source.path === virtualSource.location.source.path &&
+            source.location.path === virtualSource.location.path
+        )
+      : !request.sources.every(isPhysicalItem)
+  ) {
     return unavailable("unsupported-source");
   }
   const sourceConnectionId = request.sources[0]!.location.connectionId;
@@ -667,10 +788,20 @@ export function getCreateContainerAvailability(
     return destinationAvailability;
   }
   try {
-    const sourceLocations = request.sources.map((source) =>
-      environment.storageRegistry.resolveItem({ connectionId: source.location.connectionId, path: source.path })
-    );
+    const sourceLocations = virtualSource
+      ? [environment.storageRegistry.resolveItem(virtualSource.location.source)]
+      : request.sources.map((source) =>
+          environment.storageRegistry.resolveItem({ connectionId: source.location.connectionId, path: source.path })
+        );
     const destination = environment.storageRegistry.resolveDirectory(request.destination);
+    if (
+      virtualSource &&
+      (sourceLocations[0]!.target.kind !== "smb" ||
+        destination.target.kind !== "smb" ||
+        virtualSource.location.connectionId !== request.destination.connectionId)
+    ) {
+      return unavailable("unsupported-source");
+    }
     const includesLocal = sourceLocations.some((source) => source.target.kind === "local") || destination.target.kind === "local";
     if (includesLocal && !environment.isCompanionPaired) {
       return unavailable("companion-unavailable");
@@ -689,7 +820,7 @@ export function startCreateContainer(
   environment: ArchiveContentOperationEnvironment
 ): ContentOperationExecution {
   const availability = getCreateContainerAvailability(request, environment);
-  if (!availability.available || !isPhysicalLocation(request.destination) || !request.sources.every(isPhysicalItem)) {
+  if (!availability.available || !isPhysicalLocation(request.destination)) {
     return {
       result: Promise.reject(new Error(`Container creation is unavailable: ${availability.reason ?? "unsupported"}`)),
       cancel: async () => undefined,
@@ -697,12 +828,16 @@ export function startCreateContainer(
     };
   }
 
+  const virtualSource = request.sources[0]!.kind === "virtual" ? request.sources[0] : null;
   const execution = environment.archiveOperations.start({
-    sources: request.sources.map((source) =>
-      environment.storageRegistry.resolveItem({ connectionId: source.location.connectionId, path: source.path })
-    ),
+    sources: virtualSource
+      ? [environment.storageRegistry.resolveItem(virtualSource.location.source)]
+      : request.sources.map((source) =>
+          environment.storageRegistry.resolveItem({ connectionId: source.location.connectionId, path: source.path })
+        ),
     destination: environment.storageRegistry.resolveDirectory(request.destination),
     name: request.name,
+    ...(virtualSource ? { selectedMemberPaths: request.sources.map((source) => source.path) } : {}),
   });
   return {
     result: execution.result.then((result) => {

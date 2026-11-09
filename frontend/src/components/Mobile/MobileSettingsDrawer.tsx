@@ -19,6 +19,7 @@ import { SettingsCategoryContent } from "../Settings/SettingsCategoryContent";
 import { SettingsCategoryList } from "../Settings/SettingsCategoryList";
 import { prefetchSettingsDataForItems } from "../Settings/settingsDataSources";
 import { getSettingsViewTitle, getVisibleSettingsSections, type MobileSettingsView } from "../Settings/settingsNavigation";
+import { scheduleSettingsPagePrefetch } from "../Settings/settingsPageLoaders";
 import { settingsCompactTypographyScopeSx } from "../Settings/settingsTypographyStyles";
 import { useSettingsAccess } from "../Settings/useSettingsAccess";
 
@@ -29,6 +30,9 @@ interface MobileSettingsDrawerProps {
   onConnectionsChanged?: () => void;
   /** Initial view to show when drawer opens */
   initialView?: MobileSettingsView;
+  view?: MobileSettingsView;
+  onNavigate?: (view: MobileSettingsView) => void;
+  onBack?: () => void;
 }
 
 /**
@@ -42,20 +46,34 @@ export const MobileSettingsDrawer: React.FC<MobileSettingsDrawerProps> = ({
   onClose,
   onConnectionsChanged,
   initialView = "main",
+  view,
+  onNavigate,
+  onBack,
 }) => {
-  const [currentView, setCurrentView] = useState<MobileSettingsView>(initialView);
+  const [localView, setLocalView] = useState<MobileSettingsView>(initialView);
+  const currentView = view ?? localView;
+  const setCurrentView = onNavigate ?? setLocalView;
   const { isAdmin } = useSettingsAccess(open);
   const { t } = useTranslation();
 
   // Set view to initialView when drawer opens, reset when closes
   useEffect(() => {
     if (open) {
-      setCurrentView(initialView);
+      if (view === undefined) setLocalView(initialView);
       prefetchSettingsDataForItems(getVisibleSettingsSections(isAdmin).flatMap((section) => section.categories));
     }
-  }, [initialView, isAdmin, open]);
+  }, [initialView, isAdmin, open, view]);
+
+  useEffect(() => {
+    if (!open || currentView !== "main") return;
+    return scheduleSettingsPagePrefetch(getVisibleSettingsSections(isAdmin).flatMap((section) => section.categories));
+  }, [currentView, isAdmin, open]);
 
   const handleBack = () => {
+    if (onBack) {
+      onBack();
+      return;
+    }
     if (currentView === "main") {
       onClose();
     } else {
@@ -109,7 +127,7 @@ export const MobileSettingsDrawer: React.FC<MobileSettingsDrawerProps> = ({
                 subheaderSx={{ bgcolor: "background.default", textTransform: "uppercase", letterSpacing: 0.8 }}
                 itemButtonSx={{ py: 2 }}
                 itemIconSx={{ color: "primary.main" }}
-                primaryTypographyProps={{ fontWeight: "medium" }}
+                primaryTypographyProps={{ sx: { fontWeight: "medium" } }}
               />
             </Box>
           )}

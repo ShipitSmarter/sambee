@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DialogOperationContext } from "../DialogOperationContext";
 
 class ResizeObserverMock {
@@ -11,7 +11,7 @@ class ResizeObserverMock {
 
   observe(target: Element) {
     ResizeObserverMock.callback = this.callback;
-    vi.spyOn(target, "getBoundingClientRect").mockImplementation(() => ({ width: ResizeObserverMock.width }) as DOMRect);
+    vi.spyOn(target, "clientWidth", "get").mockImplementation(() => ResizeObserverMock.width);
     this.callback([], this as unknown as ResizeObserver);
   }
 
@@ -33,6 +33,10 @@ class ResizeObserverMock {
 }
 
 describe("DialogOperationContext", () => {
+  beforeEach(() => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+  });
+
   afterEach(() => {
     ResizeObserverMock.reset();
     vi.restoreAllMocks();
@@ -53,6 +57,7 @@ describe("DialogOperationContext", () => {
     expect(screen.getByText("Source item:").tagName).toBe("DT");
     expect(screen.getByText("Source item:").parentElement?.querySelector("dd")).not.toBeNull();
     expect(screen.getByText("Destination directory:").tagName).toBe("DT");
+    expect(HTMLCanvasElement.prototype.getContext).toHaveBeenCalled();
   });
 
   it("uses muted labels and primary identifier values", () => {
@@ -96,9 +101,15 @@ describe("DialogOperationContext", () => {
     const value = "annual-report-final.pdf";
     render(<DialogOperationContext entries={[{ label: "Source item", value, kind: "fileName", testId: "source" }]} />);
 
-    expect(screen.getByTestId("source")).not.toHaveTextContent(value);
+    const identifier = screen.getByTestId("source");
+    expect(identifier).not.toHaveTextContent(value);
 
-    ResizeObserverMock.resize(100);
+    act(() => ResizeObserverMock.resize(100));
     await waitFor(() => expect(screen.getByTestId("source")).toHaveTextContent(value));
+    expect(screen.getByTestId("source")).toBe(identifier);
+
+    act(() => ResizeObserverMock.resize(12));
+    await waitFor(() => expect(screen.getByTestId("source")).not.toHaveTextContent(value));
+    expect(screen.getByTestId("source")).toBe(identifier);
   });
 });

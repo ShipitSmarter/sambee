@@ -19,10 +19,14 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useDirectorySearchProvider } from "../../components/FileBrowser/search";
+import { formatNoticeTarget, NOTICE_DURATION_MS, type OperationNotice, useOperationError } from "../../components/OperationNotifications";
+import { translate } from "../../i18n";
 import { isClientTimeoutError, isLocalAbortError } from "../../services/backendAvailability";
 import { isLocalDrive, normalizeLocalDrivePath } from "../../services/backendRouter";
 import { browserHistoryService } from "../../services/browserHistoryService";
 import { browserLinkTargetService } from "../../services/browserLinkTargetService";
+import { publishMissingPhysicalFile, subscribeMissingPhysicalFiles } from "../../services/fileRecoveryEvents";
+import { type CompanionPairingErrorKind, getLocalDrivePairingErrorKind } from "../../services/localDrivePairing";
 import { logger } from "../../services/logger";
 import { publishRecentDirectoriesChanged } from "../../services/recentDirectoriesSync";
 import { publishRecentFilesChanged } from "../../services/recentFilesSync";
@@ -30,7 +34,9 @@ import type { StorageBackendRegistry } from "../../services/storageContracts";
 import { useSambeeTheme } from "../../theme";
 import type { FileEntry, RecentFileValidationError } from "../../types";
 import { FileType, isApiError } from "../../types";
+import { classifyFileFailure, type FileFailureKind, getApiErrorMessage, getStorageErrorCode } from "../../utils/apiErrors";
 import { getAllViewerIds, getCompatibleViewerIds, getFileTypeByExtension, isImageFile, type ViewerId } from "../../utils/FileTypeRegistry";
+import { getArchiveMemberUnavailableMessageKey, isShortcutFile } from "../../utils/fileEntries";
 import { compareLocalizedStrings } from "../../utils/localeFormatting";
 import { getConnectionById, isConnectionReadOnly } from "./access";
 import {
@@ -83,6 +89,7 @@ const INCREMENTAL_SEARCH_RESET_DELAY_MS = 1_000;
  * reloads within this window are suppressed to avoid double-fetches.
  */
 const RELOAD_DEDUP_WINDOW_MS = 2_000;
+const REALTIME_REFRESH_INTERVAL_MS = 1_000;
 const DIRECTORY_LOAD_GENERIC_ERROR = "Failed to load directory contents. Please try again.";
 const DIRECTORY_LOAD_NETWORK_ERROR = "Failed to load files. Please check your connection settings.";
 const DIRECTORY_LOAD_TIMEOUT_ERROR = "Directory listing timed out. The remote share took too long to respond.";
@@ -91,8 +98,6 @@ const ARCHIVE_MEMBER_OPEN_ERROR = "Archive member could not be opened.";
 const ARCHIVE_LIST_PAGE_SIZE = 100;
 const ARCHIVE_ROUTE_RESOLUTION_PAGE_SIZE = 500;
 const VIRTUAL_PAGE_PRELOAD_THRESHOLD = 15;
-const RECENT_FILE_DEFAULT_ERROR = "The recent file could not be opened.";
-const RECENT_FILE_MISSING_ERROR = "The recent file no longer exists.";
 
 const UNAVAILABLE_STORAGE_REGISTRY: StorageBackendRegistry = {
   resolveDirectory() {
@@ -110,6 +115,8 @@ const UNAVAILABLE_STORAGE_REGISTRY: StorageBackendRegistry = {
       writable: false,
       canList: false,
       canReadArchive: false,
+      canEditText: false,
+      preview: { imageConversion: false, imageResizing: false, pdfNormalization: false },
       canWriteFile: false,
       canResolveActivation: false,
       canOpenInNativeApp: false,
@@ -168,10 +175,8 @@ export function shouldLoadNextVirtualPage({
 const STALE_RECENT_FILE_CODES = new Set<RecentFileValidationError["code"]>([
   "recent_file_target_missing",
   "recent_file_target_not_file",
-  "recent_file_native_launch_failed",
   "recent_file_invalid_path",
   "recent_file_connection_removed",
-  "recent_file_access_denied",
 ]);
 
 type ActivationCurrentGuard = () => boolean;
@@ -204,8 +209,7 @@ function archiveLocationsMatch(left: ArchiveLocation | null, right: ArchiveLocat
 
 /** Generate a unique viewer session id for logging. */
 const createViewerSessionId = (): string => {
-  const randomPart = Math.random().toString(36).slice(2, 10);
-  return `${Date.now().toString(36)}-${randomPart}`;
+  return crypto.randomUUID();
 };
 
 function getRecentFileValidationError(error: unknown): RecentFileValidationError | null {
@@ -225,9 +229,32 @@ function getRecentFileValidationError(error: unknown): RecentFileValidationError
 }
 
 function getApiErrorCode(error: unknown): string | null {
-  if (!isApiError(error)) return null;
-  const code = error.response?.data?.code;
-  return typeof code === "string" ? code : null;
+  return getStorageErrorCode(error);
+}
+
+function isMissingDirectory(error: unknown): boolean {
+  return getApiErrorCode(error) === "directory_not_found";
+}
+
+function getDirectoryToastSummary(error: unknown): string | undefined {
+  return isMissingDirectory(error) ? translate("fileBrowser.chrome.alerts.folderNotFoundSummary") : undefined;
+}
+
+function getFileToastSummary(kind: FileFailureKind): string | undefined {
+  return kind === "missing" ? translate("fileBrowser.chrome.alerts.fileNotFoundSummary") : undefined;
+}
+
+function getDirectoryErrorMessage(error: unknown, path: string): string {
+  if (isMissingDirectory(error)) {
+    return translate("fileBrowser.chrome.alerts.folderNotFound", { name: path.split("/").at(-1) || "/" });
+  }
+  if (getApiErrorCode(error) === "directory_access_denied" || getResponseStatus(error) === 403) {
+    return translate("fileBrowser.chrome.alerts.folderAccessDenied");
+  }
+  if (getApiErrorCode(error) === "not_a_directory") return translate("fileBrowser.chrome.alerts.notAFolder");
+  if (getResponseStatus(error) === 404) return translate("fileBrowser.chrome.alerts.connectionUnavailable");
+  if (isClientTimeoutError(error) || getResponseStatus(error) === 504) return DIRECTORY_LOAD_TIMEOUT_ERROR;
+  return DIRECTORY_LOAD_GENERIC_ERROR;
 }
 
 function recordRecentHistoryEntry({
@@ -280,6 +307,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     onNavigateDirectory,
     onNavigateVirtualLocation,
     onResolveRouteLocation,
+    onOpenViewer,
   } = config;
   const providerRegistry = contentProviders;
 
@@ -296,7 +324,54 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   const [archiveLoadingMore, setArchiveLoadingMore] = useState(false);
   const [items, setItems] = useState<BrowserItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setOperationError, errorOccurrence] = useOperationError();
+  const [notification, setNotification] = useState<OperationNotice | null>(null);
+  const [errorSeverity, setErrorSeverity] = useState<"warning" | "error">("error");
+  const failedNavigationRetryRef = React.useRef<(() => void) | undefined>(undefined);
+  const failedNoticeTarget = React.useRef<{ connectionId: string; path: string; label: string; summary?: string } | null>(null);
+  const pendingNoticeTarget = React.useRef<typeof failedNoticeTarget.current>(null);
+  const setError: React.Dispatch<React.SetStateAction<string | null>> = useCallback(
+    (update) => {
+      failedNoticeTarget.current = update === null ? null : pendingNoticeTarget.current;
+      pendingNoticeTarget.current = null;
+      if (update === null) {
+        failedNavigationRetryRef.current = undefined;
+      }
+      setOperationError(update);
+    },
+    [setOperationError]
+  );
+  const identifyFailedTarget = useCallback(
+    (connectionId: string, path: string, summary?: string) => {
+      const name = getConnectionById(connections, connectionId)?.name;
+      pendingNoticeTarget.current = { connectionId, path, label: formatNoticeTarget(name, path), summary };
+    },
+    [connections]
+  );
+  const [monitoredLocation, setMonitoredLocation] = useState<{ connectionId: string; path: string } | null>(null);
+  const [directoryMonitorError, setDirectoryMonitorError, directoryMonitorErrorOccurrence] = useOperationError();
+  const directoryMonitorErrorSummary = React.useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (archiveLocation || monitoredLocation?.connectionId !== connectionId || monitoredLocation.path !== currentPath) {
+      setDirectoryMonitorError(null);
+    }
+  }, [connectionId, currentPath, archiveLocation, monitoredLocation, setDirectoryMonitorError]);
+  useEffect(() => {
+    if (error)
+      setNotification({
+        id: "browser-operation",
+        message: failedNoticeTarget.current?.summary ?? error,
+        severity: errorSeverity,
+        occurrence: errorOccurrence,
+        onRetry: failedNavigationRetryRef.current,
+        failureKey: failedNoticeTarget.current
+          ? JSON.stringify([failedNoticeTarget.current.connectionId, failedNoticeTarget.current.path])
+          : undefined,
+        targetLabel: failedNoticeTarget.current?.label,
+      });
+    else setNotification((previous) => (previous?.id === "browser-operation" ? null : previous));
+  }, [error, errorOccurrence, errorSeverity]);
+  const [companionPairingError, setCompanionPairingError] = useState<{ kind: CompanionPairingErrorKind; message: string } | null>(null);
   const files = useMemo(() => items.map((item) => item.entry), [items]);
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -315,6 +390,11 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
   /** Set of currently selected canonical file paths. */
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const selectionAnchorRef = React.useRef<string | null>(null);
+
+  useEffect(() => {
+    if (selectedFiles.size === 0) selectionAnchorRef.current = null;
+  }, [selectedFiles]);
 
   // ──────────────────────────────────────────────────────────────────────────
   // Viewer State
@@ -371,6 +451,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     [history, storageRegistry]
   );
   const pendingRecentDirectoryVisitRef = React.useRef<{ connectionId: string; path: string } | null>(null);
+  const pendingRecentDirectoryRecordRef = React.useRef<{ id: string; connectionId: string; path: string } | null>(null);
   const searchBufferRef = React.useRef<string>("");
   const searchTimeoutRef = React.useRef<number | null>(null);
 
@@ -438,36 +519,42 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   const transitionListingLocationRef = React.useRef<
     (nextConnectionId: string, nextPath: string, nextArchiveLocation: ArchiveLocation | null) => boolean
   >(() => false);
+  const requestPhysicalNavigationRef = React.useRef<(connectionId: string, path: string, commit: () => void) => void>(() => {});
+  const recoverMissingDirectoryRef = React.useRef<(connectionId: string, path: string) => Promise<void>>(async () => {});
+  const navigationAbortRef = React.useRef<AbortController | null>(null);
 
-  const prepareDirectoryTransition = useCallback((nextConnectionId: string, nextPath: string): void => {
-    const ownsPhysicalLocation =
-      archiveLocationRef.current === null && connectionIdRef.current === nextConnectionId && currentPathRef.current === nextPath;
+  const prepareDirectoryTransition = useCallback(
+    (nextConnectionId: string, nextPath: string): void => {
+      const ownsPhysicalLocation =
+        archiveLocationRef.current === null && connectionIdRef.current === nextConnectionId && currentPathRef.current === nextPath;
 
-    if (!nextConnectionId && ownsPhysicalLocation) {
-      setItems([]);
-      setLoading(false);
+      if (!nextConnectionId && ownsPhysicalLocation) {
+        setItems([]);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+
+      if (!ownsPhysicalLocation) {
+        return;
+      }
+
+      const cacheKey = `${nextConnectionId}:${nextPath}`;
+      const cached = directoryCache.current.get(cacheKey);
+      const now = Date.now();
+
       setError(null);
-      return;
-    }
 
-    if (!ownsPhysicalLocation) {
-      return;
-    }
+      if (cached && now - cached.timestamp < DIRECTORY_CACHE_TTL_MS) {
+        setItems(toPhysicalItems(nextConnectionId, nextPath, cached.items));
+        setLoading(false);
+        return;
+      }
 
-    const cacheKey = `${nextConnectionId}:${nextPath}`;
-    const cached = directoryCache.current.get(cacheKey);
-    const now = Date.now();
-
-    setError(null);
-
-    if (cached && now - cached.timestamp < DIRECTORY_CACHE_TTL_MS) {
-      setItems(toPhysicalItems(nextConnectionId, nextPath, cached.items));
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
-  }, []);
+      setLoading(true);
+    },
+    [setError]
+  );
 
   const navigateToPath = useCallback(
     (nextPath: string) => {
@@ -477,25 +564,22 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       }
 
       const normalizedPath = normalizeLocalDrivePath(nextConnectionId, nextPath);
-      if (currentPathRef.current === normalizedPath && archiveLocationRef.current === null) {
+      if (currentPathRef.current === normalizedPath && archiveLocationRef.current === null && !pendingRecentDirectoryRecordRef.current) {
+        navigationAbortRef.current?.abort();
         return;
       }
 
-      clearIncrementalSearch();
-
-      pendingRecentDirectoryVisitRef.current = normalizedPath ? { connectionId: nextConnectionId, path: normalizedPath } : null;
-
-      pendingLocationRef.current = {
-        connectionId: nextConnectionId,
-        path: normalizedPath,
-      };
-      latestLocalActivationRequestIdRef.current += 1;
-
-      transitionListingLocationRef.current(nextConnectionId, normalizedPath, null);
-      prepareDirectoryTransition(nextConnectionId, normalizedPath);
-      setCurrentPath(normalizedPath);
-      setViewInfo(null);
-      onNavigatePath?.(normalizedPath);
+      requestPhysicalNavigationRef.current(nextConnectionId, normalizedPath, () => {
+        clearIncrementalSearch();
+        pendingRecentDirectoryVisitRef.current = normalizedPath ? { connectionId: nextConnectionId, path: normalizedPath } : null;
+        pendingLocationRef.current = { connectionId: nextConnectionId, path: normalizedPath };
+        latestLocalActivationRequestIdRef.current += 1;
+        transitionListingLocationRef.current(nextConnectionId, normalizedPath, null);
+        prepareDirectoryTransition(nextConnectionId, normalizedPath);
+        setCurrentPath(normalizedPath);
+        setViewInfo(null);
+        onNavigatePath?.(normalizedPath);
+      });
     },
     [clearIncrementalSearch, onNavigatePath, prepareDirectoryTransition]
   );
@@ -512,8 +596,10 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     {
       includeDotDirectories: includeDotDirectoriesInQuickNav,
       history,
+      sourceRevision: config.sourceRevision,
       getConnectionName: (targetConnectionId) => getConnectionById(connections, targetConnectionId)?.name ?? targetConnectionId,
-      onNavigateDirectory: (targetConnectionId, path) => {
+      onNavigateDirectory: (targetConnectionId, path, recordId) => {
+        pendingRecentDirectoryRecordRef.current = recordId ? { id: recordId, connectionId: targetConnectionId, path } : null;
         if (targetConnectionId === connectionIdRef.current) {
           navigateToPath(path);
           return;
@@ -550,12 +636,18 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   const latestVirtualActivationIdRef = React.useRef(0);
   const pendingLocationRef = React.useRef<{ connectionId: string; path: string } | null>(null);
   const latestLocalActivationRequestIdRef = React.useRef(0);
-  const loadPhysicalDirectoryRef =
-    React.useRef<(path: string, forceRefresh?: boolean, preserveVisibleContent?: boolean) => Promise<void>>();
-  const loadArchiveFilesRef = React.useRef<(location: ArchiveLocation, append?: boolean) => Promise<void>>();
+  const loadPhysicalDirectoryRef = React.useRef<
+    ((path: string, forceRefresh?: boolean, preserveVisibleContent?: boolean) => Promise<void>) | undefined
+  >(undefined);
+  const loadArchiveFilesRef = React.useRef<((location: ArchiveLocation, append?: boolean) => Promise<void>) | undefined>(undefined);
   const loadMoreVirtualItemsRef = React.useRef<() => void>(() => {});
   const latestLoadRequestIdRef = React.useRef(0);
   const directoryLoadAbortRef = React.useRef<AbortController | null>(null);
+  const hasPhysicalListingRef = React.useRef(false);
+  const realtimeRefreshPendingRef = React.useRef(false);
+  const realtimeRefreshTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastRealtimeRefreshRef = React.useRef<number | null>(null);
+  const scheduleRealtimeRefreshRef = React.useRef<() => void>(() => {});
   const latestLinkTargetLoadRequestIdRef = React.useRef(0);
   const linkTargetLoadAbortRef = React.useRef<AbortController | null>(null);
   const pendingLocationReloadRef = React.useRef<PendingLocationReload | null>(null);
@@ -666,6 +758,14 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       const archiveChanged =
         connectionIdRef.current !== nextConnectionId || !archiveLocationsMatch(archiveLocationRef.current, nextArchiveLocation);
+      realtimeRefreshPendingRef.current = false;
+      if (realtimeRefreshTimerRef.current !== null) {
+        clearTimeout(realtimeRefreshTimerRef.current);
+        realtimeRefreshTimerRef.current = null;
+      }
+      lastRealtimeRefreshRef.current = null;
+      hasPhysicalListingRef.current = false;
+      navigationAbortRef.current?.abort();
       directoryLoadAbortRef.current?.abort();
       directoryLoadAbortRef.current = null;
       latestLoadRequestIdRef.current += 1;
@@ -789,10 +889,12 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
               return linkTarget ? { ...item, entry: { ...item.entry, link_target: linkTarget } } : item;
             });
             const cached = directoryCache.current.get(cacheKey);
-            directoryCache.current.set(cacheKey, {
-              items: enrichedItems.map((item) => item.entry),
-              timestamp: cached?.timestamp ?? Date.now(),
-            });
+            if (cached) {
+              directoryCache.current.set(cacheKey, {
+                items: enrichedItems.map((item) => item.entry),
+                timestamp: cached.timestamp,
+              });
+            }
             return enrichedItems;
           });
         })
@@ -840,6 +942,9 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
             return;
           }
           setItems(toPhysicalItems(targetConnectionId, targetPath, cached.items));
+          hasPhysicalListingRef.current = true;
+          setMonitoredLocation({ connectionId: targetConnectionId, path: targetPath });
+          directoryLoadAbortRef.current = null;
           setLoading(false);
           setError(null);
           loadLocalLinkTargets(targetConnectionId, targetPath, cached.items, requestId);
@@ -854,11 +959,12 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         directoryCache.current.delete(cacheKey);
       }
 
-      const shouldKeepVisibleContent = preserveVisibleContent && filesRef.current.length > 0;
+      const shouldKeepVisibleContent = preserveVisibleContent && hasPhysicalListingRef.current;
 
       if (physicalRequestOwnsLocation(requestId, targetConnectionId, targetPath)) {
         setLoading(!shouldKeepVisibleContent);
         setError(null);
+        setCompanionPairingError(null);
       }
 
       try {
@@ -879,7 +985,11 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         }
 
         const items = listing.items.map((item) => item.entry);
-        directoryCache.current.set(cacheKey, { items, timestamp: now });
+        if (!realtimeRefreshPendingRef.current) {
+          directoryCache.current.set(cacheKey, { items, timestamp: now });
+        }
+        hasPhysicalListingRef.current = true;
+        setMonitoredLocation({ connectionId: targetConnectionId, path: targetPath });
         setItems(listing.items);
         loadLocalLinkTargets(targetConnectionId, targetPath, items, requestId);
         const pendingVisit = pendingRecentDirectoryVisitRef.current;
@@ -911,38 +1021,50 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
         clearPendingRecentDirectoryVisit(targetConnectionId, targetPath);
 
-        logger.error("Error loading directory", { error: err, connectionId: targetConnectionId, path: targetPath }, "browser");
-
-        let errorMessage = DIRECTORY_LOAD_GENERIC_ERROR;
-
-        if (isClientTimeoutError(err)) {
-          errorMessage = DIRECTORY_LOAD_TIMEOUT_ERROR;
-        } else if (err && typeof err === "object" && "message" in err) {
-          const error = err as Error & { code?: string };
-          const message = error.message;
-          if (message.includes("Network Error") || message.includes("ECONNREFUSED") || error.code === "ECONNREFUSED") {
-            errorMessage = DIRECTORY_LOAD_NETWORK_ERROR;
-          } else if (isApiError(err)) {
-            if (err.response?.status === 404) {
-              const detail = err.response?.data?.detail;
-              errorMessage = detail || "Directory not found. It may have been removed or renamed.";
-            } else if (err.response?.status === 504) {
-              errorMessage = err.response?.data?.detail || DIRECTORY_LOAD_TIMEOUT_ERROR;
-            } else if (err.response?.data?.detail) {
-              errorMessage = err.response.data.detail;
-            }
-          }
-        } else if (isApiError(err)) {
-          if (err.response?.status === 404) {
-            const detail = err.response?.data?.detail;
-            errorMessage = detail || "Directory not found. It may have been removed or renamed.";
-          } else if (err.response?.status === 504) {
-            errorMessage = err.response?.data?.detail || DIRECTORY_LOAD_TIMEOUT_ERROR;
-          } else if (err.response?.data?.detail) {
-            errorMessage = err.response.data.detail;
-          }
+        if (isMissingDirectory(err)) {
+          setErrorSeverity("warning");
+          failedNavigationRetryRef.current = undefined;
+          directoryCache.current.delete(cacheKey);
+          setMonitoredLocation(null);
+          setItems([]);
+          setSelectedFiles(new Set());
+          hasPhysicalListingRef.current = false;
+          identifyFailedTarget(targetConnectionId, targetPath, getDirectoryToastSummary(err));
+          setError(getDirectoryErrorMessage(err, targetPath));
+          await recoverMissingDirectoryRef.current(targetConnectionId, targetPath);
+          return;
         }
 
+        logger.error("Error loading directory", { error: err, connectionId: targetConnectionId, path: targetPath }, "browser");
+
+        const pairingErrorKind = getLocalDrivePairingErrorKind(targetConnectionId, err);
+        let errorMessage = pairingErrorKind
+          ? translate(
+              pairingErrorKind === "signature"
+                ? "fileBrowser.chrome.alerts.localDrivePairingRejected"
+                : "fileBrowser.chrome.alerts.localDrivePairingRequired",
+              {
+                connection: getConnectionById(connections, targetConnectionId)?.name ?? targetConnectionId,
+              }
+            )
+          : DIRECTORY_LOAD_GENERIC_ERROR;
+
+        if (pairingErrorKind) {
+          setCompanionPairingError({ kind: pairingErrorKind, message: errorMessage });
+        } else if (isClientTimeoutError(err)) {
+          errorMessage = DIRECTORY_LOAD_TIMEOUT_ERROR;
+        } else if (err && typeof err === "object" && "message" in err && typeof err.message === "string") {
+          const message = err.message;
+          if (message.includes("Network Error") || message.includes("ECONNREFUSED") || ("code" in err && err.code === "ECONNREFUSED")) {
+            errorMessage = DIRECTORY_LOAD_NETWORK_ERROR;
+          } else if (isApiError(err)) {
+            errorMessage = getDirectoryErrorMessage(err, targetPath);
+          }
+        } else if (isApiError(err)) {
+          errorMessage = getDirectoryErrorMessage(err, targetPath);
+        }
+
+        identifyFailedTarget(targetConnectionId, targetPath, getDirectoryToastSummary(err));
         setError(errorMessage);
       } finally {
         if (directoryLoadAbortRef.current === abortController) {
@@ -951,10 +1073,20 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
         if (physicalRequestOwnsLocation(requestId, targetConnectionId, targetPath)) {
           setLoading(false);
+          scheduleRealtimeRefreshRef.current();
         }
       }
     },
-    [clearPendingRecentDirectoryVisit, loadLocalLinkTargets, physicalRequestOwnsLocation, providerRegistry, recordRecentDirectoryVisit]
+    [
+      clearPendingRecentDirectoryVisit,
+      connections,
+      identifyFailedTarget,
+      loadLocalLinkTargets,
+      physicalRequestOwnsLocation,
+      providerRegistry,
+      recordRecentDirectoryVisit,
+      setError,
+    ]
   );
 
   useEffect(() => {
@@ -1043,9 +1175,12 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         } else if (!append && ownsRequest) {
           setLoading(false);
         }
+        if (ownsRequest) {
+          scheduleRealtimeRefreshRef.current();
+        }
       }
     },
-    [archiveRequestOwnsLocation, providerRegistry]
+    [archiveRequestOwnsLocation, providerRegistry, setError]
   );
 
   useEffect(() => {
@@ -1078,25 +1213,55 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     [reloadCurrentLocationInternal]
   );
 
-  const seedDirectorySnapshot = useCallback((targetConnectionId: string, targetPath: string, items: FileEntry[]) => {
-    if (!targetConnectionId) {
+  const scheduleRealtimeRefresh = useCallback(() => {
+    if (!realtimeRefreshPendingRef.current || directoryLoadAbortRef.current !== null || realtimeRefreshTimerRef.current !== null) {
       return;
     }
 
-    const snapshot = [...items];
-    directoryCache.current.set(`${targetConnectionId}:${targetPath}`, {
-      items: snapshot,
-      timestamp: Date.now(),
-    });
-
-    if (connectionIdRef.current === targetConnectionId && currentPathRef.current === targetPath) {
-      if (archiveLocationRef.current === null) {
-        setItems(toPhysicalItems(connectionIdRef.current, currentPathRef.current, snapshot));
-        setLoading(false);
-        setError(null);
-      }
+    const elapsed = lastRealtimeRefreshRef.current === null ? REALTIME_REFRESH_INTERVAL_MS : Date.now() - lastRealtimeRefreshRef.current;
+    const delay = Math.max(0, REALTIME_REFRESH_INTERVAL_MS - elapsed);
+    if (delay > 0) {
+      realtimeRefreshTimerRef.current = setTimeout(() => {
+        realtimeRefreshTimerRef.current = null;
+        scheduleRealtimeRefreshRef.current();
+      }, delay);
+      return;
     }
-  }, []);
+
+    realtimeRefreshPendingRef.current = false;
+    lastRealtimeRefreshRef.current = Date.now();
+    void reloadCurrentLocationInternal({ forceRefresh: true, preserveVisibleContent: true }, false).catch((error: unknown) => {
+      logger.error("Automatic directory refresh failed", { error }, "browser");
+    });
+  }, [reloadCurrentLocationInternal]);
+
+  useEffect(() => {
+    scheduleRealtimeRefreshRef.current = scheduleRealtimeRefresh;
+  }, [scheduleRealtimeRefresh]);
+
+  const seedDirectorySnapshot = useCallback(
+    (targetConnectionId: string, targetPath: string, items: FileEntry[]) => {
+      if (!targetConnectionId) {
+        return;
+      }
+
+      const snapshot = [...items];
+      directoryCache.current.set(`${targetConnectionId}:${targetPath}`, {
+        items: snapshot,
+        timestamp: Date.now(),
+      });
+
+      if (connectionIdRef.current === targetConnectionId && currentPathRef.current === targetPath) {
+        if (archiveLocationRef.current === null) {
+          hasPhysicalListingRef.current = true;
+          setItems(toPhysicalItems(connectionIdRef.current, currentPathRef.current, snapshot));
+          setLoading(false);
+          setError(null);
+        }
+      }
+    },
+    [setError]
+  );
 
   // Load files when connection or path changes
   useEffect(() => {
@@ -1118,8 +1283,14 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
   useEffect(() => {
     return () => {
+      realtimeRefreshPendingRef.current = false;
+      if (realtimeRefreshTimerRef.current !== null) {
+        clearTimeout(realtimeRefreshTimerRef.current);
+        realtimeRefreshTimerRef.current = null;
+      }
       directoryLoadAbortRef.current?.abort();
       directoryLoadAbortRef.current = null;
+      navigationAbortRef.current?.abort();
       linkTargetLoadAbortRef.current?.abort();
       linkTargetLoadAbortRef.current = null;
     };
@@ -1470,30 +1641,32 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   const handleConnectionChange = useCallback(
     (newConnectionId: string) => {
       if (newConnectionId === connectionId) return;
-      clearIncrementalSearch();
-      const currentArchive = archiveLocationRef.current;
-      if (currentArchive !== null) {
-        latestVirtualActivationIdRef.current += 1;
-        setArchiveLocation(null);
-        archiveNavigationHistory.current.clear();
-        pendingArchiveRestoreRef.current = null;
-        setBrowserViewerPickerState((previous) => (previous?.virtualSource ? null : previous));
-      }
-      pendingLocationRef.current = {
-        connectionId: newConnectionId,
-        path: "",
-      };
-      latestLocalActivationRequestIdRef.current += 1;
-      transitionListingLocation(newConnectionId, "", null);
-      prepareDirectoryTransition(newConnectionId, "");
-      setConnectionId(newConnectionId);
-      setCurrentPath("");
-      setViewInfo(null);
-      setSelectedFiles(new Set());
-      directoryCache.current.clear();
-      navigationHistory.current.clear();
-      writeSelectedConnectionIdPreference(newConnectionId);
-      onNavigateConnection?.(newConnectionId);
+      requestPhysicalNavigationRef.current(newConnectionId, "", () => {
+        clearIncrementalSearch();
+        const currentArchive = archiveLocationRef.current;
+        if (currentArchive !== null) {
+          latestVirtualActivationIdRef.current += 1;
+          setArchiveLocation(null);
+          archiveNavigationHistory.current.clear();
+          pendingArchiveRestoreRef.current = null;
+          setBrowserViewerPickerState((previous) => (previous?.virtualSource ? null : previous));
+        }
+        pendingLocationRef.current = {
+          connectionId: newConnectionId,
+          path: "",
+        };
+        latestLocalActivationRequestIdRef.current += 1;
+        transitionListingLocation(newConnectionId, "", null);
+        prepareDirectoryTransition(newConnectionId, "");
+        setConnectionId(newConnectionId);
+        setCurrentPath("");
+        setViewInfo(null);
+        selectionAnchorRef.current = null;
+        setSelectedFiles(new Set());
+        navigationHistory.current.clear();
+        writeSelectedConnectionIdPreference(newConnectionId);
+        onNavigateConnection?.(newConnectionId);
+      });
     },
     [clearIncrementalSearch, connectionId, onNavigateConnection, prepareDirectoryTransition, transitionListingLocation]
   );
@@ -1702,11 +1875,11 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       if (useImageGallery) {
         const imageIndex = galleryImages.indexOf(filePath);
-        const effectiveIndex = imageIndex >= 0 ? imageIndex : 0;
+        const effectiveIndex = Math.max(imageIndex, 0);
         currentViewIndexRef.current = effectiveIndex;
         currentViewImagesRef.current = galleryImages;
         lastDisplayedImagePathRef.current = null;
-        setViewInfo({
+        (onOpenViewer ?? setViewInfo)({
           connectionId: targetConnectionId,
           path: filePath,
           fileSize: file.size,
@@ -1726,7 +1899,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       if (!virtualSource) {
         recordRecentFileAttempt(targetConnectionId, filePath);
       }
-      setViewInfo({
+      (onOpenViewer ?? setViewInfo)({
         connectionId: targetConnectionId,
         path: filePath,
         fileSize: file.size,
@@ -1737,7 +1910,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         sessionId: viewerSessionId,
       });
     },
-    [imageFiles, recordRecentFileAttempt, sortedItems]
+    [imageFiles, onOpenViewer, recordRecentFileAttempt, sortedItems]
   );
 
   const openNativeFile = useCallback(
@@ -1759,6 +1932,9 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
               : null;
       if (!targetItem || !getNativeOpenAvailability(targetItem, contentOperationEnvironment).available) return;
 
+      const requestId = ++latestLocalActivationRequestIdRef.current;
+      failedNavigationRetryRef.current = undefined;
+      setError(null);
       setOpenInAppLoading(true);
       try {
         const themeJson = JSON.stringify({
@@ -1778,6 +1954,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
           },
           contentOperationEnvironment
         );
+        if (requestId !== latestLocalActivationRequestIdRef.current) return;
         if (resolvedDirectory) {
           target?.onResolvedDirectory?.(resolvedDirectory);
           return;
@@ -1788,18 +1965,28 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         }
         logger.info("Opened file in native app", { file: file.name, forcePicker: options?.forcePicker ?? false }, "companion");
       } catch (err: unknown) {
-        let detail = "Failed to open file.";
-        const errorDetail = isApiError(err) ? err.response?.data?.detail : undefined;
-        if (typeof errorDetail === "string") {
-          detail = errorDetail;
+        if (requestId !== latestLocalActivationRequestIdRef.current) return;
+        const failure = classifyFileFailure(err, targetItem.path);
+        if (failure.kind === "cancelled") return;
+        if (failure.kind === "missing" && targetItem.kind === "physical") {
+          publishMissingPhysicalFile({ connectionId: targetItem.location.connectionId, path: targetItem.path });
         }
-        setError(detail);
+        failedNavigationRetryRef.current = () => {
+          void openNativeFile(file, options, {
+            item: targetItem,
+            recentRecordId: target?.recentRecordId,
+            onResolvedDirectory: target?.onResolvedDirectory,
+          });
+        };
+        if (targetItem.kind === "physical")
+          identifyFailedTarget(targetItem.location.connectionId, targetItem.path, getFileToastSummary(failure.kind));
+        setError(failure.message);
         logger.error(`Open in app failed: ${file.name}`, { error: err }, "companion");
       } finally {
-        setOpenInAppLoading(false);
+        if (requestId === latestLocalActivationRequestIdRef.current) setOpenInAppLoading(false);
       }
     },
-    [contentOperationEnvironment, currentTheme, onCompanionHint]
+    [contentOperationEnvironment, currentTheme, identifyFailedTarget, onCompanionHint, setError]
   );
 
   const openBrowserViewerPicker = useCallback(
@@ -1932,6 +2119,13 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         return;
       }
       if (targetFile.type === FileType.DIRECTORY) {
+        if (recentRecordId && !isShortcutFile(sourceFile)) {
+          await removeRecentFileRecord(recentRecordId);
+          if (isActivationCurrent && !isActivationCurrent()) return;
+          identifyFailedTarget(targetConnectionId, targetPath);
+          setError(classifyFileFailure({ response: { data: { code: "recent_file_target_not_file" } } }, targetPath).message);
+          return;
+        }
         navigateToResolvedDirectory(sourceFile, targetConnectionId, targetPath);
         return;
       }
@@ -1956,7 +2150,15 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       openFileWithAssociatedViewer(targetFile, targetPath, mimeType, targetConnectionId, isActivationCurrent);
     },
-    [navigateToResolvedDirectory, openBrowserViewerPicker, openFileWithAssociatedViewer, openNativeFile]
+    [
+      identifyFailedTarget,
+      navigateToResolvedDirectory,
+      openBrowserViewerPicker,
+      openFileWithAssociatedViewer,
+      openNativeFile,
+      removeRecentFileRecord,
+      setError,
+    ]
   );
 
   const resolveAndActivateLocalEntry = useCallback(
@@ -1992,15 +2194,15 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
           return;
         }
 
-        const detail =
-          isApiError(error) && typeof error.response?.data?.detail === "string"
-            ? error.response.data.detail
-            : "Failed to resolve local link.";
-        setError(detail);
+        const failure = classifyFileFailure(error, sourcePath);
+        if (failure.kind === "cancelled") return;
+        if (failure.kind === "missing") publishMissingPhysicalFile({ connectionId: sourceConnectionId, path: sourcePath });
+        identifyFailedTarget(sourceConnectionId, sourcePath, getFileToastSummary(failure.kind));
+        setError(failure.message);
         logger.error("Failed to resolve local activation target", { sourceConnectionId, sourcePath, error }, "browser");
       }
     },
-    [activateResolvedLocalTarget, storageRegistry]
+    [activateResolvedLocalTarget, identifyFailedTarget, storageRegistry, setError]
   );
 
   const openArchive = useCallback(
@@ -2021,7 +2223,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       updateFocus(0, { immediate: true });
       onNavigateVirtualLocation?.({ providerId, sourcePath: archivePath, virtualPath: "" });
     },
-    [onNavigateVirtualLocation, providerRegistry, transitionListingLocation, updateFocus]
+    [onNavigateVirtualLocation, providerRegistry, transitionListingLocation, updateFocus, setError]
   );
 
   const navigateArchiveToPath = useCallback(
@@ -2064,20 +2266,19 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       return;
     }
 
+    const targetConnectionId = connectionIdRef.current;
+    const targetPath = currentPathRef.current;
     latestVirtualActivationIdRef.current += 1;
-    const archiveName = currentArchive.archivePath.split("/").at(-1);
-    pendingDirectoryEntryIntentRef.current = archiveName ? { kind: "parent-return", childName: archiveName } : { kind: "fresh" };
-    transitionListingLocation(connectionIdRef.current, currentPathRef.current, null);
-    setArchiveLocation(null);
-    archiveNavigationHistory.current.clear();
-    pendingArchiveRestoreRef.current = null;
-    setSelectedFiles(new Set());
-    pendingLocationReloadRef.current = {
-      connectionId: connectionIdRef.current,
-      path: currentPathRef.current,
-      options: { forceRefresh: true },
-    };
-    onNavigateVirtualLocation?.(null);
+    requestPhysicalNavigationRef.current(targetConnectionId, targetPath, () => {
+      const archiveName = currentArchive.archivePath.split("/").at(-1);
+      pendingDirectoryEntryIntentRef.current = archiveName ? { kind: "parent-return", childName: archiveName } : { kind: "fresh" };
+      transitionListingLocation(targetConnectionId, targetPath, null);
+      setArchiveLocation(null);
+      archiveNavigationHistory.current.clear();
+      pendingArchiveRestoreRef.current = null;
+      setSelectedFiles(new Set());
+      onNavigateVirtualLocation?.(null);
+    });
   }, [onNavigateVirtualLocation, transitionListingLocation]);
 
   const loadMoreArchive = useCallback(() => {
@@ -2106,7 +2307,8 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       }
 
       if (!file.is_readable) {
-        setError(ARCHIVE_MEMBER_OPEN_ERROR);
+        const messageKey = getArchiveMemberUnavailableMessageKey(file);
+        setError(messageKey ? translate(messageKey) : ARCHIVE_MEMBER_OPEN_ERROR);
         return;
       }
 
@@ -2132,7 +2334,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       openFileWithAssociatedViewer(file, file.path, mimeType, connectionIdRef.current, isActivationCurrent, item.handle, activationId);
     },
-    [getItemForEntry, openBrowserViewerPicker, openFileWithAssociatedViewer, providerRegistry]
+    [getItemForEntry, openBrowserViewerPicker, openFileWithAssociatedViewer, providerRegistry, setError]
   );
 
   const handleFileClick = useCallback(
@@ -2286,12 +2488,14 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
             if (!isActivationCurrent()) {
               return;
             }
-            if (getApiErrorCode(error) === "local_link_target_missing") {
+            const failure = classifyFileFailure(error, path);
+            if (failure.kind === "missing" || failure.kind === "not_file") {
               await removeRecentFileRecord(recentRecordId);
-              setError(RECENT_FILE_MISSING_ERROR);
-            } else {
-              setError(RECENT_FILE_DEFAULT_ERROR);
             }
+            if (failure.kind === "missing") publishMissingPhysicalFile({ connectionId: targetConnectionId, path });
+            if (!isActivationCurrent()) return;
+            identifyFailedTarget(targetConnectionId, path, getFileToastSummary(failure.kind));
+            setError(failure.message);
             logger.warn("Recent local file could not be validated before opening", { targetConnectionId, path, error }, "browser");
             return;
           }
@@ -2309,7 +2513,10 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
             if (validationError && STALE_RECENT_FILE_CODES.has(validationError.code)) {
               publishRecentFilesChanged();
             }
-            setError(validationError?.message ?? RECENT_FILE_DEFAULT_ERROR);
+            const failure = classifyFileFailure(error, path);
+            if (failure.kind === "missing") publishMissingPhysicalFile({ connectionId: targetConnectionId, path });
+            identifyFailedTarget(targetConnectionId, path, getFileToastSummary(failure.kind));
+            setError(failure.message);
             logger.warn("Recent file could not be validated before opening", { targetConnectionId, path, error }, "browser");
             return;
           }
@@ -2340,12 +2547,14 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     },
     [
       activateResolvedLocalTarget,
+      identifyFailedTarget,
       openBrowserViewerPicker,
       openFileWithAssociatedViewer,
       openNativeFile,
       removeRecentFileRecord,
       storageRegistry,
       history,
+      setError,
     ]
   );
 
@@ -2407,6 +2616,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   const handleClose = useCallback(() => {
     setViewInfo(null);
     setBrowserViewerPickerState(null);
+    selectionAnchorRef.current = null;
     setSelectedFiles(new Set());
   }, []);
 
@@ -2435,6 +2645,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       const currentFile = files[focusedIndex];
       if (!currentFile) return;
 
+      selectionAnchorRef.current = currentFile.path;
       setSelectedFiles((prev) => {
         const next = new Set(prev);
         if (next.has(currentFile.path)) {
@@ -2442,6 +2653,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         } else {
           next.add(currentFile.path);
         }
+        if (next.size === 0) selectionAnchorRef.current = null;
         return next;
       });
     },
@@ -2464,6 +2676,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       const currentFile = files[focusedIndex];
       if (!currentFile) return;
 
+      selectionAnchorRef.current = currentFile.path;
       // Select the current file
       setSelectedFiles((prev) => {
         const next = new Set(prev);
@@ -2495,6 +2708,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       const currentFile = files[focusedIndex];
       if (!currentFile) return;
 
+      selectionAnchorRef.current = currentFile.path;
       // Select the current file
       setSelectedFiles((prev) => {
         const next = new Set(prev);
@@ -2510,14 +2724,36 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     [focusedIndex, updateFocus, listContainerEl]
   );
 
+  const handleSelectToBoundary = useCallback(
+    (boundary: "first" | "last") => {
+      if (!listContainerEl) return;
+      const activeElement = document.activeElement;
+      if (activeElement !== listContainerEl && !listContainerEl.contains(activeElement)) return;
+
+      const displayed = filesRef.current;
+      const startIndex = pendingFocusedIndexRef.current ?? focusedIndex;
+      const currentFile = displayed[startIndex];
+      if (!currentFile) return;
+
+      const targetIndex = boundary === "first" ? 0 : displayed.length - 1;
+      const range = displayed.slice(Math.min(startIndex, targetIndex), Math.max(startIndex, targetIndex) + 1);
+      selectionAnchorRef.current = currentFile.path;
+      setSelectedFiles((previous) => new Set([...previous, ...range.map((file) => file.path)]));
+      updateFocus(targetIndex);
+    },
+    [focusedIndex, updateFocus, listContainerEl]
+  );
+
   /** Select all files in the current directory (Ctrl+A). */
   const handleSelectAll = useCallback(() => {
     const allPaths = new Set(filesRef.current.map((file) => file.path));
+    selectionAnchorRef.current = filesRef.current[focusedIndex]?.path ?? null;
     setSelectedFiles(allPaths);
-  }, []);
+  }, [focusedIndex]);
 
   /** Clear all selections. */
   const handleClearSelection = useCallback(() => {
+    selectionAnchorRef.current = null;
     setSelectedFiles(new Set());
   }, []);
 
@@ -2526,6 +2762,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     const removedPaths = new Set(paths);
     setSelectedFiles((previous) => {
       const next = new Set([...previous].filter((path) => !removedPaths.has(path)));
+      if (next.size === 0) selectionAnchorRef.current = null;
       return next.size === previous.size ? previous : next;
     });
   }, []);
@@ -2534,6 +2771,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     (file: FileEntry, index: number) => {
       skipNextLayoutScrollRef.current = true;
       updateFocus(index, { immediate: true });
+      selectionAnchorRef.current = file.path;
       setSelectedFiles((previous) => new Set(previous).add(file.path));
     },
     [updateFocus]
@@ -2543,6 +2781,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     (file: FileEntry, index: number) => {
       skipNextLayoutScrollRef.current = true;
       updateFocus(index, { immediate: true });
+      selectionAnchorRef.current = file.path;
       setSelectedFiles((previous) => {
         const next = new Set(previous);
         if (next.has(file.path)) {
@@ -2550,8 +2789,35 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         } else {
           next.add(file.path);
         }
+        if (next.size === 0) selectionAnchorRef.current = null;
         return next;
       });
+    },
+    [updateFocus]
+  );
+
+  const selectItemFromIcon = useCallback(
+    (file: FileEntry, index: number, extend: boolean, _additive: boolean) => {
+      skipNextLayoutScrollRef.current = true;
+      updateFocus(index, { immediate: true });
+      const displayed = filesRef.current;
+      const anchorIndex = displayed.findIndex((entry) => entry.path === selectionAnchorRef.current);
+      if (extend && anchorIndex !== -1) {
+        const range = displayed.slice(Math.min(anchorIndex, index), Math.max(anchorIndex, index) + 1).map((entry) => entry.path);
+        setSelectedFiles((previous) => new Set([...previous, ...range]));
+      } else if (extend) {
+        selectionAnchorRef.current = file.path;
+        setSelectedFiles((previous) => new Set(previous).add(file.path));
+      } else {
+        selectionAnchorRef.current = file.path;
+        setSelectedFiles((previous) => {
+          const next = new Set(previous);
+          if (next.has(file.path)) next.delete(file.path);
+          else next.add(file.path);
+          if (next.size === 0) selectionAnchorRef.current = null;
+          return next;
+        });
+      }
     },
     [updateFocus]
   );
@@ -2579,12 +2845,14 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   useEffect(() => {
     if (pendingSelectedFilesRestoreRef.current !== null) {
       setSelectedFiles(new Set(pendingSelectedFilesRestoreRef.current));
+      selectionAnchorRef.current = null;
       pendingSelectedFilesRestoreRef.current = null;
       return;
     }
 
+    selectionAnchorRef.current = null;
     setSelectedFiles(new Set());
-  }, [currentPath, connectionId]);
+  }, [currentPath, connectionId, archiveLocation?.archivePath, archiveLocation?.virtualPath]);
 
   useEffect(() => {
     if (loading) return;
@@ -2592,6 +2860,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     setSelectedFiles((previous) => {
       if (previous.size === 0) return previous;
       const next = new Set([...previous].filter((path) => currentPaths.has(path)));
+      if (next.size === 0) selectionAnchorRef.current = null;
       return next.size === previous.size ? previous : next;
     });
   }, [files, loading]);
@@ -2667,10 +2936,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       logger.info(`Deleted ${deleteTargets.length} item(s).`, { paths: deleteTargets.map((target) => target.handle.path) }, "file-browser");
     } catch (err: unknown) {
-      let detail = "Failed to delete item.";
-      if (isApiError(err) && err.response?.data?.detail) {
-        detail = err.response.data.detail;
-      }
+      const detail = getApiErrorMessage(err, "Failed to delete item.");
       setError(detail);
       setDeleteTargets((currentTargets) => currentTargets.slice(deletedCount));
       logger.error("Delete failed.", { error: err, paths: deleteTargets.map((target) => target.handle.path) }, "file-browser");
@@ -2685,6 +2951,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     connectionId,
     listContainerEl,
     reloadCurrentLocation,
+    setError,
   ]);
 
   const closeDeleteDialog = useCallback(() => {
@@ -2739,10 +3006,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
         logger.info(`Renamed: ${renameTarget.handle.path} -> ${newName}`, undefined, "file-browser");
       } catch (err: unknown) {
-        let detail = "Failed to rename item.";
-        if (isApiError(err) && err.response?.data?.detail) {
-          detail = err.response.data.detail;
-        }
+        const detail = getApiErrorMessage(err, "Failed to rename item.");
         setRenameError(detail);
         logger.error(`Rename failed: ${renameTarget.handle.path}`, { error: err }, "file-browser");
       } finally {
@@ -2819,10 +3083,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
         logger.info(`Created ${createItemType}: ${name}`, undefined, "file-browser");
       } catch (err: unknown) {
-        let detail = "Failed to create item.";
-        if (isApiError(err) && err.response?.data?.detail) {
-          detail = err.response.data.detail;
-        }
+        const detail = getApiErrorMessage(err, "Failed to create item.");
         setCreateError(detail);
         logger.error(`Create failed: ${name}`, { error: err }, "file-browser");
       } finally {
@@ -2907,7 +3168,8 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
             (entry) => (currentPathRef.current ? `${currentPathRef.current}/${entry.name}` : entry.name) === pickerState.filePath
           );
       if (pickerState.virtualSource && !activeDirectoryFile?.is_readable) {
-        setError(ARCHIVE_MEMBER_OPEN_ERROR);
+        const messageKey = activeDirectoryFile ? getArchiveMemberUnavailableMessageKey(activeDirectoryFile) : null;
+        setError(messageKey ? translate(messageKey) : ARCHIVE_MEMBER_OPEN_ERROR);
         return;
       }
 
@@ -2950,7 +3212,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       setBrowserViewerPickerState(null);
       openFileInViewer(file, pickerState.filePath, pickerState.mimeType, selection.viewerId, targetConnectionId, pickerState.virtualSource);
     },
-    [browserViewerPickerState, openFileInViewer, openNativeFile]
+    [browserViewerPickerState, openFileInViewer, openNativeFile, setError]
   );
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -2958,33 +3220,36 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
   // ──────────────────────────────────────────────────────────────────────────
 
   const handleDirectoryChanged = useCallback(
-    (change: DirectoryChange) => {
+    (change: DirectoryChange, options?: { invalidateOnly?: boolean; confirmedAbsence?: boolean }) => {
       const { connectionId: changedConnectionId, path: changedPath } = change;
       // Invalidate cache for the changed directory
       const cacheKey = `${changedConnectionId}:${changedPath}`;
       directoryCache.current.delete(cacheKey);
 
+      if (options?.invalidateOnly) return;
+
       if (changedConnectionId !== connectionIdRef.current || changedPath !== currentPathRef.current) {
         return;
       }
 
-      if (Date.now() - lastForceReloadRef.current < RELOAD_DEDUP_WINDOW_MS) {
+      if (!options?.confirmedAbsence && Date.now() - lastForceReloadRef.current < RELOAD_DEDUP_WINDOW_MS) {
         logger.info("Skipping redundant WebSocket reload (recent forced reload)", undefined, "websocket");
         return;
       }
 
-      const currentArchive = archiveLocationRef.current;
-      if (currentArchive) {
-        void reloadCurrentLocationInternal({ forceRefresh: true }, false);
-        return;
-      }
-
-      // Reload if this pane is currently viewing the affected directory
-      if (archiveLocationRef.current === null) {
-        void reloadCurrentLocationInternal({ forceRefresh: true }, false);
-      }
+      realtimeRefreshPendingRef.current = true;
+      scheduleRealtimeRefresh();
     },
-    [reloadCurrentLocationInternal]
+    [scheduleRealtimeRefresh]
+  );
+
+  useEffect(
+    () =>
+      subscribeMissingPhysicalFiles(({ connectionId, path }) => {
+        const parent = path.split("/").slice(0, -1).join("/");
+        handleDirectoryChanged({ connectionId, path: parent }, { confirmedAbsence: true });
+      }),
+    [handleDirectoryChanged]
   );
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -3116,15 +3381,16 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       setArchiveLocation(restoredArchiveLocation);
       setArchiveHasMore(false);
       setArchiveLoadingMore(false);
+      hasPhysicalListingRef.current = restoredArchiveLocation === null;
       setItems(restoredBrowserItems);
       setLoading(false);
       setError(null);
     },
-    [clearIncrementalSearch, setViewMode, transitionListingLocation]
+    [clearIncrementalSearch, setViewMode, transitionListingLocation, setError]
   );
 
   const applyResolvedLocation = useCallback(
-    (nextConnectionId: string, normalizedPath: string, nextArchiveLocation: ArchiveLocation | null) => {
+    (nextConnectionId: string, normalizedPath: string, nextArchiveLocation: ArchiveLocation | null, preserveViewer = false) => {
       const physicalLocationChanged = connectionIdRef.current !== nextConnectionId || currentPathRef.current !== normalizedPath;
       const currentArchiveLocation = archiveLocationRef.current;
       const archiveLocationChanged =
@@ -3148,7 +3414,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
       if (archiveLocationChanged) {
         latestVirtualActivationIdRef.current += 1;
-        setViewInfo(null);
+        if (!preserveViewer) setViewInfo(null);
         setSelectedFiles(new Set());
         updateFocus(0, { immediate: true });
         if (archiveSourceChanged) {
@@ -3171,6 +3437,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       }
 
       if (connectionChanged) {
+        if (!nextConnectionId) setMonitoredLocation(null);
         clearIncrementalSearch();
         const nextCacheKey = `${nextConnectionId}:${normalizedPath}`;
         const seededSnapshot = directoryCache.current.get(nextCacheKey);
@@ -3181,7 +3448,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         }
         setConnectionId(nextConnectionId);
         setCurrentPath(normalizedPath);
-        setViewInfo(null);
+        if (!preserveViewer) setViewInfo(null);
         setSelectedFiles(new Set());
         directoryCache.current.clear();
         if (seededSnapshot) {
@@ -3202,12 +3469,147 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
           prepareDirectoryTransition(nextConnectionId, normalizedPath);
         }
         setCurrentPath(normalizedPath);
-        setViewInfo(null);
+        if (!preserveViewer) setViewInfo(null);
         setSelectedFiles(new Set());
       }
     },
     [clearIncrementalSearch, prepareDirectoryTransition, transitionListingLocation, updateFocus]
   );
+
+  requestPhysicalNavigationRef.current = (targetConnectionId, targetPath, commit) => {
+    failedNavigationRetryRef.current = undefined;
+    setCompanionPairingError(null);
+    setErrorSeverity("error");
+    latestLocalActivationRequestIdRef.current += 1;
+    navigationAbortRef.current?.abort();
+    const controller = new AbortController();
+    navigationAbortRef.current = controller;
+    directoryLoadAbortRef.current?.abort();
+    latestLoadRequestIdRef.current += 1;
+    setLoading(!hasPhysicalListingRef.current && archiveLocationRef.current === null);
+    setError(null);
+    const location = physicalLocation(targetConnectionId, targetPath);
+    void providerRegistry
+      .get(location)
+      .list(location, { signal: controller.signal })
+      .then(
+        (listing) => {
+          if (controller.signal.aborted) return;
+          directoryCache.current.set(`${targetConnectionId}:${targetPath}`, {
+            items: listing.items.map((item) => item.entry),
+            timestamp: Date.now(),
+          });
+          commit();
+          if (
+            connectionIdRef.current !== targetConnectionId ||
+            currentPathRef.current !== targetPath ||
+            archiveLocationRef.current !== null
+          ) {
+            setLoading(false);
+            return;
+          }
+          pendingRecentDirectoryRecordRef.current = null;
+          hasPhysicalListingRef.current = true;
+          setMonitoredLocation({ connectionId: targetConnectionId, path: targetPath });
+          setItems(listing.items);
+          setLoading(false);
+        },
+        (failure: unknown) => {
+          if (controller.signal.aborted || isLocalAbortError(failure)) return;
+          clearPendingRecentDirectoryVisit(targetConnectionId, targetPath);
+          directoryCache.current.delete(`${targetConnectionId}:${targetPath}`);
+          const record = pendingRecentDirectoryRecordRef.current;
+          pendingRecentDirectoryRecordRef.current = null;
+          if (isMissingDirectory(failure) && record?.connectionId === targetConnectionId && record.path === targetPath) {
+            void Promise.resolve()
+              .then(() => (history ?? browserHistoryService).removeRecentDirectory(record.id))
+              .then(publishRecentDirectoriesChanged)
+              .catch((error: unknown) => {
+                logger.warn("Failed to remove a missing recent directory", { error, recordId: record.id }, "browser");
+              });
+          }
+          const pairingKind = getLocalDrivePairingErrorKind(targetConnectionId, failure);
+          const message = pairingKind
+            ? translate(
+                pairingKind === "signature"
+                  ? "fileBrowser.chrome.alerts.localDrivePairingRejected"
+                  : "fileBrowser.chrome.alerts.localDrivePairingRequired",
+                { connection: getConnectionById(connections, targetConnectionId)?.name ?? targetConnectionId }
+              )
+            : getDirectoryErrorMessage(failure, targetPath);
+          if (pairingKind) setCompanionPairingError({ kind: pairingKind, message });
+          identifyFailedTarget(targetConnectionId, targetPath, getDirectoryToastSummary(failure));
+          setError(message);
+          setErrorSeverity(isMissingDirectory(failure) ? "warning" : "error");
+          failedNavigationRetryRef.current = () => requestPhysicalNavigationRef.current(targetConnectionId, targetPath, commit);
+          setLoading(false);
+          if (
+            isMissingDirectory(failure) &&
+            connectionIdRef.current === targetConnectionId &&
+            currentPathRef.current === targetPath &&
+            archiveLocationRef.current === null
+          ) {
+            hasPhysicalListingRef.current = false;
+            setMonitoredLocation(null);
+            setItems([]);
+            setSelectedFiles(new Set());
+            void recoverMissingDirectoryRef.current(targetConnectionId, targetPath);
+            return;
+          }
+          onResolveRouteLocationRef.current?.(currentPathRef.current, archiveLocationRef.current);
+        }
+      );
+  };
+
+  recoverMissingDirectoryRef.current = async (targetConnectionId, missingPath) => {
+    navigationAbortRef.current?.abort();
+    const controller = new AbortController();
+    navigationAbortRef.current = controller;
+    let parent = missingPath;
+    while (parent && !controller.signal.aborted) {
+      parent = parent.includes("/") ? parent.slice(0, parent.lastIndexOf("/")) : "";
+      const location = physicalLocation(targetConnectionId, parent);
+      try {
+        const listing = await providerRegistry.get(location).list(location, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        directoryCache.current.set(`${targetConnectionId}:${parent}`, {
+          items: listing.items.map((item) => item.entry),
+          timestamp: Date.now(),
+        });
+        pendingLocationRef.current = null;
+        applyResolvedLocation(targetConnectionId, parent, null, true);
+        hasPhysicalListingRef.current = true;
+        setMonitoredLocation({ connectionId: targetConnectionId, path: parent });
+        setDirectoryMonitorError(null);
+        setNotification({
+          id: "browser-recovery",
+          duration: NOTICE_DURATION_MS.information,
+          message: translate("fileBrowser.chrome.alerts.folderRecoveredSummary", {
+            parent: parent || "/",
+          }),
+          targetLabel: formatNoticeTarget(getConnectionById(connections, targetConnectionId)?.name, missingPath),
+          severity: "warning",
+          occurrence: errorOccurrence,
+        });
+        setItems(listing.items);
+        setLoading(false);
+        onResolveRouteLocationRef.current?.(parent, null);
+        return;
+      } catch (failure: unknown) {
+        if (controller.signal.aborted || isLocalAbortError(failure)) return;
+        const code = getApiErrorCode(failure);
+        identifyFailedTarget(targetConnectionId, parent, getDirectoryToastSummary(failure));
+        setError(getDirectoryErrorMessage(failure, parent));
+        if (!isMissingDirectory(failure) && code !== "directory_access_denied" && code !== "not_a_directory") break;
+      }
+    }
+    if (!controller.signal.aborted) {
+      failedNavigationRetryRef.current = () => {
+        void reloadCurrentLocation({ forceRefresh: true });
+      };
+      setLoading(false);
+    }
+  };
 
   const resolveArchiveRouteLocation = useCallback(
     async (
@@ -3262,8 +3664,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
       const segments = targetPath.split("/").filter(Boolean);
       let physicalPath = "";
 
-      for (let index = 0; index < segments.length; index += 1) {
-        const segment = segments[index];
+      for (const [index, segment] of segments.entries()) {
         const candidatePath = joinRoutePath(physicalPath, segment);
         const providerId = providerRegistry.getVirtualProviderIdForFilename(candidatePath);
         if (!providerId) {
@@ -3326,6 +3727,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         lastAppliedRouteSyncTokenRef.current = routeSyncToken;
       }
 
+      navigationAbortRef.current?.abort();
       const resolutionId = routeLocationResolutionIdRef.current + 1;
       routeLocationResolutionIdRef.current = resolutionId;
 
@@ -3335,6 +3737,16 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
         .filter(Boolean)
         .some((_, index, segments) => providerRegistry.getVirtualProviderIdForFilename(segments.slice(0, index + 1).join("/")) !== null);
       if (!hasArchiveCandidate) {
+        if (
+          nextConnectionId &&
+          hasPhysicalListingRef.current &&
+          (connectionIdRef.current !== nextConnectionId || currentPathRef.current !== normalizedPath)
+        ) {
+          requestPhysicalNavigationRef.current(nextConnectionId, normalizedPath, () => {
+            applyResolvedLocation(nextConnectionId, normalizedPath, null);
+          });
+          return;
+        }
         applyResolvedLocation(nextConnectionId, normalizedPath, null);
         return;
       }
@@ -3361,7 +3773,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
           setError(DIRECTORY_LOAD_GENERIC_ERROR);
         });
     },
-    [applyResolvedLocation, providerRegistry, resolveRouteLocation]
+    [applyResolvedLocation, providerRegistry, resolveRouteLocation, setError]
   );
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -3383,7 +3795,7 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
         // Quick-bar inputs own their keyboard interaction. File-list handlers
         // must not react while focus remains inside the quick bar.
-        if (input.dataset.quickBarInput === "true") {
+        if (input.dataset["quickBarInput"] === "true") {
           return;
         }
 
@@ -3464,7 +3876,16 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     files,
     loading,
     error,
+    errorOccurrence,
+    notification,
+    dismissNotification: () => {
+      setNotification(null);
+      if (hasPhysicalListingRef.current) setError(null);
+    },
+    monitoredLocation,
+    directoryUnavailable: !hasPhysicalListingRef.current && archiveLocation === null,
     setError,
+    companionPairingError: error !== null && error === companionPairingError?.message ? companionPairingError.kind : null,
 
     // UI preferences
     sortBy,
@@ -3480,11 +3901,13 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
     handleToggleSelection,
     handleSelectDown,
     handleSelectUp,
+    handleSelectToBoundary,
     handleSelectAll,
     handleClearSelection,
     removeSelectedPaths,
     selectItem,
     toggleItemSelection,
+    selectItemFromIcon,
     getItemsByPaths,
     getEffectiveSelection,
 
@@ -3575,6 +3998,41 @@ export function useFileBrowserPane(config: UseFileBrowserPaneConfig): UseFileBro
 
     // WebSocket
     handleDirectoryChanged,
+    directoryMonitorError,
+    directoryMonitorErrorSummary: directoryMonitorError ? directoryMonitorErrorSummary.current : undefined,
+    directoryMonitorErrorOccurrence,
+    handleDirectorySubscribed: (change) => {
+      if (change.connectionId !== connectionIdRef.current || change.path !== currentPathRef.current || archiveLocationRef.current) return;
+      setDirectoryMonitorError(null);
+    },
+    handleDirectorySubscriptionError: (change, code) => {
+      if (change.connectionId !== connectionIdRef.current || change.path !== currentPathRef.current || archiveLocationRef.current) return;
+      failedNavigationRetryRef.current = () => {
+        void reloadCurrentLocation({ forceRefresh: true });
+      };
+      const failure = { response: { data: { code } } };
+      const pairingKind =
+        classifyFileFailure(failure, change.path).kind === "pairing" ? getLocalDrivePairingErrorKind(change.connectionId, failure) : null;
+      if (pairingKind) {
+        const message = translate(
+          pairingKind === "signature"
+            ? "fileBrowser.chrome.alerts.localDrivePairingRejected"
+            : "fileBrowser.chrome.alerts.localDrivePairingRequired",
+          { connection: getConnectionById(connections, change.connectionId)?.name ?? change.connectionId }
+        );
+        setCompanionPairingError({ kind: pairingKind, message });
+        identifyFailedTarget(change.connectionId, change.path);
+        setError(message);
+        setDirectoryMonitorError(null);
+      } else {
+        directoryMonitorErrorSummary.current = getDirectoryToastSummary(failure);
+        setDirectoryMonitorError(
+          code === "directory_timeout"
+            ? translate("fileBrowser.chrome.alerts.directoryMonitoringTimeout")
+            : getDirectoryErrorMessage(failure, change.path)
+        );
+      }
+    },
 
     // Cache
     clearCaches,

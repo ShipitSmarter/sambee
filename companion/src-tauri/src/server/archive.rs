@@ -3,15 +3,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File as FsFile, OpenOptions};
 use std::io::{BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use bzip2::read::BzDecoder;
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Timelike, Utc};
 use flate2::{write::DeflateEncoder, Compression, Decompress, FlushDecompress, Status};
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -28,9 +30,16 @@ use super::target_resolution::{resolve_target_mutation, TargetResolutionDisposit
 /// Bounded source-read size for direct local archive output.
 pub const ARCHIVE_COPY_BUFFER_SIZE: usize = 64 * 1024;
 const ARCHIVE_WRITE_BUFFER_SIZE: usize = 256 * 1024;
-pub const ARCHIVE_INLINE_PREVIEW_MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub const TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED: &str = "temporary_archive_size_limit_exceeded";
+const TEMPORARY_ARCHIVE_DIRECTORY: &str = "sambee-archive-downloads";
+const TEMPORARY_ARCHIVE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TEMPORARY_DOWNLOAD_PREFIX: &str = "sambee-download-";
+const TEMPORARY_SOURCE_PREFIX: &str = "sambee-zip-source-";
 const STORED_SAVINGS_BYTES: usize = 1024;
 const STORED_SAVINGS_RATIO: f64 = 0.05;
+const ZIP_MIN_YEAR: i32 = 1980;
+const ZIP_MAX_YEAR: i32 = 2107;
+const ZIP_DOS_EPOCH_SECONDS: u64 = 315_532_800;
 const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
 const CENTRAL_DIRECTORY_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
 const ZIP64_LOCATOR_SIGNATURE: &[u8; 4] = b"PK\x06\x07";
@@ -52,6 +61,33 @@ impl<W: Write> Write for MeasuredWriter<W> {
         let written = self.inner.write(buffer)?;
         self.metrics.operations.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes.fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub struct SizeLimitedArchiveWriter<W: Write> {
+    inner: W,
+    limit: u64,
+    written: u64,
+}
+
+impl<W: Write> SizeLimitedArchiveWriter<W> {
+    pub fn new(inner: W, limit: u64) -> Self {
+        Self { inner, limit, written: 0 }
+    }
+}
+
+impl<W: Write> Write for SizeLimitedArchiveWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if u64::try_from(buffer.len()).map_or(true, |size| size > self.limit.saturating_sub(self.written)) {
+            return Err(std::io::Error::other(TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written += written as u64;
         Ok(written)
     }
 
@@ -287,7 +323,10 @@ fn find_local_archive_member(reader: &mut LocalArchiveReader, member_path: &str)
     }
     let projection = reader.effective_projection()?;
     if let Some(entry) = projection.member_by_path.get(&normalized_path) {
-        if entry.encrypted || !matches!(entry.compression_method, 0 | 8 | 12) {
+        if entry.encrypted {
+            return Err(LocalArchiveReadError::EncryptedMember);
+        }
+        if !matches!(entry.compression_method, 0 | 8 | 12) {
             return Err(LocalArchiveReadError::UnavailableMember);
         }
         return Ok(entry.clone());
@@ -377,10 +416,7 @@ impl ArchiveMemberReadPresentation {
 
     fn present(&self, member: &LocalArchiveReadEntry) -> Result<ArchiveMemberReadProjection, LocalArchiveReadError> {
         let member_name = self.member_path.rsplit('/').next().unwrap_or("download");
-        let inline_preview_eligible = !member.is_directory
-            && !member.encrypted
-            && matches!(member.compression_method, 0 | 8 | 12)
-            && member.uncompressed_size <= ARCHIVE_INLINE_PREVIEW_MAX_BYTES;
+        let inline_preview_eligible = !member.is_directory && !member.encrypted && matches!(member.compression_method, 0 | 8 | 12);
         Ok(ArchiveMemberReadProjection {
             member_path: member.path.clone(),
             inline_preview_eligible,
@@ -784,6 +820,8 @@ pub struct LocalArchiveExtractionResult {
     pub members_processed: u64,
     pub members_completed: u64,
     pub members_skipped: u64,
+    pub encrypted_members_skipped: u64,
+    pub unsupported_compression_members_skipped: u64,
     pub members_failed: u64,
     pub files_extracted: u64,
     pub directories_created: u64,
@@ -976,7 +1014,9 @@ pub enum LocalArchiveReadError {
     InvalidMemberPath,
     #[error("archive member was not found")]
     MemberNotFound,
-    #[error("archive member uses an unavailable codec or blocked feature")]
+    #[error("archive member is encrypted. Use an archive tool with the password to open it")]
+    EncryptedMember,
+    #[error("archive member uses unsupported compression. Use another archive tool to open it")]
     UnavailableMember,
     #[error("ZIP local header is invalid or does not match the central directory")]
     InvalidLocalHeader,
@@ -1361,7 +1401,10 @@ impl LocalArchiveReader {
     /// Validate a record through a duplicate of the original pinned descriptor.
     pub fn validate_entry(&self, entry: LocalArchiveReadEntry) -> Result<ValidatedLocalArchiveEntry, LocalArchiveReadError> {
         self.ensure_source_unchanged()?;
-        if entry.encrypted || !matches!(entry.compression_method, 0 | 8 | 12) {
+        if entry.encrypted {
+            return Err(LocalArchiveReadError::EncryptedMember);
+        }
+        if !matches!(entry.compression_method, 0 | 8 | 12) {
             return Err(LocalArchiveReadError::UnavailableMember);
         }
         let mut file = self.file.try_clone()?;
@@ -1507,10 +1550,7 @@ fn local_directory_entry(entry: &LocalArchiveReadEntry) -> LocalArchiveDirectory
         crc32: (!entry.is_directory).then_some(entry.crc32),
         modified_at: entry.modified_at,
         encrypted: entry.encrypted,
-        is_available: !entry.is_directory
-            && !entry.encrypted
-            && matches!(entry.compression_method, 0 | 8 | 12)
-            && entry.uncompressed_size <= ARCHIVE_INLINE_PREVIEW_MAX_BYTES,
+        is_available: !entry.is_directory && !entry.encrypted && matches!(entry.compression_method, 0 | 8 | 12),
     }
 }
 
@@ -2058,7 +2098,14 @@ pub fn build_local_archive_manifest_with_cancellation(
 
 /// Build a complete recursive manifest for a ZIP target owned by another provider.
 pub fn build_local_archive_manifest_for_remote_target(source_paths: &[PathBuf]) -> Result<Vec<LocalArchiveEntry>, LocalArchiveError> {
-    build_local_archive_manifest_inner(source_paths, None, &|| false)
+    build_local_archive_manifest_for_remote_target_with_cancellation(source_paths, || false)
+}
+
+pub fn build_local_archive_manifest_for_remote_target_with_cancellation(
+    source_paths: &[PathBuf],
+    is_cancelled: impl Fn() -> bool,
+) -> Result<Vec<LocalArchiveEntry>, LocalArchiveError> {
+    build_local_archive_manifest_inner(source_paths, None, &is_cancelled)
 }
 
 fn build_local_archive_manifest_inner<F: Fn() -> bool>(
@@ -2249,6 +2296,213 @@ pub fn create_local_archive_with_execution_plan_progress_and_state(
     Ok((result, state))
 }
 
+pub fn create_temporary_local_archive(
+    entries: &[LocalArchiveEntry],
+    size_limit: u64,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<(tempfile::TempDir, PathBuf), LocalArchiveError> {
+    create_temporary_local_archive_with_directory(entries, size_limit, is_cancelled, || {
+        create_private_temporary_directory(TEMPORARY_DOWNLOAD_PREFIX)
+    })
+}
+
+fn create_temporary_local_archive_with_directory(
+    entries: &[LocalArchiveEntry],
+    size_limit: u64,
+    is_cancelled: impl Fn() -> bool,
+    create_directory: impl FnOnce() -> Result<tempfile::TempDir, std::io::Error>,
+) -> Result<(tempfile::TempDir, PathBuf), LocalArchiveError> {
+    let execution_plan = LocalArchiveCreationExecutionPlan::from_entries(entries)?;
+    let directory = create_directory()?;
+    let path = directory.path().join("download.zip");
+    let output = create_private_temporary_file(&path)?;
+    let output = SizeLimitedArchiveWriter::new(output, size_limit);
+    write_local_archive_stream_with_execution_plan(output, entries, execution_plan, &is_cancelled, |_| {})?;
+    if is_cancelled() {
+        return Err(LocalArchiveError::Cancelled);
+    }
+    read_local_archive_entries(&path)?;
+    Ok((directory, path))
+}
+
+fn create_private_temporary_file(path: &Path) -> Result<FsFile, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+fn create_private_temporary_directory(prefix: &str) -> Result<tempfile::TempDir, std::io::Error> {
+    let store = prepare_temporary_archive_store()?;
+    create_private_temporary_directory_in_store(&store, prefix)
+}
+
+fn create_private_temporary_directory_in_store(store: &Path, prefix: &str) -> Result<tempfile::TempDir, std::io::Error> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    builder.tempdir_in(store)
+}
+
+fn prepare_temporary_archive_store() -> Result<PathBuf, std::io::Error> {
+    let store = std::env::temp_dir().join(TEMPORARY_ARCHIVE_DIRECTORY);
+    #[cfg(unix)]
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    match builder.create(&store) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&store)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("Temporary archive store is not a private directory"));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::other("Temporary archive store permissions are not private"));
+    }
+    Ok(store)
+}
+
+fn cleanup_stale_temporary_archive_directories(store: &Path) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(store)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(TEMPORARY_DOWNLOAD_PREFIX) && !name.starts_with(TEMPORARY_SOURCE_PREFIX) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_dir()
+            && SystemTime::now().duration_since(metadata.modified()?).unwrap_or_default() > TEMPORARY_ARCHIVE_MAX_AGE
+        {
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn cleanup_stale_temporary_archive_downloads() -> Result<(), std::io::Error> {
+    cleanup_stale_temporary_archive_directories(&prepare_temporary_archive_store()?)
+}
+
+pub fn create_temporary_local_zip_selection(
+    archive_path: &Path,
+    selected_paths: &[String],
+    size_limit: u64,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<(tempfile::TempDir, PathBuf), LocalArchiveError> {
+    if is_cancelled() {
+        return Err(LocalArchiveError::Cancelled);
+    }
+    let roots = canonicalize_local_archive_member_roots(Some(selected_paths.to_vec()))?.ok_or(LocalArchiveError::UnsafeEntryPath)?;
+    if roots.len() != selected_paths.len() {
+        return Err(LocalArchiveError::UnsafeEntryPath);
+    }
+    let parent = roots[0].rsplit_once('/').map_or("", |(parent, _)| parent);
+    if roots
+        .iter()
+        .any(|root| root.rsplit_once('/').map_or("", |(parent, _)| parent) != parent)
+    {
+        return Err(LocalArchiveError::UnsafeEntryPath);
+    }
+    let mut reader = LocalArchiveReader::open_pinned(archive_path)?;
+    let projection = reader.effective_projection()?;
+    if projection.skipped_entries != 0 {
+        return Err(LocalArchiveError::UnsafeEntryPath);
+    }
+    for root in &roots {
+        if !projection.member_by_path.contains_key(root) && !projection.directories.contains(root) {
+            return Err(LocalArchiveError::UnknownExtractionMember);
+        }
+    }
+    let is_selected = |path: &str| roots.iter().any(|root| path == root || path.starts_with(&format!("{root}/")));
+    let staging = create_private_temporary_directory(TEMPORARY_SOURCE_PREFIX)?;
+    let mut entries = Vec::new();
+    let mut source_bytes = 0u64;
+    for entry in projection.entries.iter().filter(|entry| is_selected(&entry.path)) {
+        if is_cancelled() {
+            return Err(LocalArchiveError::Cancelled);
+        }
+        let relative_path = entry.path.strip_prefix(parent).unwrap_or(&entry.path).trim_start_matches('/');
+        let archive_path = normalized_archive_path(relative_path, entry.is_directory)?;
+        let source_path = if entry.is_directory {
+            staging.path().to_path_buf()
+        } else {
+            source_bytes = source_bytes
+                .checked_add(entry.uncompressed_size)
+                .filter(|size| *size <= size_limit)
+                .ok_or_else(|| LocalArchiveError::Io(std::io::Error::other(TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED)))?;
+            let path = staging.path().join(format!("{}.source", uuid::Uuid::new_v4()));
+            let mut output = create_private_temporary_file(&path)?;
+            stream_validated_local_archive_entry_with_cancellation(reader.validate_entry(entry.clone())?, &mut output, &is_cancelled)
+                .map_err(|error| match error {
+                    LocalArchiveReadError::Cancelled => LocalArchiveError::Cancelled,
+                    LocalArchiveReadError::SourceChanged => LocalArchiveError::ArchiveSourceChanged,
+                    LocalArchiveReadError::Io(io_error) => LocalArchiveError::Io(io_error),
+                    error => LocalArchiveError::ArchiveRead(error),
+                })?;
+            let modified_at = entry
+                .modified_at
+                .map(SystemTime::from)
+                .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(ZIP_DOS_EPOCH_SECONDS));
+            output.set_times(fs::FileTimes::new().set_modified(modified_at))?;
+            path
+        };
+        let metadata = fs::metadata(&source_path)?;
+        entries.push(LocalArchiveEntry {
+            source_path,
+            archive_path,
+            is_directory: entry.is_directory,
+            source_size: if entry.is_directory { 0 } else { entry.uncompressed_size },
+            source_modified_at: if entry.is_directory {
+                entry
+                    .modified_at
+                    .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
+            } else {
+                normalized_source_modified_at(&metadata)
+            },
+        });
+    }
+    for directory in projection.directories.iter().filter(|path| is_selected(path)) {
+        if entries.iter().any(|entry| {
+            entry.is_directory
+                && entry.archive_path.trim_end_matches('/') == directory.strip_prefix(parent).unwrap_or(directory).trim_start_matches('/')
+        }) {
+            continue;
+        }
+        let archive_path = normalized_archive_path(directory.strip_prefix(parent).unwrap_or(directory).trim_start_matches('/'), true)?;
+        entries.push(LocalArchiveEntry {
+            source_path: staging.path().to_path_buf(),
+            archive_path,
+            is_directory: true,
+            source_size: 0,
+            source_modified_at: projection
+                .entries
+                .iter()
+                .find(|entry| entry.path.starts_with(&format!("{directory}/")))
+                .and_then(|entry| entry.modified_at)
+                .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        });
+    }
+    entries.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
+    create_temporary_local_archive(&entries, size_limit, is_cancelled)
+}
+
 /// Write a portable ZIP while retaining the immutable manifest and committed outcomes.
 /// Write a portable ZIP from a preflight manifest and its local source adapter entries.
 #[cfg(test)]
@@ -2296,7 +2550,10 @@ pub fn write_local_archive_stream_with_execution_plan<W: Write>(
                 return Err(LocalArchiveError::Cancelled);
             }
             if entry.is_directory {
-                writer.add_directory(normalized_archive_path(&manifest_entry.archive_path, true)?, directory_options())?;
+                writer.add_directory(
+                    normalized_archive_path(&manifest_entry.archive_path, true)?,
+                    source_timestamp_options(directory_options(), manifest_entry.source_modified_at.as_deref())?,
+                )?;
                 state.record_expected(&manifest_entry.archive_path)?;
                 on_progress(state.progress()?);
                 continue;
@@ -2309,7 +2566,10 @@ pub fn write_local_archive_stream_with_execution_plan<W: Write>(
             }
             writer.start_file(
                 normalized_archive_path(&manifest_entry.archive_path, false)?,
-                regular_file_options(&buffer[..probe_size])?,
+                source_timestamp_options(
+                    regular_file_options(&buffer[..probe_size])?,
+                    manifest_entry.source_modified_at.as_deref(),
+                )?,
             )?;
             writer.write_all(&buffer[..probe_size])?;
             let mut source_bytes = probe_size as u64;
@@ -2352,6 +2612,29 @@ pub fn write_local_archive_stream_with_execution_plan<W: Write>(
 
 fn directory_options() -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+}
+
+/// Encode UTC clock fields, not host-local time, in the timezone-free DOS timestamp.
+fn source_timestamp_options(options: SimpleFileOptions, modified_at: Option<&str>) -> Result<SimpleFileOptions, LocalArchiveError> {
+    let Some(modified_at) = modified_at else {
+        return Ok(options);
+    };
+    let timestamp = DateTime::parse_from_rfc3339(modified_at)
+        .map_err(|_| LocalArchiveError::InvalidCreationOutcome)?
+        .with_timezone(&Utc);
+    if timestamp.year() < ZIP_MIN_YEAR {
+        return Ok(options);
+    }
+    let timestamp = zip::DateTime::from_date_and_time(
+        timestamp.year().min(ZIP_MAX_YEAR) as u16,
+        timestamp.month() as u8,
+        timestamp.day() as u8,
+        timestamp.hour() as u8,
+        timestamp.minute() as u8,
+        timestamp.second() as u8,
+    )
+    .map_err(|_| LocalArchiveError::InvalidCreationOutcome)?;
+    Ok(options.last_modified_time(timestamp))
 }
 
 fn regular_file_options(probe: &[u8]) -> Result<SimpleFileOptions, LocalArchiveError> {
@@ -2438,7 +2721,7 @@ pub fn create_local_archive_relay_writer(
 }
 
 impl LocalArchiveRelayWriter {
-    fn next_manifest_entry(&self, archive_path: &str, is_directory: bool) -> Result<(String, u64), LocalArchiveError> {
+    fn next_manifest_entry(&self, archive_path: &str, is_directory: bool) -> Result<ArchiveCreationManifestMember, LocalArchiveError> {
         let normalized_path = normalized_archive_path(archive_path, is_directory)?
             .trim_end_matches('/')
             .to_string();
@@ -2448,18 +2731,20 @@ impl LocalArchiveRelayWriter {
             .get(self.next_manifest_index)
             .filter(|entry| entry.archive_path == normalized_path && entry.is_directory == is_directory)
             .ok_or(LocalArchiveError::InvalidCreationOutcome)?;
-        Ok((entry.archive_path.clone(), entry.source_size))
+        Ok(entry.clone())
     }
 
     /// Add one explicit directory entry to the local ZIP.
     pub fn add_directory(mut self, archive_path: &str) -> Result<Self, LocalArchiveError> {
-        let (manifest_path, source_size) = self.next_manifest_entry(archive_path, true)?;
-        if source_size != 0 {
+        let entry = self.next_manifest_entry(archive_path, true)?;
+        if entry.source_size != 0 {
             return Err(LocalArchiveError::InvalidCreationOutcome);
         }
         (|| {
-            self.writer
-                .add_directory(normalized_archive_path(&manifest_path, true)?, directory_options())?;
+            self.writer.add_directory(
+                normalized_archive_path(&entry.archive_path, true)?,
+                source_timestamp_options(directory_options(), entry.source_modified_at.as_deref())?,
+            )?;
             self.next_manifest_index += 1;
             Ok(self)
         })()
@@ -2468,14 +2753,17 @@ impl LocalArchiveRelayWriter {
 
     /// Write one regular member from a bounded asynchronous-relay channel.
     pub fn write_file(mut self, archive_path: &str, mut chunks: Receiver<LocalArchiveRelayChunk>) -> Result<Self, LocalArchiveError> {
-        let (manifest_path, expected_size) = self.next_manifest_entry(archive_path, false)?;
+        let entry = self.next_manifest_entry(archive_path, false)?;
+        let expected_size = entry.source_size;
         (|| {
             let (probe, pending_chunk, source_completed) = receive_compression_probe(&mut chunks)?;
             if probe.len() as u64 > expected_size {
                 return Err(LocalArchiveError::InvalidCreationOutcome);
             }
-            self.writer
-                .start_file(normalized_archive_path(&manifest_path, false)?, regular_file_options(&probe)?)?;
+            self.writer.start_file(
+                normalized_archive_path(&entry.archive_path, false)?,
+                source_timestamp_options(regular_file_options(&probe)?, entry.source_modified_at.as_deref())?,
+            )?;
             self.writer.write_all(&probe)?;
             let mut written = probe.len() as u64;
             if let Some(chunk) = pending_chunk {
@@ -2571,15 +2859,208 @@ mod tests {
 
     use super::*;
 
-    fn set_test_path_modified_time(path: &std::path::Path, modified_at: SystemTime) {
-        let file = if path.is_dir() {
-            fs::File::open(path)
-        } else {
-            fs::OpenOptions::new().write(true).open(path)
+    #[test]
+    fn dos_member_timestamps_use_utc() {
+        for month in [1, 7] {
+            let date = ((2026 - 1980) << 9) | (month << 5) | 15;
+            let time = (11 << 11) | (52 << 5) | 1;
+            let expected = DateTime::parse_from_rfc3339(&format!("2026-{month:02}-15T11:52:02Z"))
+                .expect("test timestamp must be valid")
+                .with_timezone(&Utc);
+            assert_eq!(dos_datetime(date, time), Some(expected));
         }
-        .expect("test path should open for timestamp updates");
-        file.set_times(fs::FileTimes::new().set_modified(modified_at))
-            .expect("test path timestamp should be set");
+        assert_eq!(dos_datetime(0, 0), None);
+    }
+
+    #[test]
+    fn temporary_archive_writer_rejects_chunks_before_exceeding_limit() {
+        let mut output = SizeLimitedArchiveWriter::new(Vec::new(), 5);
+        output.write_all(b"hello").unwrap();
+        let error = output.write_all(b"!").unwrap_err();
+        assert_eq!(error.to_string(), TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED);
+        assert_eq!(output.inner, b"hello");
+    }
+
+    #[test]
+    fn temporary_archive_cleanup_removes_only_stale_owned_directories() {
+        let store = tempdir().unwrap();
+        let stale = store.path().join(format!("{TEMPORARY_DOWNLOAD_PREFIX}stale"));
+        let recent = store.path().join(format!("{TEMPORARY_SOURCE_PREFIX}recent"));
+        let unrelated = store.path().join("other-directory");
+        for path in [&stale, &recent, &unrelated] {
+            fs::create_dir(path).unwrap();
+        }
+        set_test_path_modified_time(&stale, SystemTime::now() - TEMPORARY_ARCHIVE_MAX_AGE - Duration::from_secs(1));
+        cleanup_stale_temporary_archive_directories(store.path()).unwrap();
+        assert!(!stale.exists());
+        assert!(recent.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn temporary_directory_creation_does_not_clean_other_downloads() {
+        let store = tempdir().unwrap();
+        let stale = store.path().join(format!("{TEMPORARY_DOWNLOAD_PREFIX}stale"));
+        fs::create_dir(&stale).unwrap();
+        set_test_path_modified_time(&stale, SystemTime::now() - TEMPORARY_ARCHIVE_MAX_AGE - Duration::from_secs(1));
+
+        for prefix in [TEMPORARY_DOWNLOAD_PREFIX, TEMPORARY_SOURCE_PREFIX] {
+            let directory = create_private_temporary_directory_in_store(store.path(), prefix).unwrap();
+            assert!(directory.path().is_dir());
+            assert!(stale.is_dir());
+        }
+
+        cleanup_stale_temporary_archive_directories(store.path()).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn temporary_archive_validates_output_and_enforces_cap() {
+        let corpus_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../archive-contract/v2/fixtures/temporary-download-scenarios-v2.json");
+        let corpus: serde_json::Value = serde_json::from_slice(&fs::read(corpus_path).unwrap()).unwrap();
+        let scenario = &corpus["physical_selection"];
+        let source = tempdir().unwrap();
+        fs::create_dir_all(source.path().join("parent/folder/empty")).unwrap();
+        fs::write(source.path().join("parent/file.txt"), scenario["file_contents"].as_str().unwrap()).unwrap();
+        let roots: Vec<PathBuf> = scenario["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|root| source.path().join(root.as_str().unwrap()))
+            .collect();
+        let entries = build_local_archive_manifest_for_remote_target(&roots).unwrap();
+        let (directory, path) = create_temporary_local_archive(&entries, 1024 * 1024, || false).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let mut zip = ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        let mut actual_paths: Vec<_> = zip
+            .file_names()
+            .map(|name| name.map(|name| name.into_owned()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        actual_paths.sort();
+        let mut expected_paths: Vec<_> = scenario["expected_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+        expected_paths.sort();
+        assert_eq!(actual_paths, expected_paths);
+        let mut content = String::new();
+        zip.by_name(scenario["file_path"].as_str().unwrap())
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, scenario["file_contents"].as_str().unwrap());
+        drop(zip);
+        drop(directory);
+        assert!(!path.exists());
+
+        let error = create_temporary_local_archive(&entries, scenario["reject_limit_bytes"].as_u64().unwrap(), || false).unwrap_err();
+        assert!(error.to_string().contains(TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED), "{error}");
+
+        let store = tempdir().unwrap();
+        let owned_artifact_count = || {
+            fs::read_dir(store.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(TEMPORARY_DOWNLOAD_PREFIX))
+                .count()
+        };
+        assert!(matches!(
+            create_temporary_local_archive_with_directory(
+                &entries,
+                1024 * 1024,
+                || scenario["cancel_before_write"].as_bool().unwrap(),
+                || tempfile::Builder::new().prefix(TEMPORARY_DOWNLOAD_PREFIX).tempdir_in(store.path()),
+            ),
+            Err(LocalArchiveError::Cancelled)
+        ));
+        assert_eq!(
+            owned_artifact_count(),
+            scenario["expected_artifacts_after_cancel"].as_u64().unwrap() as usize
+        );
+    }
+
+    #[test]
+    fn temporary_local_zip_selection_preserves_selected_roots_and_implicit_directories() {
+        let source = tempdir().unwrap();
+        let archive_path = source.path().join("source.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        let options = source_timestamp_options(SimpleFileOptions::default(), Some("2026-01-15T11:52:02Z")).unwrap();
+        writer.add_directory("parent/empty/", options).unwrap();
+        writer.start_file("parent/folder/report.txt", options).unwrap();
+        writer.write_all(b"report").unwrap();
+        writer.finish().unwrap();
+
+        let (directory, output_path) = create_temporary_local_zip_selection(
+            &archive_path,
+            &["parent/empty".to_string(), "parent/folder".to_string()],
+            1024 * 1024,
+            || false,
+        )
+        .unwrap();
+        let mut output = ZipArchive::new(fs::File::open(&output_path).unwrap()).unwrap();
+        assert_eq!(output.len(), 3);
+        assert!(output.by_name("empty/").is_ok());
+        assert!(output.by_name("folder/").is_ok());
+        for name in ["empty/", "folder/", "folder/report.txt"] {
+            let timestamp = output.by_name(name).unwrap().last_modified().unwrap();
+            assert_eq!(timestamp, zip::DateTime::from_date_and_time(2026, 1, 15, 11, 52, 2).unwrap());
+        }
+        let mut content = String::new();
+        output.by_name("folder/report.txt").unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "report");
+        drop(output);
+        drop(directory);
+        assert!(!output_path.exists());
+
+        let error = create_temporary_local_zip_selection(&archive_path, &["parent/folder".to_string()], 2, || false).unwrap_err();
+        assert!(error.to_string().contains(TEMPORARY_ARCHIVE_SIZE_LIMIT_EXCEEDED));
+        assert!(matches!(
+            create_temporary_local_zip_selection(&archive_path, &["parent/folder".to_string()], 1024 * 1024, || true),
+            Err(LocalArchiveError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn temporary_local_zip_selection_rejects_missing_and_unsafe_members() {
+        let source = tempdir().unwrap();
+        let archive_path = source.path().join("source.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        writer.start_file("safe.txt", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"safe").unwrap();
+        writer.start_file("../unsafe.txt", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"unsafe").unwrap();
+        writer.finish().unwrap();
+
+        assert!(matches!(
+            create_temporary_local_zip_selection(&archive_path, &["safe.txt".to_string()], 1024, || false),
+            Err(LocalArchiveError::UnsafeEntryPath)
+        ));
+        let clean_path = source.path().join("clean.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&clean_path).unwrap());
+        writer.start_file("safe.txt", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"safe").unwrap();
+        writer.finish().unwrap();
+        assert!(matches!(
+            create_temporary_local_zip_selection(&clean_path, &["missing.txt".to_string()], 1024, || false),
+            Err(LocalArchiveError::UnknownExtractionMember)
+        ));
+        assert!(matches!(
+            create_temporary_local_zip_selection(&clean_path, &["safe.txt".to_string(), "safe.txt".to_string()], 1024, || false),
+            Err(LocalArchiveError::UnsafeEntryPath)
+        ));
+    }
+
+    fn set_test_path_modified_time(path: &std::path::Path, modified_at: SystemTime) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(modified_at)).expect("test path timestamp should be set");
     }
 
     #[derive(Deserialize)]
@@ -3171,12 +3652,57 @@ mod tests {
         assert_eq!(read_local_archive_entries(&target).unwrap().len(), 3);
         let mut archive = ZipArchive::new(FsFile::open(&target).unwrap()).unwrap();
         assert_eq!(
-            archive.file_names().collect::<Vec<_>>(),
+            archive.file_names().collect::<Result<Vec<_>, _>>().unwrap(),
             ["source/", "source/empty/", "source/notes.txt"]
         );
         let mut notes = String::new();
         archive.by_name("source/notes.txt").unwrap().read_to_string(&mut notes).unwrap();
         assert_eq!(notes, "notes");
+    }
+
+    #[test]
+    fn streams_unicode_writer_output_through_the_local_reader() {
+        let directory = tempdir().unwrap();
+        let source_root = directory.path().join("source");
+        let member_name = "caf\u{00e9}.txt";
+        let content = "archive contents".repeat(ARCHIVE_COPY_BUFFER_SIZE);
+        fs::create_dir(&source_root).unwrap();
+        fs::write(source_root.join(member_name), &content).unwrap();
+        let target = directory.path().join("archive.zip");
+        let entries = build_local_archive_manifest(&[source_root], &target).unwrap();
+
+        create_local_archive(directory.path(), &target, &entries, || false).unwrap();
+
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        let root = reader.next_entry().unwrap().unwrap();
+        assert!(root.is_directory);
+        let member = reader.next_entry().unwrap().unwrap();
+        assert_eq!(member.path, format!("source/{member_name}"));
+        assert_eq!(member.compression_method, 8);
+        let mut actual = Vec::new();
+        reader.stream_entry(member, &mut actual).unwrap();
+        assert_eq!(actual, content.as_bytes());
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn streams_zip64_directory_count_above_the_classic_limit() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("archive.zip");
+        let mut writer = ZipWriter::new_stream(BufWriter::new(FsFile::create(&target).unwrap()));
+        let entry_count = u64::from(ZIP64_SENTINEL_U16) + 1;
+        for index in 0..entry_count {
+            writer.add_directory(format!("directory-{index}/"), directory_options()).unwrap();
+        }
+        writer.finish().unwrap().flush().unwrap();
+
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        for index in 0..entry_count {
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert!(entry.is_directory);
+            assert_eq!(entry.path, format!("directory-{index}"));
+        }
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]
@@ -3202,14 +3728,25 @@ mod tests {
     fn writes_relayed_members_to_a_readable_zip_without_staging() {
         let directory = tempdir().unwrap();
         let target = directory.path().join("archive.zip");
-        let manifest = ArchiveCreationManifest::from_entries(vec![ArchiveCreationManifestMember {
-            archive_path: "notes.txt".to_string(),
-            is_directory: false,
-            source_size: 5,
-            source_modified_at: None,
-        }])
+        let manifest = ArchiveCreationManifest::from_entries(vec![
+            ArchiveCreationManifestMember {
+                archive_path: "empty".to_string(),
+                is_directory: true,
+                source_size: 0,
+                source_modified_at: Some("2024-07-15T13:52:02+02:00".to_string()),
+            },
+            ArchiveCreationManifestMember {
+                archive_path: "notes.txt".to_string(),
+                is_directory: false,
+                source_size: 5,
+                source_modified_at: Some("2026-01-15T13:52:02+02:00".to_string()),
+            },
+        ])
         .unwrap();
-        let writer = create_local_archive_relay_writer(directory.path(), &target, manifest).unwrap();
+        let writer = create_local_archive_relay_writer(directory.path(), &target, manifest)
+            .unwrap()
+            .add_directory("empty")
+            .unwrap();
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         sender.try_send(LocalArchiveRelayChunk::Data(b"notes".to_vec())).unwrap();
         sender.try_send(LocalArchiveRelayChunk::Complete).unwrap();
@@ -3218,6 +3755,14 @@ mod tests {
         let mut notes = String::new();
         archive.by_name("notes.txt").unwrap().read_to_string(&mut notes).unwrap();
         assert_eq!(notes, "notes");
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        let directory_entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(directory_entry.modified_at.unwrap().to_rfc3339(), "2024-07-15T11:52:02+00:00");
+        let entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(entry.modified_at.unwrap().to_rfc3339(), "2026-01-15T11:52:02+00:00");
+        let mut contents = Vec::new();
+        reader.stream_entry(entry, &mut contents).unwrap();
+        assert_eq!(contents, b"notes");
         assert_eq!(
             LocalArchiveReader::open_pinned(&target)
                 .unwrap()
@@ -3247,6 +3792,12 @@ mod tests {
         sender.try_send(LocalArchiveRelayChunk::Complete).unwrap();
 
         writer.write_file("notes.txt", receiver).unwrap().finish().unwrap();
+
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        let entry = reader.next_entry().unwrap().unwrap();
+        let mut contents = Vec::new();
+        reader.stream_entry(entry, &mut contents).unwrap();
+        assert_eq!(contents, content);
 
         assert_eq!(
             LocalArchiveReader::open_pinned(&target)
@@ -3462,6 +4013,16 @@ mod tests {
         fs::create_dir_all(source_root.join("nested/empty")).unwrap();
         fs::write(source_root.join("alpha.txt"), b"alpha").unwrap();
         fs::write(source_root.join("nested/beta.txt"), b"beta").unwrap();
+        let modified_at = DateTime::parse_from_rfc3339("2026-07-15T11:52:02Z").unwrap().with_timezone(&Utc);
+        for path in [
+            source_root.clone(),
+            source_root.join("alpha.txt"),
+            source_root.join("nested"),
+            source_root.join("nested/beta.txt"),
+            source_root.join("nested/empty"),
+        ] {
+            set_test_path_modified_time(&path, modified_at.into());
+        }
         let target = directory.path().join("archive.zip");
         let entries = build_local_archive_manifest(&[source_root], &target).unwrap();
         create_local_archive(directory.path(), &target, &entries, || false).unwrap();
@@ -3484,6 +4045,7 @@ mod tests {
         assert_eq!(first_page.items.len(), 1);
         assert_eq!(first_page.items[0].file_type, FileType::Directory);
         assert_eq!(first_page.items[0].state, ArchiveEntryState::Readable);
+        assert_eq!(first_page.items[0].modified_at, Some(modified_at));
         assert!(first_page.next_cursor.is_none());
 
         let nested_page = ArchiveInspectionCoordinator::from_plan(
@@ -3503,6 +4065,7 @@ mod tests {
         .directory_listing()
         .unwrap();
         assert_eq!(nested_page.path, first_page.items[0].path);
+        assert!(nested_page.items.iter().all(|entry| entry.modified_at == Some(modified_at)));
         assert_eq!(
             nested_page
                 .items
@@ -3515,6 +4078,76 @@ mod tests {
             nested_page.items.iter().find(|item| item.name == "nested").map(|item| &item.state),
             Some(&ArchiveEntryState::Readable)
         );
+    }
+
+    #[test]
+    fn large_archive_members_can_be_previewed() {
+        const LARGE_MEMBER_TEST_BYTES: usize = 6 * 1024 * 1024;
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("archive.zip");
+        let content = vec![b'x'; LARGE_MEMBER_TEST_BYTES];
+        let mut archive = ZipWriter::new(FsFile::create(&target).unwrap());
+        archive
+            .start_file("large.pdf", regular_file_options(&content[..ARCHIVE_COPY_BUFFER_SIZE]).unwrap())
+            .unwrap();
+        archive.write_all(&content).unwrap();
+        archive.finish().unwrap();
+
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        let page = reader.directory_page("", None, 10).unwrap();
+        let listing = ArchiveDirectoryListingPresentation::new("archive.zip".to_string(), 0, None, String::new(), None, 10).present(page);
+        assert_eq!(listing.items[0].state, ArchiveEntryState::Readable);
+
+        let mut reader = LocalArchiveReader::open_pinned(&target).unwrap();
+        let member = find_local_archive_member(&mut reader, "large.pdf").unwrap();
+        for size in [0, LARGE_MEMBER_TEST_BYTES as u64, u64::MAX] {
+            let mut entry = member.clone();
+            entry.uncompressed_size = size;
+            for method in [0, 8, 12, 99] {
+                entry.compression_method = method;
+                let page = LocalArchiveDirectoryPage {
+                    path: String::new(),
+                    entries: vec![local_directory_entry(&entry)],
+                    next_cursor: None,
+                };
+                let listing =
+                    ArchiveDirectoryListingPresentation::new("archive.zip".to_string(), 0, None, String::new(), None, 10).present(page);
+                assert_eq!(
+                    listing.items[0].state,
+                    if method == 99 {
+                        ArchiveEntryState::Unavailable
+                    } else {
+                        ArchiveEntryState::Readable
+                    }
+                );
+            }
+            entry.encrypted = true;
+            let page = LocalArchiveDirectoryPage {
+                path: String::new(),
+                entries: vec![local_directory_entry(&entry)],
+                next_cursor: None,
+            };
+            let listing =
+                ArchiveDirectoryListingPresentation::new("archive.zip".to_string(), 0, None, String::new(), None, 10).present(page);
+            assert_eq!(listing.items[0].state, ArchiveEntryState::Blocked);
+        }
+        assert_eq!(
+            ArchiveMemberReadPresentation::new("large.pdf".to_string(), false)
+                .present(&member)
+                .unwrap()
+                .delivery,
+            ArchiveMemberReadDelivery::Stream
+        );
+        assert_eq!(
+            ArchiveMemberReadPresentation::new("large.pdf".to_string(), true)
+                .present(&member)
+                .unwrap()
+                .delivery,
+            ArchiveMemberReadDelivery::Stream
+        );
+        let mut output = Vec::new();
+        reader.stream_entry(member, &mut output).unwrap();
+        assert_eq!(output, content);
     }
 
     #[test]

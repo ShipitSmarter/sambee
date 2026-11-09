@@ -3,7 +3,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterator
+from typing import Iterator, Sequence
 from urllib.parse import urlsplit
 
 from sqlalchemy import delete, update
@@ -16,6 +16,7 @@ from app.services.oidc_configuration import OidcSecretCipher
 from app.services.oidc_http import LOGIN_GRANT_LIFETIME_SECONDS, PRE_CALLBACK_FLOW_LIFETIME_SECONDS, VALIDATED_TEST_FLOW_LIFETIME_SECONDS
 
 _FLOW_TABLE = SQLModel.metadata.tables["oidcflow"]
+_LOGIN_PATH = "/login"
 
 
 class OidcFlowError(ValueError):
@@ -55,6 +56,7 @@ class ValidatedLoginGrant:
 class ConsumedLoginGrant:
     user: User
     return_path: str
+    state_hash: str
     oidc_browser_session_id: uuid.UUID | None
     encrypted_browser_session_secret: str | None
 
@@ -74,10 +76,17 @@ def hash_flow_secret(value: str) -> str:
 
 
 def safe_return_path(value: str | None) -> str:
-    if not value:
+    if not value or "\\" in value:
         return "/browse"
     parsed = urlsplit(value)
-    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/")
+        or parsed.path.startswith("//")
+        or parsed.path == _LOGIN_PATH
+        or parsed.path.startswith(f"{_LOGIN_PATH}/")
+    ):
         return "/browse"
     return parsed.path + (f"?{parsed.query}" if parsed.query else "")
 
@@ -170,7 +179,7 @@ def claim_oidc_callback(
             _FLOW_TABLE.c.state_hash == hash_flow_secret(state),
             _FLOW_TABLE.c.expires_at > current_time,
         )
-        .values(status=OidcFlowStatus.CALLBACK_PROCESSING, state_hash=None)
+        .values(status=OidcFlowStatus.CALLBACK_PROCESSING)
         .returning(_FLOW_TABLE.c.id)
     )
     flow_id = session.connection().execute(statement).scalar_one_or_none()
@@ -212,6 +221,7 @@ def complete_test_callback(
     *,
     flow_id: uuid.UUID,
     encrypted_tested_identity: str,
+    refresh_token_returned: bool = True,
     now: datetime | None = None,
 ) -> None:
     current_time = now or _now_utc()
@@ -225,6 +235,7 @@ def complete_test_callback(
         .values(
             status=OidcFlowStatus.CALLBACK_VALIDATED,
             encrypted_tested_identity=encrypted_tested_identity,
+            test_refresh_token_returned=refresh_token_returned,
             encrypted_nonce=None,
             encrypted_verifier=None,
             expires_at=current_time + timedelta(seconds=VALIDATED_TEST_FLOW_LIFETIME_SECONDS),
@@ -289,24 +300,28 @@ def consume_login_grant(
     session: Session,
     *,
     grant: str,
+    browser_states: Sequence[str],
     now: datetime | None = None,
 ) -> ConsumedLoginGrant:
     current_time = now or _now_utc()
+    if not browser_states:
+        raise OidcFlowError("OIDC login grant is invalid")
     statement = (
         update(_FLOW_TABLE)
         .where(
             _FLOW_TABLE.c.purpose == OidcFlowPurpose.LOGIN,
             _FLOW_TABLE.c.status == OidcFlowStatus.CALLBACK_VALIDATED,
             _FLOW_TABLE.c.grant_hash == hash_flow_secret(grant),
+            _FLOW_TABLE.c.state_hash.in_([hash_flow_secret(state) for state in browser_states]),
             _FLOW_TABLE.c.grant_expires_at > current_time,
         )
         .values(status=OidcFlowStatus.CONSUMED, grant_hash=None)
-        .returning(_FLOW_TABLE.c.id)
+        .returning(_FLOW_TABLE.c.id, _FLOW_TABLE.c.state_hash)
     )
-    flow_id = session.connection().execute(statement).scalar_one_or_none()
-    if flow_id is None:
+    matched_flow = session.connection().execute(statement).one_or_none()
+    if matched_flow is None:
         raise OidcFlowError("OIDC login grant is invalid")
-    flow = session.get(OidcFlow, flow_id)
+    flow = session.get(OidcFlow, matched_flow.id)
     if flow is None or flow.user_id is None or flow.user_token_version is None:
         raise OidcFlowError("OIDC login grant is invalid")
     user = session.get(User, flow.user_id)
@@ -318,6 +333,7 @@ def consume_login_grant(
     consumed = ConsumedLoginGrant(
         user=user,
         return_path=flow.return_path,
+        state_hash=matched_flow.state_hash,
         oidc_browser_session_id=flow.oidc_browser_session_id,
         encrypted_browser_session_secret=flow.encrypted_browser_session_secret,
     )

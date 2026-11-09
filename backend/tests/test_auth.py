@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, delete, select
+from starlette.requests import Request
 
 import app.api.auth as auth_module
 from app.core.security import (
@@ -21,10 +22,85 @@ from app.core.security import (
     verify_password,
 )
 from app.middleware.authentication import PASSWORD_FORM_BODY_LIMIT_BYTES
-from app.models.oidc import OidcBrowserSession, OidcBrowserSessionStatus, OidcProviderConfiguration
+from app.models.oidc import (
+    OidcBrowserSession,
+    OidcBrowserSessionStatus,
+    OidcFlow,
+    OidcFlowStatus,
+    OidcProviderConfiguration,
+    OidcSessionCapability,
+    OidcSessionCipherKey,
+    SignInMode,
+)
+from app.models.oidc_api import OidcConfigurationCandidate
 from app.models.user import User, UserRole
 from app.services.oidc_browser_session import OIDC_BROWSER_SESSION_COOKIE_NAME, build_cookie_value
-from app.services.oidc_client import OidcClientError, OidcClientErrorCode
+from app.services.oidc_client import NormalizedOidcClaims, OidcClientError, OidcClientErrorCode, ValidatedOidcTokenSet
+from app.services.oidc_configuration import encrypt_candidate_snapshot, get_oidc_secret_cipher, normalize_candidate
+from app.services.oidc_flow import start_login_flow, start_test_flow
+
+
+@pytest.mark.parametrize("submitted_username", ["MixedUser", "mixeduser", "MIXEDUSER", " MixedUser ", "STRASSE"])
+def test_password_login_matches_case_insensitively(client: TestClient, session: Session, submitted_username: str) -> None:
+    stored_username = "Straße" if submitted_username == "STRASSE" else "MixedUser"
+    user = User(username=stored_username, password_hash=get_password_hash("Secret123!"))
+    session.add(user)
+    session.commit()
+    response = client.post("/api/auth/token", data={"username": submitted_username, "password": "Secret123!"})
+    assert response.status_code == 200
+    assert decode_access_token(response.json()["access_token"])["sub"] == str(user.id)
+    assert response.json()["username"] == stored_username
+    assert client.post("/api/auth/token", data={"username": submitted_username, "password": "secret123!"}).status_code == 401
+
+
+def test_legacy_conflicts_require_exact_spelling_and_resolve_after_rename(
+    client: TestClient, session: Session, legacy_username_conflict: tuple[User, User]
+) -> None:
+    first, second = legacy_username_conflict
+    for username, password, expected_id in [
+        (first.username, "FirstPassword!", first.id),
+        (second.username, "SecondPassword!", second.id),
+    ]:
+        response = client.post("/api/auth/token", data={"username": username, "password": password})
+        assert response.status_code == 200
+        assert decode_access_token(response.json()["access_token"])["sub"] == str(expected_id)
+    for username, password in [("LEGACYUSER", "FirstPassword!"), (first.username, "SecondPassword!")]:
+        response = client.post("/api/auth/token", data={"username": username, "password": password})
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Incorrect username or password"
+    second.username = "DistinctUser"
+    session.add(second)
+    session.commit()
+    assert client.post("/api/auth/token", data={"username": "LEGACYUSER", "password": "FirstPassword!"}).status_code == 200
+
+
+@pytest.mark.parametrize("state", ["disabled", "expired", "passwordless"])
+def test_unavailable_accounts_still_count_toward_login_conflicts(
+    client: TestClient, session: Session, legacy_username_conflict: tuple[User, User], state: str
+) -> None:
+    _first, second = legacy_username_conflict
+    if state == "disabled":
+        second.is_active = False
+    elif state == "expired":
+        second.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    else:
+        second.password_hash = None
+    session.add(second)
+    session.commit()
+    assert client.post("/api/auth/token", data={"username": "LEGACYUSER", "password": "FirstPassword!"}).status_code == 401
+    assert client.post("/api/auth/token", data={"username": "LegacyUser", "password": "FirstPassword!"}).status_code == 200
+    assert client.post("/api/auth/token", data={"username": "legacyuser", "password": "SecondPassword!"}).status_code == 401
+
+
+def test_pending_oidc_login_cookies_keep_parallel_flows_separate() -> None:
+    first_state, second_state = "first-state", "second-state"
+    first_cookie = auth_module._oidc_login_flow_cookie_name(first_state)
+    second_cookie = auth_module._oidc_login_flow_cookie_name(second_state)
+    assert first_cookie != second_cookie
+
+    cookie_header = f"{first_cookie}={first_state}; {second_cookie}={second_state}; {auth_module.OIDC_LOGIN_FLOW_COOKIE_NAME}_invalid=wrong"
+    request = Request({"type": "http", "headers": [(b"cookie", cookie_header.encode())]})
+    assert auth_module._pending_oidc_login_states(request) == [first_state, second_state]
 
 
 @pytest.mark.parametrize(
@@ -42,13 +118,128 @@ def test_oidc_failure_category_uses_safe_userinfo_reason(error_code: OidcClientE
     assert auth_module._oidc_failure_category(error) == expected_category
 
 
-def test_authorization_scopes_adds_offline_access_for_legacy_configuration() -> None:
+def test_authorization_scopes_preserves_stored_configuration() -> None:
     assert auth_module._authorization_scopes('["openid", "profile", "email"]') == (
         "openid",
         "profile",
         "email",
-        "offline_access",
     )
+
+
+@pytest.mark.parametrize("has_refresh_token", [False, True])
+@pytest.mark.parametrize(("age_days", "succeeds"), [(0, True), (3, False), (None, False)])
+def test_oidc_test_callback_requires_recent_auth_time_with_or_without_refresh_token(
+    client: TestClient,
+    session: Session,
+    admin_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+    has_refresh_token: bool,
+    age_days: int | None,
+    succeeds: bool,
+) -> None:
+    cipher = get_oidc_secret_cipher()
+    candidate = normalize_candidate(
+        OidcConfigurationCandidate(
+            issuer_url="https://idp.example.test",
+            client_id="sambee",
+            client_secret="secret",
+            sign_in_mode="oidc_only",
+            interactive_reauthentication_max_age_days=2,
+        ),
+        None,
+        cipher,
+    )
+    started = start_test_flow(
+        session,
+        initiating_admin_id=admin_user.id,
+        encrypted_candidate_configuration=encrypt_candidate_snapshot(candidate, cipher),
+        active_configuration_revision=None,
+        cipher=cipher,
+    )
+    session.commit()
+
+    async def metadata(*_args: object, **_kwargs: object) -> tuple[object, dict[str, object]]:
+        return object(), {}
+
+    async def token_set(*_args: object, **_kwargs: object) -> ValidatedOidcTokenSet:
+        return ValidatedOidcTokenSet(
+            claims=NormalizedOidcClaims(
+                issuer=candidate.issuer_url,
+                subject="subject",
+                username="admin",
+                groups=(),
+                name=None,
+                email=None,
+            ),
+            authenticated_at=int((datetime.now(timezone.utc) - timedelta(days=age_days)).timestamp()) if age_days is not None else None,
+            provider_access_token=None,
+            refresh_token="provider-refresh-token" if has_refresh_token else None,
+        )
+
+    monkeypatch.setattr(auth_module, "load_provider_metadata", metadata)
+    monkeypatch.setattr(auth_module, "exchange_and_validate_callback", token_set)
+    monkeypatch.setattr(auth_module, "derive_oidc_redirect_uri", lambda _url: "http://testserver/api/auth/oidc/callback")
+    response = client.get("/api/auth/oidc/callback", params={"state": started.state, "code": "code"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/browse?settings=admin-authentication") is succeeds
+    flow = session.get(OidcFlow, started.flow_id)
+    if succeeds:
+        assert flow is not None and flow.status == OidcFlowStatus.CALLBACK_VALIDATED
+        assert flow.test_refresh_token_returned is has_refresh_token
+
+
+def test_oidc_login_callback_without_refresh_token_creates_fixed_session(
+    client: TestClient,
+    session: Session,
+    admin_user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cipher = get_oidc_secret_cipher()
+    configuration = OidcProviderConfiguration(
+        display_name="IdP",
+        issuer_url="https://idp.example.test",
+        client_id="sambee",
+        encrypted_client_secret=cipher.encrypt("secret"),
+        sign_in_mode=SignInMode.OIDC_ONLY,
+    )
+    session.add(configuration)
+    session.commit()
+    started = start_login_flow(session, configuration_revision=configuration.configuration_revision, cipher=cipher, return_path="/browse")
+    session.commit()
+
+    async def metadata(*_args: object, **_kwargs: object) -> tuple[object, dict[str, object]]:
+        return object(), {}
+
+    async def token_set(*_args: object, **_kwargs: object) -> ValidatedOidcTokenSet:
+        return ValidatedOidcTokenSet(
+            claims=NormalizedOidcClaims(
+                issuer=configuration.issuer_url,
+                subject="subject",
+                username=admin_user.username,
+                groups=(),
+                name=None,
+                email=None,
+            ),
+            authenticated_at=int(datetime.now(timezone.utc).timestamp()),
+            provider_access_token=None,
+            refresh_token=None,
+        )
+
+    monkeypatch.setattr(auth_module, "load_provider_metadata", metadata)
+    monkeypatch.setattr(auth_module, "exchange_and_validate_callback", token_set)
+    monkeypatch.setattr(auth_module, "derive_oidc_redirect_uri", lambda _url: "http://testserver/api/auth/oidc/callback")
+    monkeypatch.setattr(auth_module, "get_effective_authentication_mode", lambda _session: SignInMode.OIDC_ONLY)
+    monkeypatch.setattr(auth_module, "resolve_or_provision_oidc_user", lambda *_args, **_kwargs: admin_user)
+    client.cookies.set(auth_module._oidc_login_flow_cookie_name(started.state), started.state)
+    response = client.get("/api/auth/oidc/callback", params={"state": started.state, "code": "code"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login/oidc/callback#grant=")
+    browser_session = session.exec(select(OidcBrowserSession)).one()
+    assert browser_session.capability == OidcSessionCapability.REAUTHORIZATION_ONLY
+    assert browser_session.encrypted_refresh_token is None
+    assert session.exec(select(OidcSessionCipherKey)).all() == []
 
 
 @pytest.mark.parametrize("scopes_json", ('{"openid": true}', '["openid", 1]', "not-json"))
@@ -651,6 +842,7 @@ class TestGetCurrentUserEndpoint:
             "has_local_password": True,
             "identity_source": "local",
             "password_change_available": True,
+            "password_change_required": False,
             "browser_session_management_available": False,
             "oidc_provider_name": None,
             "current_session": {
@@ -708,6 +900,78 @@ class TestGetCurrentUserEndpoint:
 @pytest.mark.integration
 class TestChangePasswordEndpoint:
     """Test password change functionality."""
+
+    @pytest.mark.parametrize(
+        ("mode", "enforced", "oidc_session", "expected"),
+        [
+            ("password_only", True, False, True),
+            ("oidc_or_password", True, False, True),
+            ("oidc_or_password", True, True, False),
+            ("oidc_only", True, False, False),
+            ("password_only", False, False, False),
+        ],
+    )
+    def test_password_change_requirement_respects_authentication_context(
+        self, session: Session, regular_user: User, mode: str, enforced: bool, oidc_session: bool, expected: bool
+    ):
+        import uuid
+
+        from app.core.auth_methods import AuthenticationMode
+        from app.core.security import BrowserAuthentication, password_change_required
+        from app.services.authentication_config import set_ui_authentication_mode
+
+        set_ui_authentication_mode(session, mode=AuthenticationMode(mode), updated_by_user_id=None)
+        regular_user.must_change_password = True
+        authentication = BrowserAuthentication(
+            user=regular_user,
+            token_version_current=True,
+            oidc_browser_session_id=uuid.uuid4() if oidc_session else None,
+            authentication_enforced=enforced,
+        )
+        assert password_change_required(authentication, session) is expected
+
+    def test_required_password_change_blocks_access_until_completed(
+        self, client: TestClient, session: Session, regular_user: User, auth_headers_user: dict
+    ):
+        regular_user.must_change_password = True
+        session.add(regular_user)
+        session.commit()
+
+        assert client.get("/api/auth/me", headers=auth_headers_user).status_code == 200
+        account = client.get("/api/auth/account", headers=auth_headers_user)
+        assert account.status_code == 200
+        assert account.json()["password_change_required"] is True
+        blocked = client.get("/api/auth/me/settings", headers=auth_headers_user)
+        assert blocked.status_code == 403
+        assert blocked.json()["detail"] == {"code": "password_change_required"}
+
+        rejected = client.post(
+            "/api/auth/change-password",
+            headers=auth_headers_user,
+            json={"current_password": "incorrect", "new_password": "newpass123"},
+        )
+        assert rejected.status_code == 400
+        session.refresh(regular_user)
+        assert regular_user.must_change_password is True
+
+        response = client.post(
+            "/api/auth/change-password",
+            headers=auth_headers_user,
+            json={"current_password": "userpass123", "new_password": "newpass123"},
+        )
+        assert response.status_code == 200
+        session.refresh(regular_user)
+        assert regular_user.must_change_password is False
+        assert client.get("/api/auth/me", headers=auth_headers_user).status_code == 401
+
+    def test_change_password_rejects_current_password(self, client: TestClient, auth_headers_user: dict):
+        response = client.post(
+            "/api/auth/change-password",
+            headers=auth_headers_user,
+            json={"current_password": "userpass123", "new_password": "userpass123"},
+        )
+        assert response.status_code == 400
+        assert "different" in response.json()["detail"]
 
     def test_change_password_success(self, client: TestClient, session: Session):
         """Test successful password change."""

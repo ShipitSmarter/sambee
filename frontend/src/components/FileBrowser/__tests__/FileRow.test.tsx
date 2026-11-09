@@ -1,22 +1,23 @@
-import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setLocale, translate } from "../../../i18n";
 import { formatDate, formatFileSize } from "../../../pages/FileBrowser/formatters";
 import { FILE_BROWSER_ROW_HEIGHT } from "../../../theme/constants";
-import { FileType } from "../../../types";
+import { type FileInfo, FileType } from "../../../types";
 import { FileRow, shortenTargetPath } from "../FileRow";
 
 function createDefaultFileRowProps() {
+  const file: FileInfo = {
+    name: "report.pdf",
+    path: "/report.pdf",
+    type: FileType.FILE,
+    size: 1024,
+    modified_at: "2024-01-01T00:00:00Z",
+    is_readable: true,
+    is_hidden: false,
+  };
   return {
-    file: {
-      name: "report.pdf",
-      path: "/report.pdf",
-      type: FileType.FILE,
-      size: 1024,
-      modified_at: "2024-01-01T00:00:00Z",
-      is_readable: true,
-      is_hidden: false,
-    },
+    file,
     useCompactLayout: false,
     index: 0,
     isSelected: true,
@@ -43,8 +44,24 @@ function createDefaultFileRowProps() {
 
 describe("FileRow", () => {
   afterEach(async () => {
+    cleanup();
     vi.useRealTimers();
     await setLocale("en");
+  });
+
+  it("selects through a labeled icon without opening or activating twice in a double click", () => {
+    const props = createDefaultFileRowProps();
+    props.isMultiSelected = false;
+    const onIconClick = vi.fn();
+    render(<FileRow {...props} selectionMode={false} onIconClick={onIconClick} />);
+
+    const icon = screen.getByRole("checkbox", { name: "Select: report.pdf" });
+    expect(icon).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(icon, { detail: 1, shiftKey: true });
+    fireEvent.click(icon, { detail: 2 });
+    expect(onIconClick).toHaveBeenCalledTimes(1);
+    expect(onIconClick).toHaveBeenCalledWith(props.file, props.index, true, false);
+    expect(props.onClick).not.toHaveBeenCalled();
   });
 
   it("does not render an application context menu on desktop", async () => {
@@ -110,14 +127,20 @@ describe("FileRow", () => {
     expect(rowButton).toHaveStyle({ backgroundColor: "rgb(4, 5, 6)" });
   });
 
-  it("disables unavailable archive entries and hides their actions", () => {
+  it.each([
+    ["blocked", "fileBrowser.archiveMembers.encrypted"],
+    ["unavailable", "fileBrowser.archiveMembers.unsupportedCompression"],
+  ] as const)("explains why an archive member is %s and hides its actions", (state, messageKey) => {
     const props = createDefaultFileRowProps();
-    props.file = { ...props.file, is_readable: false, archive_entry_state: "blocked" };
+    props.file = { ...props.file, is_readable: false, archive_entry_state: state };
 
     render(<FileRow {...props} />);
 
     const rowButton = screen.getByRole("button", { name: /report\.pdf/i });
     expect(rowButton).toBeDisabled();
+    expect(rowButton).toHaveAccessibleName(expect.stringContaining(translate(messageKey)));
+    expect(screen.getByText("report.pdf")).toHaveAttribute("title", translate(messageKey));
+    expect(rowButton.parentElement).toHaveAttribute("title", translate(messageKey));
     fireEvent.click(rowButton);
     fireEvent.contextMenu(rowButton);
 

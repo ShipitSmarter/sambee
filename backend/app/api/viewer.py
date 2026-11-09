@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import secrets
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -8,9 +9,11 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
-from sqlmodel import Session, select
+from pydantic import BaseModel
+from sqlalchemy import delete
+from sqlmodel import Session, col, select
 
-from app.api._smb_helpers import build_smb_backend, disconnect_backend_safely
+from app.api._smb_helpers import build_smb_backend, disconnect_backend_safely, file_target_http_error, prepare_file_streamer
 from app.api.companion import (
     COMPANION_ERROR_LOCK_LOST,
     _get_current_companion_operation_user,
@@ -22,6 +25,7 @@ from app.core.security import get_current_user_for_token, get_current_user_with_
 from app.core.system_setting_definitions import SystemSettingKey
 from app.db.database import get_session
 from app.models.connection import Connection
+from app.models.download_intent import DownloadIntent
 from app.models.edit_lock import HEARTBEAT_TIMEOUT_SECONDS, EditLock
 from app.models.file import FileInfo, FileType
 from app.models.user import User
@@ -45,11 +49,114 @@ from app.services.pdf_normalizer import (
 from app.services.preprocessor import PreprocessorFileTooLargeError
 from app.services.system_settings import get_integer_setting_value
 from app.storage.smb import SMBBackend
-from app.utils.content_disposition import build_content_disposition
+from app.utils.content_disposition import build_content_disposition, is_active_document_mime_type
 from app.utils.file_type_registry import needs_processing
 
 router = APIRouter()
 logger = get_logger(__name__)
+DOWNLOAD_INTENT_TTL = timedelta(seconds=90)
+
+
+class DownloadIntentRequest(BaseModel):
+    connection_id: uuid.UUID
+    path: str
+    member_path: str | None = None
+
+
+class DownloadIntentResponse(BaseModel):
+    url: str
+
+
+@router.post("/download-intents", response_model=DownloadIntentResponse)
+async def create_download_intent(
+    body: DownloadIntentRequest,
+    current_user: User = Depends(get_current_user_with_auth_check),
+    session: Session = Depends(get_session),
+) -> DownloadIntentResponse:
+    """Authorize one browser-native download without exposing the bearer token."""
+    if not body.path or body.member_path == "":
+        raise HTTPException(status_code=422, detail="A file path and nonempty member path are required")
+    connection = get_accessible_connection_or_404(session, current_user, body.connection_id)
+    backend = build_smb_backend(connection, backend_factory=SMBBackend)
+    reader = None
+    try:
+        await backend.connect()
+        file_info = await backend.get_file_info(body.path)
+        if file_info.type != FileType.FILE:
+            raise HTTPException(status_code=422, detail="Download source must be a regular file")
+        if body.member_path is not None:
+            if file_info.size is None:
+                raise HTTPException(status_code=422, detail="Archive size is unavailable")
+            reader = await backend.open_random_access_reader(body.path)
+            await ZipReader(reader, file_info.size).validate_member_in_record_order(body.member_path)
+    except (ArchiveFormatError, FileNotFoundError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        if reader is not None:
+            await reader.close()
+        await disconnect_backend_safely(backend, logger=logger, context="download intent preparation")
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    session.exec(delete(DownloadIntent).where(col(DownloadIntent.expires_at) < now))
+    session.add(
+        DownloadIntent(
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            user_id=current_user.id,
+            token_version=current_user.token_version,
+            connection_id=body.connection_id,
+            path=body.path,
+            member_path=body.member_path,
+            expires_at=now + DOWNLOAD_INTENT_TTL,
+        )
+    )
+    session.commit()
+    return DownloadIntentResponse(url=f"/api/viewer/download-intents/{token}")
+
+
+@router.get("/download-intents/{token}", response_model=None)
+async def redeem_download_intent(token: str, session: Session = Depends(get_session)) -> Response | StreamingResponse:
+    """Atomically consume a scoped capability before opening its source stream."""
+    intent = session.execute(
+        delete(DownloadIntent)
+        .where(col(DownloadIntent.token_hash) == hashlib.sha256(token.encode()).hexdigest())
+        .returning(
+            col(DownloadIntent.expires_at),
+            col(DownloadIntent.user_id),
+            col(DownloadIntent.token_version),
+            col(DownloadIntent.connection_id),
+            col(DownloadIntent.path),
+            col(DownloadIntent.member_path),
+        )
+    ).one_or_none()
+    session.commit()
+    if intent is None or intent.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="Download expired or unavailable")
+    current_user = session.get(User, intent.user_id)
+    if current_user is None or not current_user.is_active or current_user.token_version != intent.token_version:
+        raise HTTPException(status_code=404, detail="Download expired or unavailable")
+    get_accessible_connection_or_404(session, current_user, intent.connection_id)
+    if intent.member_path is None:
+        response: Response | StreamingResponse = await _stream_download_file(intent.connection_id, intent.path, current_user, session)
+    else:
+        response = await stream_archive_member(
+            intent.connection_id,
+            intent.path,
+            intent.member_path,
+            True,
+            "raw",
+            "original",
+            None,
+            None,
+            False,
+            None,
+            None,
+            200,
+            current_user,
+            session,
+        )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def _inspection_member(entry: ZipEntry) -> ArchiveInspectionManifestMember:
@@ -135,9 +242,7 @@ async def stream_archive_member(
         inspection_member = _inspection_member(member)
         inspection_projection = presentation.project_member(inspection_member)
         if inspection_projection.delivery == "preview_unavailable":
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Archive member exceeds the inline preview size limit"
-            )
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Archive member is not eligible for preview")
         member_name = inspection_member.path.rsplit("/", 1)[-1]
 
         async def read_member_source() -> tuple[bytes, PDFSourceRevision]:
@@ -215,7 +320,14 @@ async def stream_archive_member(
         return StreamingResponse(
             stream_member(),
             media_type=inspection_projection.content_type,
-            headers={"Content-Disposition": inspection_projection.content_disposition},
+            headers={
+                "Content-Disposition": (
+                    build_content_disposition("attachment", member_name)
+                    if is_active_document_mime_type(inspection_projection.content_type)
+                    else inspection_projection.content_disposition
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
     except ArchiveFormatError as exc:
         if reader is not None:
@@ -294,36 +406,6 @@ def _get_active_lock(connection_id: uuid.UUID, path: str, session: Session) -> E
 #
 # create_file_streamer
 #
-def create_file_streamer(backend: SMBBackend, path: str) -> AsyncIterator[bytes]:
-    """Create an async generator that streams file contents from SMB backend
-
-    Handles error cases during streaming and ensures backend disconnection.
-    """
-
-    async def file_streamer() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in backend.read_file(path):
-                yield chunk
-        except TimeoutError as e:
-            logger.error(f"Timeout reading file during streaming: {path} - {e}")
-            # Can't raise HTTPException mid-stream, connection will be closed
-            # Client will see incomplete response
-            raise
-        except FileNotFoundError as e:
-            logger.warning(f"File not found during streaming: {path} - {e}")
-            # Can't raise HTTPException mid-stream, connection will be closed
-            # Client will see incomplete response
-            raise
-        except IOError as e:
-            logger.warning(f"File access error during streaming: {path} - {e}")
-            # Can't raise HTTPException mid-stream, connection will be closed
-            raise
-        finally:
-            await disconnect_backend_safely(backend, logger=logger, context=f"streaming '{path}'")
-
-    return file_streamer()
-
-
 async def read_pdf_derivative_source(
     backend: SMBBackend,
     path: str,
@@ -414,7 +496,7 @@ async def create_normalized_pdf_response_for_source(
     max_source_size = get_integer_setting_value(SystemSettingKey.PDF_NORMALIZER_MAX_SOURCE_SIZE_BYTES)
     if metadata_revision.size is not None and metadata_revision.size > max_source_size:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="This PDF exceeds the configured compatibility-processing size limit.",
         )
 
@@ -471,7 +553,7 @@ async def create_normalized_pdf_response_for_source(
     pdf_bytes, revision = await read_source()
     if len(pdf_bytes) > max_source_size:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="This PDF exceeds the configured compatibility-processing size limit.",
         )
 
@@ -669,7 +751,7 @@ async def create_converted_image_response(
         file_size_mb = exc.file_size / (1024 * 1024)
         max_file_size_mb = exc.max_file_size / (1024 * 1024)
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail={
                 "code": "image_preview_too_large",
                 "message": f"This image is too large to preview ({file_size_mb:.0f} MB; maximum {max_file_size_mb:.0f} MB).",
@@ -726,6 +808,8 @@ async def read_and_convert_image(
 
     except HTTPException:
         raise
+    except (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError) as error:
+        raise file_target_http_error(error) from error
     except TimeoutError as e:
         logger.error(
             f"Timeout reading file: connection_id={connection_id}, path='{path}', error={e}",
@@ -799,23 +883,12 @@ async def view_file(
             file_info = await backend.get_file_info(path)
             if file_info.type == FileType.DIRECTORY:
                 await disconnect_backend_safely(backend, logger=logger, context=f"view file directory check for '{path}'")
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot view a directory")
+                raise file_target_http_error(IsADirectoryError())
         except HTTPException:
             raise
-        except TimeoutError as e:
-            await disconnect_backend_safely(backend, logger=logger, context=f"view file info timeout for '{path}'")
-            logger.error(f"Timeout getting file info: connection_id={connection_id}, path='{path}', error={e}")
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Timeout reading file from network share",
-            )
-        except FileNotFoundError:
-            await disconnect_backend_safely(backend, logger=logger, context=f"view file missing path '{path}'")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {path}")
         except Exception as e:
             await disconnect_backend_safely(backend, logger=logger, context=f"view file info failure for '{path}'")
-            logger.error(f"Failed to get file info: connection_id={connection_id}, path='{path}', error={type(e).__name__}: {e}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {path}")
+            raise file_target_http_error(e) from e
 
         # Check if image needs processing for browser compatibility and viewing speed
         if needs_processing(file_info.name, file_info.size):
@@ -855,9 +928,14 @@ async def view_file(
         # Stream the file (browser-native format or non-image/non-PDF)
         logger.debug(f"Streaming file for viewing: connection_id={connection_id}, path='{path}', mime_type={file_info.mime_type}")
         return StreamingResponse(
-            create_file_streamer(backend, path),
+            await prepare_file_streamer(backend, path),
             media_type=file_info.mime_type,
-            headers={"Content-Disposition": build_content_disposition("inline", file_info.name)},
+            headers={
+                "Content-Disposition": build_content_disposition(
+                    "attachment" if is_active_document_mime_type(file_info.mime_type) else "inline", file_info.name
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     except HTTPException:
@@ -869,10 +947,7 @@ async def view_file(
             f"error={type(e).__name__}: {e}",
             exc_info=True,
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read file: {str(e)}",
-        )
+        raise file_target_http_error(e) from e
 
 
 #
@@ -923,6 +998,11 @@ async def download_file(
     else:
         current_user = await get_current_user_for_token(token, session)
 
+    return await _stream_download_file(connection_id, path, current_user, session)
+
+
+async def _stream_download_file(connection_id: uuid.UUID, path: str, current_user: User, session: Session) -> StreamingResponse:
+    """Stream an authorized physical file for both bearer and intent requests."""
     set_user(current_user.username)
     logger.info(f"Download file: connection_id={connection_id}, path='{path}'")
 
@@ -943,21 +1023,14 @@ async def download_file(
         # Get file info
         try:
             file_info = await backend.get_file_info(path)
-        except TimeoutError as e:
-            await disconnect_backend_safely(backend, logger=logger, context=f"download file info timeout for '{path}'")
-            logger.error(f"Timeout getting download file info: connection_id={connection_id}, path='{path}', error={e}")
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Timeout reading file from network share",
-            )
-        except FileNotFoundError:
-            await disconnect_backend_safely(backend, logger=logger, context=f"download missing path '{path}'")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {path}")
+        except Exception as error:
+            await disconnect_backend_safely(backend, logger=logger, context=f"download file info failure for '{path}'")
+            raise file_target_http_error(error) from error
 
         if file_info.type != "file":
             logger.warning(f"Path is not a file: connection_id={connection_id}, path='{path}', type={file_info.type}")
             await disconnect_backend_safely(backend, logger=logger, context=f"download directory check for '{path}'")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is not a file")
+            raise file_target_http_error(IsADirectoryError())
 
         # Stream the file
         headers = {"Content-Disposition": build_content_disposition("attachment", file_info.name)}
@@ -966,7 +1039,7 @@ async def download_file(
 
         logger.info(f"Streaming file for download: connection_id={connection_id}, path='{path}', size={file_info.size}")
         return StreamingResponse(
-            create_file_streamer(backend, path),
+            await prepare_file_streamer(backend, path),
             media_type="application/octet-stream",
             headers=headers,
         )
@@ -980,7 +1053,4 @@ async def download_file(
             f"error={type(e).__name__}: {e}",
             exc_info=True,
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to download file: {str(e)}",
-        )
+        raise file_target_http_error(e) from e

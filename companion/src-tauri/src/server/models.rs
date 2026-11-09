@@ -281,6 +281,8 @@ pub struct ArchiveExtractionResponse {
     pub members_processed: u64,
     pub members_completed: u64,
     pub members_skipped: u64,
+    pub encrypted_members_skipped: u64,
+    pub unsupported_compression_members_skipped: u64,
     pub members_failed: u64,
     pub files_extracted: u64,
     pub directories_created: u64,
@@ -320,6 +322,8 @@ pub struct ArchiveExtractionAggregate {
     pub members_processed: u64,
     pub members_completed: u64,
     pub members_skipped: u64,
+    pub encrypted_members_skipped: u64,
+    pub unsupported_compression_members_skipped: u64,
     pub members_failed: u64,
     pub files_extracted: u64,
     pub directories_created: u64,
@@ -491,7 +495,7 @@ pub struct DriveInfo {
 }
 
 /// Classification of a drive's physical/logical type.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum DriveType {
@@ -499,6 +503,7 @@ pub enum DriveType {
     Removable,
     Network,
     Virtual,
+    #[default]
     Unknown,
 }
 
@@ -507,6 +512,7 @@ pub enum DriveType {
 pub struct HealthResponse {
     pub status: String,
     pub paired: bool,
+    pub auth_protocol_version: u32,
 }
 
 /// Public pairing state for the current browser origin.
@@ -528,7 +534,7 @@ pub struct PairInitiateResponse {
 /// Response from `POST /api/pair/confirm`.
 #[derive(Debug, Serialize)]
 pub struct PairConfirmResponse {
-    pub secret: String,
+    pub paired: bool,
 }
 
 /// Public pairing status for the current browser origin.
@@ -566,6 +572,7 @@ pub struct CompanionLocalizationState {
 
 /// Response after attempting to sync browser localization.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct LocalizationSyncResponse {
     pub applied: bool,
     #[serde(flatten)]
@@ -622,10 +629,40 @@ pub struct ConflictInfo {
 
 /// Response for directory search (quick navigate).
 /// Matches the backend `DirectorySearchResult` Pydantic model.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScanProgress {
+    pub phase: &'static str,
+    pub parents_done: usize,
+    pub parents_queued: usize,
+    pub directories_found: usize,
+    pub started_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DirectoryIssueDetail {
+    pub path: String,
+    pub code: &'static str,
+    pub scope: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DirectorySearchResult {
     pub results: Vec<String>,
     pub total_matches: usize,
     pub cache_state: String,
     pub directory_count: usize,
+    pub search_contract_version: Option<u32>,
+    pub match_ranks: std::collections::HashMap<String, i64>,
+    pub matched_term_counts: std::collections::HashMap<String, usize>,
+    pub accepted_revision: Option<i64>,
+    pub coverage: Option<String>,
+    pub coverage_issue_count: usize,
+    pub issue_details_available: bool,
+    pub issue_details: Option<Vec<DirectoryIssueDetail>>,
+    pub issue_details_incomplete: bool,
+    pub last_verified_at_ms: Option<i64>,
+    pub status_message: Option<String>,
+    pub monitoring_state: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub scan_progress: Option<ScanProgress>,
 }

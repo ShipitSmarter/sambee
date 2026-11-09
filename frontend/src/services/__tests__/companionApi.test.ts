@@ -1,5 +1,5 @@
 import type { AxiosResponse } from "axios";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock axios before importing the API service
 vi.mock("axios", () => {
@@ -9,6 +9,7 @@ vi.mock("axios", () => {
     put: vi.fn(),
     delete: vi.fn(),
     defaults: { baseURL: "/api" },
+    getUri: vi.fn(() => "http://localhost:21549/api/browse/private-drive/directories"),
     interceptors: {
       request: {
         use: vi.fn(),
@@ -30,15 +31,22 @@ vi.mock("axios", () => {
 
 import axios from "axios";
 import apiService from "../api";
+import { authSession } from "../authSession";
+import { companionSession } from "../companionSession";
+import { COMPANION_SETTINGS_CHANGED_EVENT } from "../companionSettingsEvents";
+import { logger } from "../logger";
 
 const mockedAxios = vi.mocked(axios);
 const mockAxiosInstance = mockedAxios.create() as ReturnType<typeof mockedAxios.create> & {
   post: ReturnType<typeof vi.fn>;
 };
+const companionRequestInterceptor = vi.mocked(mockAxiosInstance.interceptors.request.use).mock.calls.at(-1)?.[0];
+const companionResponseInterceptors = vi.mocked(mockAxiosInstance.interceptors.response.use).mock.calls.at(-1);
 
 describe("Companion API", () => {
   beforeEach(() => {
     localStorage.clear();
+    companionSession.clearPairing();
     vi.clearAllMocks();
 
     // Mock window.location.origin
@@ -52,7 +60,98 @@ describe("Companion API", () => {
     vi.clearAllMocks();
   });
 
+  it.each([
+    {
+      status: 200,
+      code: undefined,
+      cancelled: false,
+      url: "/browse/private-drive/directories",
+      route: "/browse/{drive}/directories",
+      revision: 7,
+    },
+    {
+      status: 503,
+      code: "ERR_BAD_RESPONSE",
+      cancelled: false,
+      url: "/browse/private-drive/directories",
+      route: "/browse/{drive}/directories",
+      revision: undefined,
+    },
+    {
+      status: null,
+      code: "ERR_CANCELED",
+      cancelled: true,
+      url: "/browse/private-drive/directories",
+      route: "/browse/{drive}/directories",
+      revision: undefined,
+    },
+    {
+      status: 200,
+      code: undefined,
+      cancelled: false,
+      url: "/browse/private-drive/private-filename?token=private-token",
+      route: "/{route}",
+      revision: "private-revision",
+    },
+  ])(
+    "logs private-safe companion timing for status $status cancellation $cancelled",
+    async ({ status, code, cancelled, url, route, revision }) => {
+      const { AxiosError, AxiosHeaders } = await vi.importActual<typeof import("axios")>("axios");
+      assert(companionRequestInterceptor);
+      assert(companionResponseInterceptors?.[0]);
+      assert(companionResponseInterceptors?.[1]);
+      const debug = vi.spyOn(logger, "debug").mockImplementation(() => undefined);
+      vi.spyOn(companionSession, "getSigningHeaders").mockResolvedValue({ "X-Companion-Secret": "private-signature" });
+      vi.spyOn(performance, "now").mockReturnValueOnce(100).mockReturnValue(125);
+      const config = await companionRequestInterceptor({
+        method: "get",
+        url,
+        headers: new AxiosHeaders({ Authorization: "private-authorization" }),
+        params: { q: "private-terms", path: "private-path", hmac: "private-signed-value" },
+        data: { grant: "private-grant" },
+      });
+      const response = {
+        config,
+        status: status ?? 0,
+        statusText: "private-status-text",
+        headers: new AxiosHeaders(),
+        data: { accepted_revision: revision },
+      };
+      if (code) {
+        const error = new AxiosError("private-error-message", code, config, undefined, status === null ? undefined : response);
+        await expect(companionResponseInterceptors[1](error)).rejects.toBe(error);
+      } else {
+        expect(companionResponseInterceptors[0](response)).toBe(response);
+      }
+      expect(debug).toHaveBeenCalledWith(
+        "Companion API request finished",
+        {
+          method: "GET",
+          route,
+          status,
+          duration_ms: 25,
+          cancelled,
+          ...(typeof revision === "number" ? { accepted_revision: revision } : {}),
+        },
+        "companion"
+      );
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(debug.mock.calls)).not.toContain("private-");
+    }
+  );
+
   describe("getCompanionUri()", () => {
+    it("does not send URI themes after pairing", async () => {
+      await companionSession.storePairing();
+      mockAxiosInstance.post.mockResolvedValueOnce({ data: { uri_token: "paired-token", expires_in: 60 } } as AxiosResponse);
+      const uri = await apiService.getCompanionUri(
+        "conn-1",
+        "file.txt",
+        JSON.stringify({ id: "sambee-dark", mode: "dark", primary: { main: "#D4A020" } })
+      );
+      expect(uri).not.toContain("theme=");
+    });
+
     it("builds a sambee:// URI with server, token, connection, and path", async () => {
       mockAxiosInstance.defaults.baseURL = "/api";
       mockAxiosInstance.post.mockResolvedValueOnce({
@@ -132,5 +231,28 @@ describe("Companion API", () => {
       expect(uri).toContain("server=https%3A%2F%2Fapi.sambee.example.com");
       expect(uri).not.toContain("server=https%3A%2F%2Fsambee.example.com");
     });
+  });
+
+  it.each([false, true])("guards theme delivery notifications when identity changed=%s", async (changed) => {
+    const identity = vi.spyOn(authSession, "getIdentity").mockReturnValue({ epoch: 1, userId: "first-user" });
+    let complete!: (value: AxiosResponse) => void;
+    const write = vi.spyOn(mockAxiosInstance, "put").mockReturnValueOnce(
+      new Promise((resolve) => {
+        complete = resolve;
+      })
+    );
+    const notification = vi.fn();
+    window.addEventListener(COMPANION_SETTINGS_CHANGED_EVENT, notification);
+    try {
+      const pending = apiService.setSiteDefaultTheme("sambee-dark");
+      if (changed) identity.mockReturnValue({ epoch: 2, userId: "second-user" });
+      complete({ data: {} } as AxiosResponse);
+      await pending;
+      expect(notification).toHaveBeenCalledTimes(changed ? 0 : 1);
+    } finally {
+      window.removeEventListener(COMPANION_SETTINGS_CHANGED_EVENT, notification);
+      identity.mockRestore();
+      write.mockRestore();
+    }
   });
 });

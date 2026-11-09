@@ -1,11 +1,12 @@
 import { ArrowBack, ArrowForward, Close, Download, IosShare, RotateLeft, RotateRight, Search, ZoomIn, ZoomOut } from "@mui/icons-material";
-import { Box, Button, Chip, IconButton, TextField, Typography, useMediaQuery, useTheme } from "@mui/material";
+import { Box, Button, IconButton, TextField, Typography, useMediaQuery, useTheme } from "@mui/material";
 import React, { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { COMMON_SHORTCUTS, VIEWER_SHORTCUTS } from "../../config/keyboardShortcuts";
 import { withShortcut } from "../../hooks/useKeyboardShortcuts";
 import { PAGE_INPUT, RESPONSIVE_FONT_SIZE, TOOLBAR_HEIGHT, Z_INDEX } from "../../theme/constants";
 import { getViewerToolbarForegroundColors, VIEWER_DEFAULTS } from "../../theme/viewerStyles";
+import { CompactBadge as Chip } from "../CompactBadge";
 
 export const VIEWER_SEARCH_INPUT_ATTRIBUTE = "data-viewer-search-input";
 
@@ -111,6 +112,7 @@ export interface ViewerControlsProps {
   onDownload?: () => void;
   /** Share handler (optional) */
   onShare?: () => void;
+  shareControl?: React.ReactNode;
   /** Warm share payload on early user intent (optional) */
   onShareIntent?: () => void;
   /** Disable share button while work is in progress */
@@ -200,6 +202,7 @@ export const ViewerControls: React.FC<ViewerControlsProps> = ({
   toolbarAccessory,
   onDownload,
   onShare,
+  shareControl,
   onShareIntent,
   shareDisabled = false,
   controlsDisabled = false,
@@ -790,19 +793,22 @@ export const ViewerControls: React.FC<ViewerControlsProps> = ({
         )}
 
         {/* Share button */}
-        {config.share && onShare && isMobile && (
-          <IconButton
-            color="inherit"
-            onClick={onShare}
-            onPointerDown={onShareIntent}
-            aria-label={t("common.actions.share")}
-            title={t("common.actions.share")}
-            size="small"
-            disabled={controlsDisabled || shareDisabled}
-          >
-            <IosShare fontSize="small" />
-          </IconButton>
-        )}
+        {config.share &&
+          isMobile &&
+          (shareControl ??
+            (onShare && (
+              <IconButton
+                color="inherit"
+                onClick={onShare}
+                onPointerDown={onShareIntent}
+                aria-label={t("common.actions.share")}
+                title={t("common.actions.share")}
+                size="small"
+                disabled={controlsDisabled || shareDisabled}
+              >
+                <IosShare fontSize="small" />
+              </IconButton>
+            )))}
 
         {toolbarAccessory}
 

@@ -11,10 +11,16 @@ use serde_json::Value;
 
 /// Stable error code used while browser pairing is still awaiting companion approval.
 pub const PAIR_CONFIRMATION_PENDING_CODE: &str = "pair_confirmation_pending";
-/// Stable error code for a recent local file that no longer exists.
-pub const RECENT_FILE_TARGET_MISSING_CODE: &str = "recent_file_target_missing";
+pub const DIRECTORY_NOT_FOUND_CODE: &str = "directory_not_found";
+pub const DIRECTORY_ACCESS_DENIED_CODE: &str = "directory_access_denied";
+pub const NOT_A_DIRECTORY_CODE: &str = "not_a_directory";
+pub const DIRECTORY_UNAVAILABLE_CODE: &str = "directory_unavailable";
+pub const ITEM_NOT_FOUND_CODE: &str = "item_not_found";
+pub const FILE_ACCESS_DENIED_CODE: &str = "file_access_denied";
+pub const NOT_A_FILE_CODE: &str = "not_a_file";
+pub const FILE_TIMEOUT_CODE: &str = "file_timeout";
+pub const FILE_UNAVAILABLE_CODE: &str = "file_unavailable";
 /// Stable error code for a recent local target that is no longer a regular file.
-pub const RECENT_FILE_TARGET_NOT_FILE_CODE: &str = "recent_file_target_not_file";
 /// Stable error code for a confirmed failure to launch a local native application.
 pub const RECENT_FILE_NATIVE_LAUNCH_FAILED_CODE: &str = "recent_file_native_launch_failed";
 /// Stable error code for a link whose target no longer exists.
@@ -32,28 +38,28 @@ pub const LOCAL_ARCHIVE_CREATION_PARTIAL_CODE: &str = "local_archive_creation_pa
 /// Stable V2 archive error code when a source identity no longer matches its preflight manifest.
 pub const ARCHIVE_SOURCE_CHANGED_CODE: &str = "source_changed";
 
-fn archive_v2_contract_code(code: &'static str, fallback: &'static str) -> &'static str {
-    match code {
-        "invalid_manifest"
-        | "invalid_checkpoint"
-        | "invalid_contract_version"
-        | "invalid_member_path"
-        | "collision"
-        | "partial_output"
-        | "source_changed"
-        | "transport_failure"
-        | "cancelled"
-        | "idempotency_conflict"
-        | "capability_invalid"
-        | "capability_version_mismatch"
-        | "invalid_request"
-        | "authentication_invalid"
-        | "authorization_denied"
-        | "not_found"
-        | "invalid_operation_state"
-        | "operation_unavailable" => code,
-        _ => fallback,
-    }
+pub(super) fn archive_v2_contract_code(code: &str, fallback: &'static str) -> &'static str {
+    const CODES: &[&str] = &[
+        "invalid_manifest",
+        "invalid_checkpoint",
+        "invalid_contract_version",
+        "invalid_member_path",
+        "collision",
+        "partial_output",
+        "source_changed",
+        "transport_failure",
+        "cancelled",
+        "idempotency_conflict",
+        "capability_invalid",
+        "capability_version_mismatch",
+        "invalid_request",
+        "authentication_invalid",
+        "authorization_denied",
+        "not_found",
+        "invalid_operation_state",
+        "operation_unavailable",
+    ];
+    CODES.iter().copied().find(|candidate| *candidate == code).unwrap_or(fallback)
 }
 
 /// V2-only failure that always serializes to the language-neutral archive contract envelope.
@@ -320,11 +326,11 @@ mod tests {
         response::IntoResponse,
     };
 
-    use super::{ApiError, ArchiveV2Error, ArchiveV2Json, ArchiveV2NoQuery, RECENT_FILE_TARGET_NOT_FILE_CODE};
+    use super::{ApiError, ArchiveV2Error, ArchiveV2Json, ArchiveV2NoQuery, NOT_A_FILE_CODE};
 
     #[tokio::test]
     async fn coded_bad_request_includes_the_permanent_target_code() {
-        let response = ApiError::bad_request_code("Not a file", RECENT_FILE_TARGET_NOT_FILE_CODE).into_response();
+        let response = ApiError::bad_request_code("Not a file", NOT_A_FILE_CODE).into_response();
 
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -332,7 +338,7 @@ mod tests {
             .expect("response body should be readable");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("response body should be JSON"),
-            serde_json::json!({ "detail": "Not a file", "code": RECENT_FILE_TARGET_NOT_FILE_CODE })
+            serde_json::json!({ "detail": "Not a file", "code": NOT_A_FILE_CODE })
         );
     }
 

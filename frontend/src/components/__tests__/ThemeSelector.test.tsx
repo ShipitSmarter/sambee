@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setLocale } from "../../i18n";
@@ -56,6 +56,7 @@ describe("ThemeSelector Component", () => {
   });
 
   afterEach(async () => {
+    cleanup();
     await setLocale("en");
   });
 
@@ -192,7 +193,7 @@ describe("ThemeSelector Component", () => {
       await user.click(screen.getByText(/Sambee dark/i).closest("button")!);
 
       expect(screen.getByRole("status", { name: "Saving setting" })).toBeInTheDocument();
-      expect(screen.getAllByRole("button").filter((button) => button.closest(".MuiCard-root"))).toSatisfy((cards) =>
+      expect(screen.getAllByRole("button").filter((button) => button.closest(".MuiCard-root"))).toSatisfy((cards: HTMLElement[]) =>
         cards.every((card) => card.hasAttribute("disabled"))
       );
     });

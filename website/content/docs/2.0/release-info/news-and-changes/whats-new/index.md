@@ -1,0 +1,205 @@
++++
+title = "What's New"
++++
+
+## ⚠️ Action Required
+
+Sambee's GitHub repository was moved to an organization account. This makes it necessary that you update the Docker Compose image URL to `ghcr.io/sambee-app/sambee` in your Docker Compose file (see the [Docker deployment docs](../../../admin-guide/installation-and-deployment/deploy-sambee-with-docker/) for details).
+
+## Theme Editor
+
+UI themes are an integral part of an app's visual presentation. As so often, flexibility is key. Some like it dark, others colorful, some require high-contrast, others prefer muted colors.
+
+Sambee now has a multi-layer theme system. It differentiates between built-in themes, site-wide themes which only admins can manage, and users' personal themes. Any user can modify existing themes for their own use; admins can also provide themes for other users on the same Sambee server and designate a default theme for new users.
+
+With Sambee's new theme editor, users can change all theme colors via hex values or the integrated RGBA color picker (which covers transparency in addition to color). Themes can be imported and exported, too.
+
+## File List
+
+### Mouse Selection on Desktop
+
+Previous versions of Sambee introduced multi-selection for mobile users and keyboard aficionados on desktop. Mouse coverage was lacking. That has been rectified now: Selecting multiple files with a mouse is now straightforward. Click a file or folder icon to select it, then Shift-click another icon to add everything in between without losing your earlier selections. The pane's status bar keeps the count in view.
+
+### New Keyboard Shortcuts
+
+- New tab: <kbd>Ctrl+Alt+T</kbd> opens the current location in a new browser tab.
+- Pane location: <kbd>Ctrl+Left</kbd> sets the left pane to the right pane's location, and <kbd>Ctrl+Right</kbd> sets the right pane to the left pane's location.
+- Item selection: keyboard shortcuts now include <kbd>Shift+Home</kbd> and <kbd>Shift+End</kbd>.
+
+### Other Changes
+
+- Sambee no longer uses <kbd>Ctrl+1</kbd> and <kbd>Ctrl+2</kbd> for pane focus so as not to block these shortcuts for browser tab selection.
+- Native mobile sharing is now available for single or multiple files from the file list.
+- Single-file downloads are now streamed directly without buffering in memory. This speeds up downloads and effectively removes limits imposed by file size.
+
+### Bugfixes
+
+#### File Copy/Move Fixes
+
+- Uploads and copy or move operations no longer interfere with each other's conflict decisions.
+- Moving files between SMB connections no longer leaves the original in place when it should have been deleted.
+- SMB moves now protect the source from concurrent edits and renames, preventing deletion of changes that weren't copied yet.
+- Overwriting an existing SMB file now replaces it atomically instead of failing.
+- Cancelling a move after copying finishes, but before source deletion starts, now correctly reports that both copies were kept.
+- Transfer results now show when a file was copied or replaced, even if removing or checking the original fails.
+- When transferring a folder, a problem with one file no longer hides files already copied, moved, or replaced from the summary.
+- Interrupted SMB moves now release files safely, without leaving them open or interrupting work still in progress.
+- Pressing Enter after a transfer finishes no longer starts the same transfer again.
+- SMB file metadata timezones and ZIP creation now consistently use UTC.
+- SMB connection idle cleanup and failed-request duration logs now use a monotonic clock, so daylight saving time and system clock changes do not affect elapsed-time calculations.
+
+#### SMB Change Monitoring Fixes
+
+File list:
+
+- File-list monitoring now watches only immediate children, so changes deeper in a folder don't trigger unnecessary refreshes.
+- When changes happen, the file list is now refreshed in the background.
+- File list refreshes are now coalesced and rate-limited.
+
+Directory cache for instant navigation:
+
+- Quick directory navigation keeps its existing index when a background scan times out or fails.
+- Background scans keep the live directory index when a removal or rename overlaps a read, including when its notification arrives late. This prevents changes from being applied twice when a folder's name is reused.
+- Changing a connection's target or sign-in details no longer reuses directory suggestions from its old configuration.
+- Directory indexing excludes junctions, other reparse descendants, and DFS shares to prevent unsafe traversal.
+- Startup verification and scheduled directory scans now stop cleanly when their cache is removed.
+
+#### Other Fixes
+
+- Invalid file browser URLs no longer break the page or prevent the other pane from loading.
+- Overlapping download requests were allowed.
+- A failed background connection refresh no longer hides a recovered file listing.
+- Renaming a file to a name that differed by case only failed on local drive connections.
+
+## OpenID Connect (OIDC)
+
+### Refresh Token & `offline_access` Are Now Optional
+
+Many identity providers require the `offline_access` scope to issue refresh tokens, but some (like OneLogin) rejects that scope in the authorization code flow and can issue a refresh token without it when refresh tokens are enabled for the app.
+
+Sambee uses a provider refresh token when one is returned, whether or not `offline_access` was requested. If no refresh token is returned, Sambee can continue issuing short-lived API tokens from the browser session for up to 8 hours by default (configurable from 1 to 24 hours). After Sambee's user session expires, the user must sign in through the identity provider again.
+
+### Re-Login Broadcast to Other Open Tabs
+
+When an OIDC login is necessary, all Sambee browser tabs switch to the login page. After a successful login in one tab, that tab now broadcasts a login complete hint. When other tabs on the login page receive that hint, they return to their respectice previous URLs.
+
+### Bugfixes
+
+- OIDC login failures after password reset: OIDC login now completes reliably after an administrator resets the account’s password. Sambee ignores responses from the previous browser session while the new login finishes, reloads the user’s themes and settings, and returns to the file browser instead of the login page.
+- Sambee always removed a trailing slash from the issuer URL, which could cause errors with providers like Authentik. Trailing slashes are now left in place.
+
+## Text and Markdown Editors
+
+### Text Viewer and Editor Combined
+
+Sambee's text viewer and text editor are now combined into a single component. Text files now open directly in the editor. If write mode cannot be enabled, text editor operates in read-only mode and a notification is shown.
+
+As part of this change, Sambee got a consistent toast-based notification system for info, warning, and error messages.
+
+### Syntax Highlighting and Rendering Performance Optimization
+
+Sambee now uses a consolidated syntax highlighting system throughout all text and Markdown rendering surfaces: text editor, Markdown editor, fenced code blocks in Markdown viewer and Markdown editor. The syntax highlighting system is integrated with the theming system; highlight colors are now part of each theme and can be edited in the new theme editor.
+
+Syntax highlighting is available for a wide range of languages and file types ([docs](../../../user-guide/reference/text-file-support-and-syntax-highlighting/)).
+
+Text editor and Markdown editor performance was significantly boosted, especially for long documents. This was achieved through virtualization and viewport rendering.
+
+## Markdown Viewer
+
+### Print and Save as PDF
+
+When you print or save as PDF from the browser, the Markdown viewer reformats the full rendered document to fit the page, spanning multiple pages as needed. A new print icon in the top bar makes the new functionality discoverable.
+
+### Other Changes
+
+- Closing the editor by clicking the X now works in the same way as pressing <kbd>Esc</kbd>: it returns to the viewer. From there, another click returns to the file list.
+- When reloading a browser tab with an editor, Sambee now recovers the file lock. This prevents the error `Unable to enter edit mode. File is locked for editing by <username>`.
+
+## Quick Bar: Directory Navigation v2
+
+Directory search and navigation in the quick bar was put on a new foundation:
+
+- Local drives are now indexed, too.
+- The indexing process is now faster and more resilient.
+- The directory index storage was upgraded from JSONL to SQLite databases.
+
+## Miscellaneous
+
+### Native Mobile Sharing
+
+Consolidated the native mobile sharing implementation across the file list and image, PDF, text, and Markdown viewers and editors. When sharing fails, a dialog with details can be invoked to facilitate issue reporting.
+
+Text editor and Markdown viewer/editor now have an option to share the current content as text as an alternative to sharing the stored file. This helps circumvent Chrome restrictions that prevent sharing file types such as Markdown.
+
+Image and PDF viewers alway share the displayed content, which may have been normalized for viewing in the browser.
+
+### Full Browser History Navigation
+
+Every navigation step is now encoded in the URL and recorded in browser history. This enables browser back/forward navigation across the entire Sambee workspace, including the file list, viewers, and editors.
+
+### Local Drive Acess
+
+Sambee now checks local-drive access before saying the browser is ready to use Companion. If the check fails, Local Drives settings distinguish between an outdated Companion, an outdated Sambee page, and a pairing that needs to be restored.
+
+When Companion rejects a request while browsing a local drive, the file list points to the affected pane and offers a way to reload Sambee or open Local Drives, depending on what went wrong.
+
+### Unencrypted HTTP Support
+
+Sambee now deals with unencrypted HTTP explicitly:
+
+- Companion pairing and operations are unavailable.
+- File copying caused a `crypto.randomUUID` error. This has been fixed by implementing a fallback.
+- File uploading would show `outcome uncertain` and not upload files on HTTP/1.1 connections (even over HTTPS). This has been fixed by sending files directly instead of using a streamed request body, so uploads work on HTTP/1.1 while still showing progress.
+- Copying to the clipboard (used in Settings) is now disabled.
+
+HTTP for development on `localhost` is treated as secure by browsers and continues to be supported by Sambee.
+
+### Supported Browser Detection
+
+If your browser is too old or lacks features Sambee needs, you'll now see a clear message instead of a blank page. The message identifies missing capabilities and links to the browser requirements so you can choose a supported browser.
+
+### Password Login
+
+- When an admin configures a user to require a password change, that change is now enforced upon the next password login.
+- Local usernames are now evaluated case-insensitively.
+- The password field got an option to reveal the password.
+
+### Settings
+
+- User Management: Table column content could overflow into the next row. This was fixes with a comprehensive layout revision.
+
+## Under the Hood
+
+### Security Review
+
+A security review resulted in the following improvements:
+
+- OIDC login now binds the callback and login grant to the browser that started the login flow, preventing a grant from being redeemed in another browser.
+- Only admins can list and download uploaded mobile logs; signed-in users can still upload logs for troubleshooting.
+- Companion requests now use signatures tied to the HTTP method and requested URL, so a signature can't be reused for another request.
+- Mobile log uploads have a size limit, and stored logs are pruned when they exceed the storage budget.
+- HTML, XHTML, and SVG files, including archive members, download instead of running as active content in the viewer.
+
+### Other Changes
+
+- The backend's Python environment was upgraded from 3.13 to 3.14.
+- Fixed the container startup warning: `AuthlibDeprecationWarning: The httpx module is deprecated; please use httpx2 instead.`
+- Reduced the Frontend's JavaScript chunk size.
+
+### Dependency Security
+
+- Updated all dependencies with known issues or vulnerabilities to fixed versions.
+- Pinned all third-party GitHub Actions workflows to commit SHAs.
+- Frontend: removed `patch-package` to get rid of vulnerable transisitve dependency `braces`.
+- Backend: PIP is now upgraded before use and uninstalled from the Docker image afterwards.
+
+### Frontend Type Correctness
+
+Type correctness of frontend code and tests is now enforced. As part of this implementation, 1,152 diagnostics across 162 files were fixed: 840 in tests, 311 in application code,
+and one in an imported browser-test helper.
+
+## Internals
+
+- Companion build for Windows: Authenticode signing was removed from PR check builds and only remains on release workflows.
+- GitHub Actions: replaced `pull_request_target` as it will be removed on public repositories by default in November.
+- GitHub Actions: cache retention optimization.

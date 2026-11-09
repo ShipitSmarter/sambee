@@ -6,15 +6,13 @@ title = "What's New"
 
 ### File Search
 
-Sambee's quick bar is getting closer to the goal of becoming a universal search and navigation tool with the addition of file search (keyboard shortcut: <kbd>/</kbd>).
+With the addition of file search (keyboard shortcut: <kbd>/</kbd>), Sambee's quick bar is becoming a universal search and navigation tool.
 
-File search complements the existing directory navigation (keyboard shortcut: <kbd>Ctrl+K</kbd>) by providing instant access to recently opened files across directories as well as files in the current directory matching a user-specified search term.
-
-File search supercedes file filtering mode which was removed.
+File search complements the existing directory navigation (keyboard shortcut: <kbd>Ctrl+K</kbd>) by providing instant access to recently opened files across directories. File search supersedes file filtering mode, which was removed.
 
 ### Directory Navigation History
 
-Directory navigation gets a history functionality that makes it possible to instantly navigate to the folders you need most.
+Directory navigation now has a history. When you're looking for something, just open the quick bar in directory nav mode and it'll probably already be there. If not, typing a few characters of the name should bring it up in milliseconds.
 
 ### Other Changes
 
@@ -62,9 +60,17 @@ Sambee lets you navigate seamlessly into ZIP archives the same way you'd navigat
 
 The addition of ZIP archive inspection was the right opportunity to implement storage and content provider abstraction layers. These new abstractions centralize knowledge of storage backends (e.g., SMB, Companion) and how to work with the data on the storage (e.g., regular files, archives), respectively. Introducing these abstractions significantly improves the product's architecture and will greatly simplify adding additional backends or container file types in the future.
 
+### Upload & Download
+
+A product like Sambee needs efficient ways to get files and folders in and out of the system. To upload files or folders to SMB or local drive destinations, either drag them to Sambee's file browser or select the **Upload** (<kbd>Ctrl+U</kbd>) command in the bottom toolbar. To download files or folders, choose files and/or folders and select the **Download** (<kbd>Ctrl+D</kbd>) command in the bottom toolbar.
+
+Downloading creates a temporary ZIP archive from the selected files and folders, which is then streamed to the browser and subsequently deleted. Sambee allows downloading from all locations: from SMB connections, from local drives, and even from inside ZIP archives.
+
 ### Local Drives: Resolve .LNK Files
 
-Shortcuts (`.lnk` files), symlinks, and junctions on local drives now show the target path (pulled in asynchronously after the directory list has loaded; we don't want to give up on that snappy UI, after all). Paths are sensibly shortened to fit the available row width. When activated, file targets are opened whereas directory targets are navigated to.
+Shortcuts (`.lnk` files), symlinks, and junctions on local drives now show the target path in the status bar. The target information is pulled in asynchronously after the directory list has loaded - we don't want to give up on that snappy UI, after all. Paths are sensibly shortened to fit the available row width.
+
+When activated, file targets are opened whereas directory targets are navigated to.
 
 ### File Copy and Move: Overwrite Options
 
@@ -72,11 +78,11 @@ Copy and move operations can now overwrite an existing file or replace it only w
 
 ### Command Toolbar (Desktop) & Per-Row Actions (Mobile)
 
-A new toolbar at the bottom of the file list makes available commands discoverable. On small screens, typical mobile controls are used instead: a "+" icon to create new files or directories, per-row item actions menus to access commands that operate on individual files or folders.
+A new toolbar at the bottom of the file list makes available commands discoverable. On small screens, typical mobile controls are used instead: a "+" icon to create new files or directories and per-row action menus to access commands that operate on individual files or folders.
 
 ### Item Selection on Small Screens (Mobile)
 
-On phones and other small screen devices, files and folders can be selected either through a long press or via the item action menu. Once one item is selected, Sambee switches to multi-selection mode where additional items can be selected through a single tap. An action bar at the bottom of the sceen provides access to commands.
+On phones and other small screen devices, files and folders can be selected either through a long press or via the item action menu. Once one item is selected, Sambee switches to multi-selection mode where additional items can be selected through a single tap. An action bar at the bottom of the screen provides access to commands.
 
 ### File Metadata on Small Screens (Mobile)
 
@@ -84,16 +90,17 @@ On phones and other small screen devices, file size and modification time are no
 
 ### Other Changes
 
-- When keyboard shortcuts are ignored Sambee now shows a toast message to make the user unobtrusively aware of the fact.
-- Keyboard navigation: removed delay after entering a new directory
-- Typeahead buffer: cleared when <kbd>Esc</kbd> is pressed
-- The status bar is now always shown
+- Added a toolbar button to switch between single-pane and dual-pane modes.
+- When keyboard shortcuts are ignored (because inapplicable in the current situation), Sambee now shows a toast message to make the user unobtrusively aware of the fact.
+- Keyboard navigation: removed delay after entering a new directory.
+- Typeahead buffer: cleared when <kbd>Esc</kbd> is pressed.
+- The status bar is now always shown.
 
 ## Settings
 
 ### No More Save Button
 
-Clicking a save button at the bottom of the page after adjusting some configuration settings is easily forgotten. So best get rid of that pesky save button altogether. Modern UIs like Sambee's are clever enough to apply config changes automatically and confer to the user that saving happend through subtle visual cues.
+Clicking a save button at the bottom of the page after adjusting some configuration settings is easily forgotten. So best get rid of that pesky save button altogether. Modern UIs like Sambee's are clever enough to apply config changes automatically and show the user that saving happened through subtle visual cues.
 
 ### New Settings
 
@@ -104,6 +111,10 @@ The settings gained a new category page:
 File browser settings:
 
 - **Touch-friendly file selection:** controls how mobile-style file selection is enabled (auto, always on, off).
+
+System settings:
+
+- **Temporary archive download size limit:** sets the maximum size of the temporary ZIP archive created when multiple items are downloaded.
 
 ### Other Changes
 

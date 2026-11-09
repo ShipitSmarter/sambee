@@ -49,6 +49,62 @@ type UpdateActionState =
   | { kind: "installed"; version: string | null; checkedChannel: CompanionUpdateChannel }
   | { kind: "error"; message: string; checkedChannel: CompanionUpdateChannel };
 
+interface NativeDirectoryPolicyStatus {
+  status: string;
+  authoritative_origin: string | null;
+  sections: { directory_index?: { marker: string } };
+  message: string | null;
+}
+
+function DirectoryPolicyPreferences() {
+  const [status, setStatus] = useState<NativeDirectoryPolicyStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try {
+      setStatus((await invoke<NativeDirectoryPolicyStatus>("get_native_directory_policy_status")) ?? null);
+      setError(null);
+    } catch {
+      setError(translate("preferences.directoryPolicy.unavailable"));
+    }
+  }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  return (
+    <div class="preferences__section">
+      <span class="preferences__section-title">{translate("preferences.directoryPolicy.title")}</span>
+      <div class="preferences__field">
+        <span class="preferences__hint" role="status">
+          {error ??
+            status?.message ??
+            (!status
+              ? translate("preferences.directoryPolicy.loading")
+              : status.authoritative_origin
+                ? translate("preferences.directoryPolicy.active")
+                : translate("preferences.directoryPolicy.defaults"))}
+        </span>
+        {status?.authoritative_origin && (
+          <dl class="preferences__status-grid">
+            <div class="preferences__status-row">
+              <dt class="preferences__status-label">{translate("preferences.directoryPolicy.owner")}</dt>
+              <dd class="preferences__status-value preferences__status-value--code">{status.authoritative_origin}</dd>
+            </div>
+            <div class="preferences__status-row">
+              <dt class="preferences__status-label">{translate("preferences.directoryPolicy.revision")}</dt>
+              <dd class="preferences__status-value">{status.sections.directory_index?.marker ?? "-"}</dd>
+            </div>
+          </dl>
+        )}
+        <div class="preferences__confirm-actions">
+          <button type="button" class="preferences__confirm-btn preferences__confirm-btn--ghost" onClick={() => void load()}>
+            {translate("preferences.directoryPolicy.refresh")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -459,6 +515,9 @@ export function Preferences({ onClose }: PreferencesProps) {
         </div>
       </div>
 
+      <hr class="preferences__divider" />
+
+      <DirectoryPolicyPreferences />
       <hr class="preferences__divider" />
 
       {/* ── Localization Sync ── */}

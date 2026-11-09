@@ -18,6 +18,7 @@ export interface User {
   role?: UserRole;
   is_active?: boolean;
   must_change_password?: boolean;
+  password_change_required?: boolean;
   expires_at?: string | null;
   access_token_expires_at?: string;
   created_at?: string;
@@ -33,6 +34,7 @@ export interface CurrentAccount extends User {
   has_local_password: boolean;
   identity_source: AccountIdentitySource;
   password_change_available: boolean;
+  password_change_required: boolean;
   browser_session_management_available: boolean;
   oidc_provider_name: string | null;
   current_session: CurrentAccountSession | null;
@@ -51,6 +53,8 @@ export interface AuthToken extends User {
   access_token: string;
   token_type: string;
   oidc_refresh_generation?: number;
+  oidc_session_capability?: "renewable" | "reauthorization_only";
+  oidc_session_expires_at?: string;
   return_path?: string;
 }
 
@@ -137,6 +141,7 @@ export interface AdminUserListResponse {
   items: AdminUser[];
   total: number;
   summary: AdminUserListSummary;
+  username_conflicts?: string[][];
 }
 
 export interface AdminUserCreateInput {
@@ -245,6 +250,7 @@ export interface PdfAdvancedSettings {
 export interface AdvancedSystemSettings {
   preprocessors: Record<string, PreprocessorAdvancedSettings>;
   pdf?: PdfAdvancedSettings;
+  temporary_archive_download_size_bytes?: IntegerSystemSetting;
 }
 
 export type AdvancedSystemSettingsUpdate = { field: string; value: number };
@@ -256,6 +262,49 @@ export interface FileSearchSettings {
   result_limit: number;
   excluded_categories: FileSearchExclusionCategory[];
   excluded_extensions: string[];
+}
+export type DirectoryIndexPolicyScope = "backend" | "companion";
+export const DIRECTORY_INDEX_POLICY_FIELDS = [
+  "disk_budget_bytes",
+  "inactive_retention_seconds",
+  "max_retained_inactive_sources",
+  "page_cache_kib",
+  "healthy_verification_seconds",
+  "degraded_verification_seconds",
+] as const;
+export type DirectoryIndexPolicyField = (typeof DIRECTORY_INDEX_POLICY_FIELDS)[number];
+export type DirectoryIndexPolicy = Record<DirectoryIndexPolicyField, number> & { version: 1 };
+export interface DirectoryIndexSettings {
+  scope: DirectoryIndexPolicyScope;
+  policy: DirectoryIndexPolicy;
+  backend_identity: string;
+  revision: number;
+  fields: Record<DirectoryIndexPolicyField, IntegerSystemSetting>;
+}
+export type DirectoryIndexSettingUpdate = { field: DirectoryIndexPolicyField; value: number };
+
+export interface DirectoryPolicyGrantBinding {
+  companion_id: string;
+  challenge: string;
+  origin: string;
+}
+export interface DirectoryPolicyGrant {
+  grant: string;
+  expires_in_seconds: number;
+  revision: number;
+  backend_identity: string;
+}
+export interface CompanionDirectoryPolicyStatus {
+  version: number;
+  companion_id: string;
+  status: "unowned" | "applied" | "pending_local_approval" | "pending_delivery" | "redeeming" | "denied" | "failed" | "owner_conflict";
+  owner_origin: string | null;
+  backend_identity: string | null;
+  effective_revision: number | null;
+  policy: DirectoryIndexPolicy;
+  challenge: string | null;
+  approved: boolean;
+  message: string | null;
 }
 
 export interface FileSearchSettingsRead {
@@ -275,11 +324,15 @@ export interface RecentFile {
   path: string;
   file_name: string;
   last_opened_at: string;
+  usage_score?: number;
+  match_rank?: number;
+  matched_term_count?: number;
 }
 
 export interface RecentFileSearchResponse {
   results: RecentFile[];
   result_limit?: number;
+  search_contract_version?: number;
 }
 
 export interface RecentDirectory {
@@ -287,11 +340,15 @@ export interface RecentDirectory {
   connection_id: string;
   path: string;
   last_visited_at: string;
+  usage_score?: number;
+  match_rank?: number;
+  matched_term_count?: number;
 }
 
 export interface RecentDirectorySearchResponse {
   results: RecentDirectory[];
   result_limit: number;
+  search_contract_version?: number;
 }
 
 export interface RecentFileValidationError {
@@ -357,6 +414,7 @@ export type NetworkSettingsUpdate = { field: "public_url"; value: string } | { f
 export interface CurrentUserSettings {
   appearance: {
     theme_id: string;
+    has_theme_override?: boolean;
     custom_themes: ThemeConfig[];
   };
   localization: {
@@ -381,7 +439,6 @@ export interface CurrentUserSettings {
 
 export type CurrentUserSettingsUpdate =
   | { field: "appearance.theme_id"; value: string }
-  | { field: "appearance.custom_themes"; value: ThemeConfig[] }
   | { field: "localization.language"; value: LanguagePreference }
   | { field: "localization.regional_locale"; value: RegionalLocalePreference }
   | { field: "browser.quick_nav_include_dot_directories"; value: boolean }
@@ -550,11 +607,39 @@ export interface LocalLinkTargetListing {
   items: LocalLinkTargetResolution[];
 }
 
+export interface ScanProgress {
+  phase: "building" | "updating" | "idle";
+  parents_done: number;
+  parents_queued: number;
+  directories_found: number;
+  started_at_ms: number;
+}
+
+export interface DirectoryIssueDetail {
+  path: string;
+  code: "access_denied" | "unsupported_encoding" | "unsafe_traversal" | "scan_failed";
+  scope?: "directory" | "contents";
+}
+
 export interface DirectorySearchResult {
+  search_contract_version?: number | null;
   results: string[];
+  match_ranks?: Record<string, number>;
   total_matches: number;
-  cache_state: "empty" | "building" | "ready" | "updating";
+  cache_state: "empty" | "opening" | "building" | "ready" | "updating";
   directory_count: number;
+  matched_term_counts?: Record<string, number>;
+  accepted_revision?: number | null;
+  coverage?: "partial" | "complete" | "uncertain" | null;
+  coverage_issue_count?: number;
+  issue_details_available?: boolean;
+  issue_details?: DirectoryIssueDetail[] | null;
+  issue_details_incomplete?: boolean;
+  last_verified_at_ms?: number | null;
+  status_message?: string | null;
+  monitoring_state?: "starting" | "healthy" | "recovering" | "unavailable" | null;
+  retry_after_ms?: number | null;
+  scan_progress?: ScanProgress | null;
 }
 
 export interface EditLockInfo {
@@ -621,6 +706,7 @@ export interface OidcRoleMappings {
 export interface OidcReviewedPolicy {
   sign_in_mode: SignInMode;
   interactive_reauthentication_max_age_days: number;
+  no_refresh_session_limit_hours: number;
   admission_mode: OidcAdmissionMode;
   admission_groups: string[];
   role_assignment_mode: OidcRoleAssignmentMode;
@@ -641,6 +727,7 @@ export interface OidcConfigurationCandidate {
   groups_claim: string | null;
   sign_in_mode: SignInMode;
   interactive_reauthentication_max_age_days: number;
+  no_refresh_session_limit_hours: number;
   admission_mode: OidcAdmissionMode;
   admission_groups: string[];
   role_assignment_mode: OidcRoleAssignmentMode;
@@ -697,6 +784,7 @@ export interface OidcReplacementMapping {
 
 export interface OidcTestedIdentity {
   flow_id: string;
+  refresh_token_returned: boolean;
   candidate: RedactedOidcConfiguration;
   replacement_mappings: OidcReplacementMapping[];
   expected_identity_mapping_revision: number | null;
@@ -759,10 +847,15 @@ export interface OidcMappingValidationDetail {
 }
 
 // API Error type for axios errors
+export interface ImagePreviewTooLargeError {
+  code: "image_preview_too_large";
+  message: string;
+}
+
 export interface ApiError {
   response?: {
     data?: {
-      detail?: string | ConflictInfo | OidcMappingValidationDetail | RecentFileValidationError;
+      detail?: string | ConflictInfo | OidcMappingValidationDetail | RecentFileValidationError | ImagePreviewTooLargeError;
       code?: string;
     };
     status?: number;

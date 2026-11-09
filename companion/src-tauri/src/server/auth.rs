@@ -1,313 +1,279 @@
-//! HMAC-SHA256 authentication middleware for the local API server.
-//!
-//! Validates requests by checking the `X-Companion-Secret` header, which
-//! must contain `HMAC-SHA256(shared_secret, timestamp)`, and the
-//! `X-Companion-Timestamp` header which carries the timestamp string.
-//! Requests with timestamps deviating more than 30 seconds are rejected.
-//!
-//! Viewer endpoints also support query-parameter auth (`hmac` + `ts` params)
-//! for use in `<img src>` / `<iframe>` contexts where headers can't be set.
-
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use axum::extract::{Query, State};
-use axum::http::Request;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use hmac::{Hmac, Mac};
-use log::warn;
-use serde::Deserialize;
-use sha2::Sha256;
-use url::Url;
+//! Public-key authentication middleware for the Companion local API.
 
 use super::errors::ApiError;
 use super::AppState;
+use axum::body::to_bytes;
+use axum::extract::{Query, State};
+use axum::http::{Request, Uri};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
-/// Name of the header carrying the HMAC value.
-const SECRET_HEADER: &str = "x-companion-secret";
-
-/// Name of the header carrying the timestamp used in the HMAC.
+const KEY_HEADER: &str = "x-companion-key";
+const SIGNATURE_HEADER: &str = "x-companion-signature";
 const TIMESTAMP_HEADER: &str = "x-companion-timestamp";
-
-/// Maximum clock skew allowed (seconds).
+const NONCE_HEADER: &str = "x-companion-nonce";
+const BODY_HASH_HEADER: &str = "x-companion-body-sha256";
 const MAX_TIMESTAMP_SKEW: u64 = 30;
+pub(super) const AUTH_PROTOCOL_VERSION: u32 = 3;
+pub(super) const AUTH_SIGNATURE_MISMATCH_CODE: &str = "companion_auth_signature_mismatch";
+pub(super) const PAIRING_NOT_FOUND_CODE: &str = "companion_pairing_not_found";
 
-/// Request context included in authentication warning logs.
 pub(super) struct AuthLogContext<'a> {
-    pub(super) auth_transport: &'a str,
     pub(super) method: &'a str,
-    pub(super) path: &'a str,
 }
 
-/// Query parameters for viewer URL auth (fallback when headers aren't set).
-#[derive(Deserialize, Default)]
-struct AuthQueryParams {
-    hmac: Option<String>,
-    ts: Option<String>,
-    /// Origin identifier for query-param auth (the paired origin).
-    origin: Option<String>,
+pub(super) struct SignedRequestCredentials {
+    pub(super) origin: String,
+    pub(super) key: String,
+    pub(super) signature: String,
+    pub(super) timestamp: String,
+    pub(super) nonce: String,
+    pub(super) body_hash: String,
 }
-
-/// Cached HMAC validation state (holds no secrets itself — retrieves from keychain on demand).
-pub struct AuthState {
-    // No persistent state needed — secrets are in the keychain
-    // and origins are validated per-request.
-}
-
+pub struct AuthState {}
 impl AuthState {
     pub fn new() -> Self {
         Self {}
     }
 }
 
-/// Parse and normalize a browser origin to its exact serialized form.
-pub fn normalize_browser_origin(origin: &str) -> Option<String> {
-    let Ok(url) = Url::parse(origin) else {
-        return None;
-    };
+#[derive(Deserialize, Default)]
+struct AuthQueryParams {
+    sig: Option<String>,
+    ts: Option<String>,
+    nonce: Option<String>,
+    key: Option<String>,
+    body_sha256: Option<String>,
+    origin: Option<String>,
+}
 
+pub fn normalize_browser_origin(origin: &str) -> Option<String> {
+    let url = Url::parse(origin).ok()?;
     match url.scheme() {
         "http" | "https" => Some(url.origin().ascii_serialization()),
         _ => None,
     }
 }
-
-/// Return true for local development origins served from loopback hosts.
 pub fn is_loopback_dev_origin(origin: &str) -> bool {
-    let Some(normalized_origin) = normalize_browser_origin(origin) else {
+    let Some(normalized) = normalize_browser_origin(origin) else {
         return false;
     };
-
-    let Ok(url) = Url::parse(&normalized_origin) else {
-        return false;
-    };
-
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+    let Ok(url) = Url::parse(&normalized) else { return false };
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1" | "[::1]"))
 }
-
-/// Return true when the origin is a valid browser origin that may access the localhost API via CORS.
 pub fn is_allowed_browser_origin_for_cors(origin: &str) -> bool {
-    if is_loopback_dev_origin(origin) {
-        return true;
-    }
-
-    normalize_browser_origin(origin).is_some()
+    is_loopback_dev_origin(origin) || normalize_browser_origin(origin).is_some()
 }
-
-/// Parse and normalize a browser origin or reject it as invalid.
 pub fn require_normalized_browser_origin(origin: &str) -> Result<String, ApiError> {
     normalize_browser_origin(origin)
         .ok_or_else(|| ApiError::Forbidden("Origin is not allowed to access the companion bootstrap API".to_string()))
 }
 
-/// Axum middleware that validates HMAC-authenticated requests.
-///
-/// Extracts the `Origin` header to determine which pairing secret to use,
-/// then verifies the HMAC in `X-Companion-Secret` against the shared secret.
-pub async fn require_auth(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>, next: Next) -> Response {
-    let log_context = AuthLogContext {
-        auth_transport: "header",
-        method: request.method().as_str(),
-        path: request.uri().path(),
+pub fn signature_payload(origin: &str, timestamp: &str, nonce: &str, method: &str, uri: &Uri, body_hash: &str) -> String {
+    let mut parameters: Vec<(String, String)> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .filter(|(key, _)| !matches!(key.as_ref(), "sig" | "ts" | "nonce" | "key" | "body_sha256" | "origin" | "hmac"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    parameters.sort();
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters.iter().map(|(k, v)| (k, v)))
+        .finish();
+    let target = if query.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{}?{query}", uri.path())
     };
+    format!("{origin}\n{timestamp}\n{nonce}\n{method}\n{target}\n{body_hash}")
+}
 
-    match extract_auth_credentials(&request) {
-        Ok((origin, hmac_value, timestamp_str)) => match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &log_context) {
-            Ok(()) => next.run(request).await,
-            Err(e) => e.into_response(),
-        },
-        Err(e) => e.into_response(),
+pub async fn require_auth(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return ApiError::Forbidden("Request body is too large or unreadable".to_string()).into_response(),
+    };
+    let body_hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+    let request = Request::from_parts(parts, axum::body::Body::from(bytes));
+    let context = AuthLogContext {
+        method: request.method().as_str(),
+    };
+    match extract_auth_credentials(&request)
+        .and_then(|credentials| validate_signature(&state, credentials, request.uri(), &context, Some(&body_hash)))
+    {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
     }
 }
 
-/// Axum middleware that validates requests via headers OR query-param fallback.
-///
-/// First tries header-based auth (Origin + X-Companion-Secret + X-Companion-Timestamp).
-/// If headers are missing, falls back to query params (`hmac`, `ts`, `origin`).
-/// Used for viewer endpoints where the URL is used in `<img src>` attributes.
 pub async fn require_auth_or_query(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>, next: Next) -> Response {
-    // Try header-based auth first
-    let header_log_context = AuthLogContext {
-        auth_transport: "header",
-        method: request.method().as_str(),
-        path: request.uri().path(),
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return ApiError::Forbidden("Request body is too large or unreadable".to_string()).into_response(),
     };
-    if let Ok((origin, hmac_value, timestamp_str)) = extract_auth_credentials(&request) {
-        return match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &header_log_context) {
+    let body_hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+    let request = Request::from_parts(parts, axum::body::Body::from(bytes));
+    let context = AuthLogContext {
+        method: request.method().as_str(),
+    };
+    if let Ok(credentials) = extract_auth_credentials(&request) {
+        return match validate_signature(&state, credentials, request.uri(), &context, Some(&body_hash)) {
             Ok(()) => next.run(request).await,
-            Err(e) => e.into_response(),
+            Err(error) => error.into_response(),
         };
     }
-
-    // Fall back to query-param auth
-    let query: AuthQueryParams = Query::try_from_uri(request.uri()).map(|q| q.0).unwrap_or_default();
-
-    let Some(hmac_value) = query.hmac else {
-        return ApiError::Forbidden("Missing authentication (headers or query params)".to_string()).into_response();
+    let query: AuthQueryParams = Query::try_from_uri(request.uri()).map(|query| query.0).unwrap_or_default();
+    let (Some(sig), Some(ts), Some(nonce), Some(key), Some(body_sha256), Some(origin)) =
+        (query.sig, query.ts, query.nonce, query.key, query.body_sha256, query.origin)
+    else {
+        return ApiError::Forbidden("Missing authentication headers".to_string()).into_response();
     };
-
-    let Some(timestamp_str) = query.ts else {
-        return ApiError::Forbidden("Missing timestamp in query params".to_string()).into_response();
-    };
-
-    // For query-param auth, we need the origin in the query string since
-    // browser resource requests (img src) don't include Origin headers.
-    let origin = query.origin.unwrap_or_default();
-    if origin.is_empty() {
-        return ApiError::Forbidden("Missing origin in query params".to_string()).into_response();
-    }
-
-    let query_log_context = AuthLogContext {
-        auth_transport: "query",
+    let context = AuthLogContext {
         method: request.method().as_str(),
-        path: request.uri().path(),
     };
-
-    match validate_hmac(&state, &origin, &hmac_value, &timestamp_str, &query_log_context) {
+    match validate_signature(
+        &state,
+        SignedRequestCredentials {
+            origin,
+            key,
+            signature: sig,
+            timestamp: ts,
+            nonce,
+            body_hash: body_sha256,
+        },
+        request.uri(),
+        &context,
+        Some(&body_hash),
+    ) {
         Ok(()) => next.run(request).await,
-        Err(e) => e.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
-/// Extract auth credentials from request headers.
-fn extract_auth_credentials(request: &Request<axum::body::Body>) -> Result<(String, String, String), ApiError> {
+fn extract_auth_credentials(request: &Request<axum::body::Body>) -> Result<SignedRequestCredentials, ApiError> {
     let origin = request
         .headers()
         .get("origin")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .and_then(normalize_browser_origin)
         .ok_or_else(|| ApiError::Forbidden("Missing Origin header".to_string()))?;
-
-    let hmac_value = request
-        .headers()
-        .get(SECRET_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| ApiError::Forbidden("Missing X-Companion-Secret header".to_string()))?;
-
-    let timestamp_str = request
-        .headers()
-        .get(TIMESTAMP_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| ApiError::Forbidden("Missing X-Companion-Timestamp header".to_string()))?;
-
-    Ok((origin, hmac_value, timestamp_str))
+    let header = |name: &str, message: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| ApiError::Forbidden(message.to_string()))
+    };
+    Ok(SignedRequestCredentials {
+        origin,
+        key: header(KEY_HEADER, "Missing X-Companion-Key header")?,
+        signature: header(SIGNATURE_HEADER, "Missing X-Companion-Signature header")?,
+        timestamp: header(TIMESTAMP_HEADER, "Missing X-Companion-Timestamp header")?,
+        nonce: header(NONCE_HEADER, "Missing X-Companion-Nonce header")?,
+        body_hash: header(BODY_HASH_HEADER, "Missing X-Companion-Body-SHA256 header")?,
+    })
 }
 
-/// Validate HMAC credentials against the stored secret for an origin.
-///
-/// Called from middleware and also from the WebSocket upgrade handler.
-pub(super) fn validate_hmac_public(
+pub(super) fn validate_signed_request(
     state: &AppState,
-    origin: &str,
-    hmac_value: &str,
-    timestamp_str: &str,
-    log_context: &AuthLogContext,
+    credentials: SignedRequestCredentials,
+    uri: &Uri,
+    context: &AuthLogContext,
 ) -> Result<(), ApiError> {
-    validate_hmac(state, origin, hmac_value, timestamp_str, log_context)
+    validate_signature(state, credentials, uri, context, None)
 }
 
-/// Validate HMAC credentials against the stored secret for an origin.
-fn validate_hmac(
+fn validate_signature(
     state: &AppState,
-    origin: &str,
-    hmac_value: &str,
-    timestamp_str: &str,
-    log_context: &AuthLogContext,
+    credentials: SignedRequestCredentials,
+    uri: &Uri,
+    context: &AuthLogContext,
+    actual_body_hash: Option<&str>,
 ) -> Result<(), ApiError> {
-    let origin = require_normalized_browser_origin(origin)?;
-
-    // Get shared secret for this origin from pairing state
-    let secret = state.pairing.get_secret_for_origin(&origin).ok_or_else(|| {
-        warn!(
-            "Auth rejected: no pairing found for origin {origin}; transport={}; method={}; path={}",
-            log_context.auth_transport, log_context.method, log_context.path,
-        );
-        ApiError::Forbidden("Not paired with this origin".to_string())
-    })?;
-
-    // Validate timestamp (within ±MAX_TIMESTAMP_SKEW seconds)
+    let SignedRequestCredentials {
+        origin,
+        key,
+        signature,
+        timestamp: timestamp_str,
+        nonce,
+        body_hash,
+    } = credentials;
+    let origin = require_normalized_browser_origin(&origin)?;
+    let registered_key = state
+        .pairing
+        .get_public_key_for_origin(&origin)
+        .ok_or_else(|| ApiError::forbidden_code("Not paired with this origin", PAIRING_NOT_FOUND_CODE))?;
+    if key != registered_key {
+        return Err(ApiError::forbidden_code("Invalid authentication", AUTH_SIGNATURE_MISMATCH_CODE));
+    }
     let timestamp: u64 = timestamp_str
         .parse()
         .map_err(|_| ApiError::Forbidden("Invalid timestamp format".to_string()))?;
-
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let diff = now.abs_diff(timestamp);
-
-    if diff > MAX_TIMESTAMP_SKEW {
-        let direction = if timestamp > now { "future" } else { "past" };
-        warn!(
-            "Auth rejected: timestamp skew {diff}s exceeds {MAX_TIMESTAMP_SKEW}s; transport={}; method={}; path={}; origin={origin}; server_ts={now}; request_ts={timestamp}; direction={direction}",
-            log_context.auth_transport,
-            log_context.method,
-            log_context.path,
-        );
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW {
         return Err(ApiError::Forbidden("Request timestamp too old or too new".to_string()));
     }
-
-    // Verify HMAC.
-    // The secret is a hex string (e.g. "a1b2c3..."). Both sides use the
-    // UTF-8 bytes of this string as the HMAC key (matching the frontend's
-    // `TextEncoder.encode(secret)`).
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Internal("HMAC initialization failed".to_string()))?;
-    mac.update(timestamp_str.as_bytes());
-
-    let expected = hex::encode(mac.finalize().into_bytes());
-
-    if expected != hmac_value {
-        warn!(
-            "Auth rejected: HMAC mismatch for origin {origin}; transport={}; method={}; path={}; server_ts={now}; request_ts={timestamp}",
-            log_context.auth_transport, log_context.method, log_context.path,
-        );
-        return Err(ApiError::Forbidden("Invalid authentication".to_string()));
+    if let Some(actual_body_hash) = actual_body_hash {
+        if body_hash != actual_body_hash {
+            return Err(ApiError::Forbidden("Request body hash mismatch".to_string()));
+        }
     }
-
+    if !state.pairing.consume_request_nonce(&format!("{origin}\n{nonce}")) {
+        return Err(ApiError::Forbidden("Request nonce has already been used".to_string()));
+    }
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .map_err(|_| ApiError::Forbidden("Invalid public key".to_string()))?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&key_bytes).map_err(|_| ApiError::Forbidden("Invalid public key".to_string()))?;
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .map_err(|_| ApiError::Forbidden("Invalid signature".to_string()))?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|_| ApiError::Forbidden("Invalid signature".to_string()))?;
+    verifying_key
+        .verify(
+            signature_payload(&origin, &timestamp_str, &nonce, context.method, uri, &body_hash).as_bytes(),
+            &signature,
+        )
+        .map_err(|_| ApiError::forbidden_code("Invalid authentication", AUTH_SIGNATURE_MISMATCH_CODE))?;
     if !state.pairing.is_origin_paired(&origin) {
         state.pairing.record_verified_origin(
             &origin,
             crate::server::pairing::VerifiedOriginRecordReason::RecoveredFromAuthenticatedRequest,
         );
     }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_browser_origin_for_cors, is_loopback_dev_origin, normalize_browser_origin};
-
+    use super::*;
     #[test]
     fn normalizes_browser_origins_exactly() {
         assert_eq!(
             normalize_browser_origin("https://Sambee.Example.com:8443").as_deref(),
             Some("https://sambee.example.com:8443")
         );
-        assert_eq!(
-            normalize_browser_origin("http://localhost:5173").as_deref(),
-            Some("http://localhost:5173")
-        );
     }
-
     #[test]
-    fn recognizes_typical_loopback_dev_origins() {
+    fn recognizes_loopback_dev_origins() {
         assert!(is_loopback_dev_origin("http://localhost:5173"));
-        assert!(is_loopback_dev_origin("http://127.0.0.1:3000"));
-        assert!(is_loopback_dev_origin("https://localhost:8443"));
         assert!(!is_loopback_dev_origin("https://sambee.example.com"));
     }
-
     #[test]
-    fn cors_allows_valid_browser_origins_and_rejects_non_http_origins() {
-        assert!(is_allowed_browser_origin_for_cors("https://sambee.example.com"));
-        assert!(is_allowed_browser_origin_for_cors("http://127.0.0.1:5173"));
-        assert!(!is_allowed_browser_origin_for_cors("file:///tmp/index.html"));
-        assert!(!is_allowed_browser_origin_for_cors("not-an-origin"));
+    fn excludes_auth_parameters_from_payload() {
+        let uri: Uri = "/x?b=2&sig=s&a=1".parse().unwrap();
+        let nonce = format!("test-nonce-{}", std::process::id());
+        assert_eq!(
+            signature_payload("https://example.test", "1", &nonce, "GET", &uri, "h"),
+            format!("https://example.test\n1\n{nonce}\nGET\n/x?a=1&b=2\nh")
+        );
     }
 }

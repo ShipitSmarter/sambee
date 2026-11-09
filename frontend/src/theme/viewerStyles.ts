@@ -7,6 +7,7 @@
 
 import { alpha, type Theme } from "@mui/material";
 import type { SystemStyleObject } from "@mui/system";
+import { resolveThemePalette, VIEWER_FALLBACKS } from "./palette";
 import type { ThemeConfig } from "./types";
 
 //
@@ -17,21 +18,7 @@ import type { ThemeConfig } from "./types";
  * Default fallback colors for viewer components.
  * These are used when theme doesn't provide specific viewer colors.
  */
-export const VIEWER_DEFAULTS = {
-  /** Toolbar background shared across all viewers */
-  TOOLBAR_BG: "rgba(0,0,0,0.8)",
-  /** Toolbar text color (white for contrast against dark toolbar) */
-  TOOLBAR_TEXT: "#ffffff",
-
-  /** Image viewer: black background to make images pop */
-  IMAGE_VIEWER_BG: "#000000",
-  /** PDF viewer: gray background to distinguish from PDF pages */
-  PDF_VIEWER_BG: "#525252",
-  /** Markdown viewer: white background for readability */
-  MARKDOWN_VIEWER_BG: "#ffffff",
-  /** Markdown viewer: dark text for readability */
-  MARKDOWN_VIEWER_TEXT: "#000000",
-} as const;
+export const VIEWER_DEFAULTS = VIEWER_FALLBACKS;
 
 //
 // Viewer color types
@@ -91,31 +78,7 @@ export function getViewerColors(theme: ThemeConfig, viewerType: "image"): Viewer
 export function getViewerColors(theme: ThemeConfig, viewerType: "pdf"): ViewerColors;
 export function getViewerColors(theme: ThemeConfig, viewerType: "markdown"): MarkdownViewerColors;
 export function getViewerColors(theme: ThemeConfig, viewerType: "image" | "pdf" | "markdown"): ViewerColors | MarkdownViewerColors {
-  switch (viewerType) {
-    case "image":
-      return {
-        viewerBg: theme.components?.imageViewer?.viewerBackground || VIEWER_DEFAULTS.IMAGE_VIEWER_BG,
-        toolbarBg: theme.components?.imageViewer?.toolbarBackground || VIEWER_DEFAULTS.TOOLBAR_BG,
-        toolbarText: theme.components?.imageViewer?.toolbarText || VIEWER_DEFAULTS.TOOLBAR_TEXT,
-      };
-
-    case "pdf":
-      return {
-        viewerBg: theme.components?.pdfViewer?.viewerBackground || VIEWER_DEFAULTS.PDF_VIEWER_BG,
-        toolbarBg: theme.components?.pdfViewer?.toolbarBackground || VIEWER_DEFAULTS.TOOLBAR_BG,
-        toolbarText: theme.components?.pdfViewer?.toolbarText || VIEWER_DEFAULTS.TOOLBAR_TEXT,
-      };
-
-    case "markdown":
-      return {
-        viewerBg: theme.components?.markdownViewer?.viewerBackground || VIEWER_DEFAULTS.MARKDOWN_VIEWER_BG,
-        toolbarBg: theme.components?.markdownViewer?.toolbarBackground || VIEWER_DEFAULTS.TOOLBAR_BG,
-        toolbarText: theme.components?.markdownViewer?.toolbarText || VIEWER_DEFAULTS.TOOLBAR_TEXT,
-        viewerText: theme.components?.markdownViewer?.viewerText || VIEWER_DEFAULTS.MARKDOWN_VIEWER_TEXT,
-        linkColor: theme.components?.link?.main || theme.primary.main,
-        linkHoverColor: theme.components?.link?.hover || theme.primary.dark || theme.primary.main,
-      };
-  }
+  return resolveThemePalette(theme).viewers[viewerType];
 }
 
 //
@@ -163,6 +126,101 @@ export const VIEWER_SCROLL_END_PADDING = {
   xs: "clamp(64px, 18dvh, 192px)",
   sm: "clamp(64px, 18dvh, 192px)",
 } as const;
+export const MARKDOWN_PRINT_TYPOGRAPHY = {
+  body: "10pt",
+  lineHeight: 1.4,
+  h1: "18pt",
+  h2: "14pt",
+  h3: "12pt",
+  lowerHeadings: "11pt",
+  codeAndTables: "9pt",
+} as const;
+export const MARKDOWN_VIEWER_PRINT_STYLES = {
+  "@media print": {
+    "body:has([data-markdown-print-viewer])": { height: "auto !important", overflow: "visible !important" },
+    "body:has([data-markdown-print-viewer]) > :not([data-markdown-print-viewer])": { display: "none !important" },
+    "[data-markdown-print-viewer].MuiDialog-root": { position: "static !important", overflow: "visible" },
+    "[data-markdown-print-viewer] .MuiBackdrop-root, [data-markdown-print-frame] > :not([data-testid='markdown-viewer-content'])": {
+      display: "none !important",
+    },
+    "[data-markdown-print-viewer] .MuiDialog-paper, [data-markdown-print-viewer] [data-markdown-search-root]": {
+      color: "#000 !important",
+      backgroundColor: "#fff !important",
+    },
+    "[data-markdown-print-viewer] [data-markdown-search-root]": {
+      padding: 0,
+      fontSize: MARKDOWN_PRINT_TYPOGRAPHY.body,
+      lineHeight: MARKDOWN_PRINT_TYPOGRAPHY.lineHeight,
+      "--sambee-syntax-foreground": "#000 !important",
+      "--sambee-syntax-keyword": "#000 !important",
+      "--sambee-syntax-string": "#000 !important",
+      "--sambee-syntax-number": "#000 !important",
+      "--sambee-syntax-comment": "#000 !important",
+      "--sambee-syntax-type": "#000 !important",
+      "--sambee-syntax-function": "#000 !important",
+      "--sambee-syntax-operator": "#000 !important",
+      "--sambee-syntax-punctuation": "#000 !important",
+      "--sambee-search-foreground": "#000 !important",
+      "--sambee-search-other": "transparent !important",
+      "--sambee-search-current": "transparent !important",
+    },
+    // Select only blocks without an earlier sibling, without Emotion's SSR-unsafe pseudo-classes.
+    "[data-markdown-print-viewer] [data-markdown-search-root] > :not(* + *), [data-markdown-print-viewer] [data-markdown-publication] > :not(* + *)":
+      {
+        marginTop: 0,
+      },
+    "[data-markdown-print-viewer] [data-markdown-search-root] h1": { fontSize: MARKDOWN_PRINT_TYPOGRAPHY.h1 },
+    "[data-markdown-print-viewer] [data-markdown-search-root] h2": { fontSize: MARKDOWN_PRINT_TYPOGRAPHY.h2 },
+    "[data-markdown-print-viewer] [data-markdown-search-root] h3": { fontSize: MARKDOWN_PRINT_TYPOGRAPHY.h3 },
+    "[data-markdown-print-viewer] [data-markdown-search-root] h4, [data-markdown-print-viewer] [data-markdown-search-root] h5, [data-markdown-print-viewer] [data-markdown-search-root] h6":
+      {
+        fontSize: MARKDOWN_PRINT_TYPOGRAPHY.lowerHeadings,
+      },
+    "[data-markdown-print-viewer] [data-markdown-search-root] pre, [data-markdown-print-viewer] [data-markdown-search-root] code:not(pre code)":
+      {
+        fontSize: MARKDOWN_PRINT_TYPOGRAPHY.codeAndTables,
+      },
+    "[data-markdown-print-viewer] [data-markdown-search-root] *": {
+      color: "#000 !important",
+      backgroundColor: "transparent !important",
+      boxShadow: "none !important",
+      textShadow: "none !important",
+    },
+    "[data-markdown-print-viewer] .MuiDialog-container, [data-markdown-print-viewer] .MuiDialog-paper, [data-markdown-print-viewer] [data-markdown-print-frame], [data-markdown-print-viewer] [data-testid='markdown-viewer-content']":
+      {
+        position: "static",
+        display: "block",
+        width: "auto",
+        maxWidth: "none",
+        height: "auto",
+        maxHeight: "none",
+        minHeight: 0,
+        overflow: "visible",
+        flex: "none",
+        margin: 0,
+        paddingBottom: 0,
+      },
+    "[data-markdown-print-viewer] [data-markdown-search-root] pre, [data-markdown-print-viewer] [data-markdown-search-root] pre code": {
+      minWidth: 0,
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
+      overflow: "visible",
+    },
+    "[data-markdown-print-viewer] [data-markdown-search-root] table": {
+      fontSize: MARKDOWN_PRINT_TYPOGRAPHY.codeAndTables,
+      display: "table",
+      width: "100%",
+      tableLayout: "fixed",
+      overflowWrap: "anywhere",
+    },
+    "[data-markdown-print-viewer] [data-markdown-search-root] table th": { fontSize: MARKDOWN_PRINT_TYPOGRAPHY.codeAndTables },
+    "[data-markdown-print-viewer] thead": { display: "table-header-group" },
+    "[data-markdown-print-viewer] tr, [data-markdown-print-viewer] img": { breakInside: "avoid" },
+    "[data-markdown-print-viewer] h1, [data-markdown-print-viewer] h2, [data-markdown-print-viewer] h3": { breakAfter: "avoid" },
+    "[data-markdown-print-viewer] p": { orphans: 3, widows: 3 },
+    "[data-markdown-print-viewer] img": { maxWidth: "100%", maxHeight: "240mm", objectFit: "contain" },
+  },
+} as const;
 export const MARKDOWN_TABLE_CELL_PADDING_INLINE = "0.675rem";
 export const MARKDOWN_TABLE_CELL_PADDING_BLOCK = "0.8em";
 export const MARKDOWN_TABLE_FONT_SIZE = "0.9375em";
@@ -179,6 +237,17 @@ const MARKDOWN_TABLE_DARK_BORDER = "#3b3935";
 const MARKDOWN_TABLE_DARK_HEADER_TEXT = "#ebe8e2";
 
 export function getMarkdownCodeSurfaceColors(theme: Theme) {
+  const document = theme.palette.markdownDocument;
+  if (document) {
+    return {
+      blockBackground: document.blockBackground,
+      inlineBackground: document.inlineBackground,
+      blockBorder: document.blockBorder,
+      inlineBorder: document.inlineBorder,
+      textColor: document.codeText,
+      activeLineGutterBackground: document.activeLineGutterBackground,
+    };
+  }
   if (theme.palette.mode === "dark") {
     return {
       blockBackground: MARKDOWN_CODE_BLOCK_DARK_BG,
@@ -201,6 +270,16 @@ export function getMarkdownCodeSurfaceColors(theme: Theme) {
 }
 
 export function getMarkdownTableSurfaceColors(theme: Theme) {
+  const document = theme.palette.markdownDocument;
+  if (document) {
+    return {
+      tableBackground: document.tableBackground,
+      alternateRowBackground: document.alternateRowBackground,
+      headerBackground: document.headerBackground,
+      headerText: document.headerText,
+      border: document.tableBorder,
+    };
+  }
   if (theme.palette.mode === "dark") {
     return {
       tableBackground: MARKDOWN_TABLE_DARK_BG,
@@ -331,11 +410,11 @@ function getMarkdownDocumentStyles(viewerText: string, linkColor: string, linkHo
 
     // Blockquotes.
     "& blockquote": {
-      borderLeft: `4px solid ${MARKDOWN_COLORS.BORDER}`,
+      borderLeft: (theme) => `4px solid ${theme.palette.markdownDocument?.blockquoteBorder ?? MARKDOWN_COLORS.BORDER}`,
       marginTop: 0,
       marginBottom: "16px",
       paddingLeft: "16px",
-      color: MARKDOWN_COLORS.MUTED_TEXT,
+      color: (theme) => theme.palette.markdownDocument?.blockquoteText ?? MARKDOWN_COLORS.MUTED_TEXT,
     },
 
     // Headings: break long words.
@@ -349,12 +428,12 @@ function getMarkdownDocumentStyles(viewerText: string, linkColor: string, linkHo
     "& h1": {
       paddingBottom: "0.3em",
       fontSize: "2em",
-      borderBottom: `1px solid ${MARKDOWN_COLORS.HEADING_BORDER}`,
+      borderBottom: (theme) => `1px solid ${theme.palette.markdownDocument?.headingBorder ?? MARKDOWN_COLORS.HEADING_BORDER}`,
     },
     "& h2": {
       paddingBottom: "0.3em",
       fontSize: "1.5em",
-      borderBottom: `1px solid ${MARKDOWN_COLORS.HEADING_BORDER}`,
+      borderBottom: (theme) => `1px solid ${theme.palette.markdownDocument?.headingBorder ?? MARKDOWN_COLORS.HEADING_BORDER}`,
     },
     "& h3": {
       fontSize: "1.25em",

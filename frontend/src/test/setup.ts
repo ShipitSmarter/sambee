@@ -1,10 +1,36 @@
 import "@testing-library/jest-dom";
 import * as events from "node:events";
 import { cleanup } from "@testing-library/react";
-import { afterAll, afterEach, beforeAll, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, onTestFinished, vi } from "vitest";
 import { server } from "./mocks/server";
 
 const TEST_EVENT_TARGET_MAX_LISTENERS = 0;
+
+beforeEach(() => {
+  const consoleError = console.error;
+  const consoleWarn = console.warn;
+  const unexpectedWarnings: string[] = [];
+  const captureWarnings =
+    (output: typeof console.error) =>
+    (...args: unknown[]) => {
+      const message = args.map(String).join(" ");
+      unexpectedWarnings.push(message);
+      output(...args);
+    };
+  console.error = captureWarnings(consoleError);
+  console.warn = captureWarnings(consoleWarn);
+  onTestFinished(() => {
+    try {
+      expect(
+        unexpectedWarnings,
+        "Unexpected console.warn or console.error output. Fix its cause or explicitly mock and assert an expected diagnostic in this test."
+      ).toEqual([]);
+    } finally {
+      console.error = consoleError;
+      console.warn = consoleWarn;
+    }
+  });
+});
 
 events.setMaxListeners(TEST_EVENT_TARGET_MAX_LISTENERS);
 
@@ -28,28 +54,6 @@ const mockLocation = {
   reload: vi.fn(),
 };
 
-// Suppress jsdom CSS parsing errors and React act warnings
-const originalStderrWrite = process.stderr.write.bind(process.stderr);
-const originalConsoleError = console.error.bind(console);
-
-// biome-ignore lint/suspicious/noExplicitAny: Overriding process.stderr.write
-process.stderr.write = (chunk: any, encoding?: any, callback?: any): boolean => {
-  if (typeof chunk === "string" && chunk.includes("Could not parse CSS stylesheet")) {
-    return true;
-  }
-  return originalStderrWrite(chunk, encoding, callback);
-};
-
-// Suppress React act warnings that are unavoidable due to async library behavior
-// biome-ignore lint/suspicious/noExplicitAny: Overriding console.error
-console.error = (...args: any[]) => {
-  const message = args[0];
-  if (typeof message === "string" && (message.includes("Warning: An update to") || message.includes("not wrapped in act(...)"))) {
-    return;
-  }
-  originalConsoleError(...args);
-};
-
 // Set up fake location for jsdom/MSW - must be before MSW setup
 Object.defineProperty(window, "location", {
   writable: true,
@@ -59,19 +63,20 @@ Object.defineProperty(window, "location", {
 // Start MSW server before all tests
 beforeAll(() => {
   server.listen({
-    onUnhandledRequest(request, print) {
+    onUnhandledFrame({ frame, defaults }) {
       // Ignore WebSocket connection attempts - they're mocked separately
-      if (request.url.includes("/api/ws") || request.url.startsWith("ws://")) {
+      if (frame.protocol === "ws") {
         return;
       }
+      const request = frame.data && typeof frame.data === "object" && "request" in frame.data ? frame.data.request : null;
       // Ignore companion background health probes triggered by FileBrowser.
       // These requests are expected during test startup and their failures are
       // already handled by the hook as a normal "companion unavailable" path.
-      if (request.url === "http://localhost:21549/api/health") {
+      if (request instanceof Request && (request.url.includes("/api/ws") || request.url === "http://localhost:21549/api/health")) {
         return;
       }
       // Warn about other unhandled requests
-      print.warning();
+      defaults.warn();
     },
   });
 });
@@ -171,7 +176,7 @@ Object.defineProperty(window, "localStorage", {
   value: localStorageMock,
 });
 
-if (typeof globalThis.Iterator === "undefined") {
+if (typeof Reflect.get(globalThis, "Iterator") === "undefined") {
   class IteratorHelperPolyfill<TValue> {
     private readonly values: TValue[];
 

@@ -23,13 +23,16 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { OperationNotificationProvider } from "../../components/OperationNotifications";
 import { createMockConnection } from "../../test/fixtures/connections";
 import type { Connection, FileEntry } from "../../types";
 import { FileType } from "../../types";
+import { physicalLocation } from "../FileBrowser/contentProviders";
 import { FileBrowserPane, type FileBrowserPaneProps } from "../FileBrowser/FileBrowserPane";
 import type { UseFileBrowserPaneReturn } from "../FileBrowser/types";
 
-vi.mock("react-i18next", () => ({
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
   useTranslation: () => ({
     t: (key: string) => {
       if (key === "settings.connectionDialog.accessMode.readOnlyLabel") {
@@ -105,7 +108,7 @@ vi.mock("@tanstack/react-virtual", () => import("../../__mocks__/@tanstack/react
 
 const TEST_CONNECTION_ID = "conn-1";
 
-const testConnections: Connection[] = [
+const testConnections: [Connection, Connection] = [
   createMockConnection({ id: TEST_CONNECTION_ID, name: "My NAS" }),
   createMockConnection({ id: "conn-2", name: "Backup Server" }),
 ];
@@ -141,6 +144,21 @@ function createMockPane(overrides: Partial<UseFileBrowserPaneReturn> = {}): UseF
     connectionId: TEST_CONNECTION_ID,
     setConnectionId: vi.fn(),
     currentPath: "some/path",
+    currentLocation: physicalLocation(TEST_CONNECTION_ID, "some/path"),
+    contentCapabilities: { browse: true, read: true, download: true, extract: true, mutate: true, openInNativeApp: true },
+    companionPairingError: null,
+    removeSelectedPaths: vi.fn(),
+    selectItem: vi.fn(),
+    toggleItemSelection: vi.fn(),
+    selectItemFromIcon: vi.fn(),
+    getItemsByPaths: vi.fn().mockReturnValue([]),
+    handleOpenFileAtPath: vi.fn().mockResolvedValue(undefined),
+    navigateToPath: vi.fn(),
+    handleDeleteForFile: vi.fn(),
+    seedDirectorySnapshot: vi.fn(),
+    applyLocation: vi.fn(),
+    captureRecoverySnapshot: vi.fn().mockReturnValue(null),
+    restoreRecoverySnapshot: vi.fn(),
     setCurrentPath: vi.fn(),
     archiveLocation: null,
     archiveHasMore: false,
@@ -163,6 +181,7 @@ function createMockPane(overrides: Partial<UseFileBrowserPaneReturn> = {}): UseF
     selectedFiles: new Set<string>(),
     handleToggleSelection: vi.fn(),
     handleSelectDown: vi.fn(),
+    handleSelectToBoundary: vi.fn(),
     handleSelectUp: vi.fn(),
     handleSelectAll: vi.fn(),
     handleClearSelection: vi.fn(),
@@ -188,7 +207,7 @@ function createMockPane(overrides: Partial<UseFileBrowserPaneReturn> = {}): UseF
 
     // Dialog state
     deleteDialogOpen: false,
-    deleteTarget: null,
+    deleteTargets: [],
     isDeleting: false,
     renameDialogOpen: false,
     renameTarget: null,
@@ -286,6 +305,7 @@ function defaultProps(overrides: Partial<FileBrowserPaneProps> = {}): FileBrowse
     useCompactLayout: false,
     isUsingKeyboard: false,
     onPaneFocus: vi.fn(),
+    searchProvider: createMockPane().directorySearchProvider,
     ...overrides,
   };
 }
@@ -297,6 +317,39 @@ function defaultProps(overrides: Partial<FileBrowserPaneProps> = {}): FileBrowse
 describe("FileBrowserPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("presents pane notices in the shared viewport host", () => {
+    const dismissNotification = vi.fn();
+    const pane = createMockPane({
+      notification: { id: "missing", message: "Folder was not found", severity: "warning", occurrence: 1 },
+      dismissNotification,
+    });
+    render(
+      <OperationNotificationProvider>
+        <FileBrowserPane {...defaultProps({ pane, paneId: "right", paneMode: "dual" })} />
+      </OperationNotificationProvider>
+    );
+    const notice = screen.getByRole("status");
+    expect(notice.closest("[data-pane-id]")).toBeNull();
+    expect(notice.closest(".MuiSnackbar-root")).not.toBeNull();
+    expect(notice).not.toHaveTextContent("Right pane:");
+    fireEvent.click(screen.getByRole("button", { name: "common.actions.close" }));
+    expect(dismissNotification).toHaveBeenCalledOnce();
+  });
+
+  it("shows a monitor summary with its full current target below it", () => {
+    const pane = createMockPane({
+      currentPath: "Projects/Reports",
+      directoryMonitorError: 'Folder "Reports" was not found. It may have been moved or deleted.',
+      directoryMonitorErrorSummary: "Folder not found. It may have been moved or deleted.",
+    });
+    render(<FileBrowserPane {...defaultProps({ pane })} />);
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent("Folder not found. It may have been moved or deleted.");
+    expect(notice).toHaveTextContent("My NAS: /Projects/Reports");
+    expect(notice).not.toHaveTextContent('Folder "Reports"');
+    expect(notice.querySelector("strong")).toBeNull();
   });
 
   // --------------------------------------------------------------------------
@@ -316,6 +369,48 @@ describe("FileBrowserPane", () => {
   // --------------------------------------------------------------------------
 
   describe("desktop layout", () => {
+    it("centers an accessible drop cue without shifting rows and clears it on drop", () => {
+      const onFileDrop = vi.fn();
+      const props = defaultProps({ dropTargetLabel: "My NAS:/some/path", onFileDrop });
+      const { rerender } = render(<FileBrowserPane {...props} />);
+      const list = screen.getByTestId("file-list");
+      const frame = list.parentElement!;
+      fireEvent.dragEnter(list, { dataTransfer: { types: ["Files"] } });
+      const cue = screen.getByRole("status", { name: /My NAS:\/some\/path/ });
+      expect(cue).toHaveTextContent("fileBrowser.transfers.dropToUpload");
+      expect(cue).not.toHaveTextContent("My NAS:/some/path");
+      expect(cue).toContainElement(screen.getByTestId("CloudUploadOutlinedIcon"));
+      expect(cue).toHaveStyle({ position: "absolute", left: "50%", pointerEvents: "none" });
+      expect(getComputedStyle(frame).outline).toContain("2px solid");
+      expect(list).toHaveTextContent("Documents");
+      fireEvent.drop(list, { dataTransfer: { types: ["Files"] } });
+      expect(onFileDrop).toHaveBeenCalledOnce();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+      rerender(<FileBrowserPane {...props} dropUnavailableReason="Finish the current upload first" />);
+      fireEvent.dragEnter(list, { dataTransfer: { types: ["Files"] } });
+      const unavailable = screen.getByRole("status", { name: "Finish the current upload first" });
+      expect(unavailable).toContainElement(screen.getByTestId("BlockOutlinedIcon"));
+      expect(unavailable).not.toHaveTextContent("My NAS:/some/path");
+      expect(getComputedStyle(frame).outlineStyle).toBe("none");
+    });
+
+    it("ignores non-file drags and clears a nested file drag on Escape", () => {
+      const onFileDrop = vi.fn();
+      render(<FileBrowserPane {...defaultProps({ dropTargetLabel: "My NAS:/some/path", onFileDrop })} />);
+      const list = screen.getByTestId("file-list");
+      fireEvent.dragEnter(list, { dataTransfer: { types: ["text/plain"] } });
+      fireEvent.drop(list, { dataTransfer: { types: ["text/plain"] } });
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(onFileDrop).not.toHaveBeenCalled();
+
+      fireEvent.dragEnter(list, { dataTransfer: { types: ["Files"] } });
+      fireEvent.dragEnter(list.firstElementChild!, { dataTransfer: { types: ["Files"] } });
+      expect(screen.getByRole("status", { name: /My NAS:\/some\/path/ })).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
     it("uses fixed pixel dimensions for the visually hidden selection announcement", () => {
       render(<FileBrowserPane {...defaultProps()} />);
 
@@ -331,7 +426,7 @@ describe("FileBrowserPane", () => {
 
     it("renders an archive location in the existing breadcrumb trail", () => {
       const pane = createMockPane({
-        archiveLocation: { archivePath: "some/path/backup.zip", virtualPath: "nested" },
+        archiveLocation: { providerId: "zip", archivePath: "some/path/backup.zip", virtualPath: "nested" },
       });
       render(<FileBrowserPane {...defaultProps({ pane })} />);
 
@@ -361,19 +456,6 @@ describe("FileBrowserPane", () => {
     it("does not render search bar in desktop mode", () => {
       render(<FileBrowserPane {...defaultProps()} />);
       expect(screen.queryByTestId("search-bar")).not.toBeInTheDocument();
-    });
-
-    it("renders a refresh button beside live directory updates and uses the existing refresh handler", async () => {
-      const user = userEvent.setup();
-      const pane = createMockPane();
-      render(<FileBrowserPane {...defaultProps({ pane })} />);
-
-      const refreshButton = screen.getByRole("button", { name: "fileBrowser.shortcuts.refresh" });
-      expect(refreshButton).toBeInTheDocument();
-
-      await user.click(refreshButton);
-
-      expect(pane.handleRefresh).toHaveBeenCalledOnce();
     });
 
     it("shows a read-only chip for read-only connections", () => {

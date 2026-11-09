@@ -1,5 +1,6 @@
 """WebSocket endpoints for real-time directory updates"""
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,15 @@ from app.storage.smb import SMBBackend
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+TRANSFER_PROGRESS_SEND_TIMEOUT_SECONDS = 2.0
+SUBSCRIPTION_ERROR_MESSAGES = {
+    "directory_not_found": "The folder was not found. Refresh the folder to recover.",
+    "not_a_directory": "This location is not a folder. Select another folder.",
+    "directory_access_denied": "Access to this folder was denied. Check your permissions and retry.",
+    "directory_timeout": "Folder monitoring timed out. Check the connection and retry.",
+    "directory_unavailable": "Folder monitoring is unavailable. Check the connection and retry.",
+    "connection_unavailable": "The connection is unavailable or access was denied. Check Connections settings.",
+}
 
 
 class ConnectionManager:
@@ -33,19 +43,35 @@ class ConnectionManager:
         self.subscriptions: Dict[WebSocket, Set[str]] = {}
         # Map: WebSocket -> authenticated user
         self.users: Dict[WebSocket, User] = {}
+        self.authentication_tokens: dict[WebSocket, str] = {}
         # Map: subscription key -> resolved SMB path (with path_prefix applied)
         self._resolved_paths: Dict[str, str] = {}
+        self.subscription_errors: dict[WebSocket, str] = {}
 
     #
     # connect
     #
-    async def connect(self, websocket: WebSocket, user: User) -> None:
+    async def connect(self, websocket: WebSocket, user: User, token: str | None = None) -> None:
         """Accept a new WebSocket connection"""
 
         await websocket.accept()
         self.subscriptions[websocket] = set()
         self.users[websocket] = user
+        if token is not None:
+            self.authentication_tokens[websocket] = token
         logger.debug(f"WebSocket connected: {id(websocket)}")
+
+    async def is_authorized(self, websocket: WebSocket) -> bool:
+        token = self.authentication_tokens.get(websocket)
+        if token is None:
+            return True
+        try:
+            with DBSession(engine) as session:
+                await get_current_user_for_token(token, session)
+        except HTTPException:
+            await websocket.close(code=1008, reason="Authentication is no longer valid")
+            return False
+        return True
 
     #
     # disconnect
@@ -60,6 +86,8 @@ class ConnectionManager:
             del self.subscriptions[websocket]
 
         self.users.pop(websocket, None)
+        self.authentication_tokens.pop(websocket, None)
+        self.subscription_errors.pop(websocket, None)
 
         # Remove from active_connections and stop monitoring if last subscriber
         for key in subscriptions_to_remove:
@@ -89,6 +117,7 @@ class ConnectionManager:
     async def subscribe(self, websocket: WebSocket, connection_id: str, path: str) -> bool:
         """Subscribe a WebSocket to directory changes and start SMB monitoring"""
 
+        self.subscription_errors[websocket] = "connection_unavailable"
         current_user = self.users.get(websocket)
         if current_user is None:
             logger.warning(f"Rejected unauthenticated WebSocket subscription: {id(websocket)}")
@@ -146,7 +175,20 @@ class ConnectionManager:
                 )
                 self._resolved_paths[key] = resolved_path
                 logger.debug(f"Started SMB monitoring for {key} (resolved: {resolved_path})")
+            except (FileNotFoundError, NotADirectoryError, PermissionError, TimeoutError) as error:
+                self.subscription_errors[websocket] = (
+                    "directory_not_found"
+                    if isinstance(error, FileNotFoundError)
+                    else "not_a_directory"
+                    if isinstance(error, NotADirectoryError)
+                    else "directory_access_denied"
+                    if isinstance(error, PermissionError)
+                    else "directory_timeout"
+                )
+                logger.info("Directory monitoring target is missing or inaccessible: %s", key)
+                return False
             except Exception as e:
+                self.subscription_errors[websocket] = "directory_unavailable"
                 logger.error(f"Failed to start SMB monitoring for {key}: {e}", exc_info=True)
                 return False
 
@@ -155,7 +197,7 @@ class ConnectionManager:
         self.active_connections.setdefault(key, set()).add(websocket)
 
         logger.debug(f"WebSocket {id(websocket)} subscribed to {key}")
-
+        self.subscription_errors.pop(websocket, None)
         return True
 
     #
@@ -214,6 +256,9 @@ class ConnectionManager:
             disconnected = []
             for websocket in self.active_connections[key]:
                 try:
+                    if not await self.is_authorized(websocket):
+                        disconnected.append(websocket)
+                        continue
                     await websocket.send_json(
                         {
                             "type": "directory_changed",
@@ -240,6 +285,7 @@ class ConnectionManager:
         bytes_transferred: int,
         total_bytes: int | None,
         item_name: str,
+        transfer_attempt_id: str | None = None,
     ) -> None:
         """Broadcast byte-level transfer progress to all WebSocket clients
         subscribed to the parent directory of *path*.
@@ -267,17 +313,28 @@ class ConnectionManager:
             "bytes_transferred": bytes_transferred,
             "total_bytes": total_bytes,
             "item_name": item_name,
+            "transfer_attempt_id": transfer_attempt_id,
         }
 
-        disconnected: list[WebSocket] = []
-        for websocket in self.active_connections[key]:
+        async def send(websocket: WebSocket) -> WebSocket | None:
             try:
-                await websocket.send_json(payload)
-            except Exception:
-                disconnected.append(websocket)
+                if not await self.is_authorized(websocket):
+                    return websocket
+                await asyncio.wait_for(websocket.send_json(payload), timeout=TRANSFER_PROGRESS_SEND_TIMEOUT_SECONDS)
+            except Exception as error:
+                logger.warning(
+                    "Transfer progress WebSocket send failed: connection_id=%s, path=%s, error=%s",
+                    connection_id,
+                    path,
+                    type(error).__name__,
+                )
+                return websocket
+            return None
 
-        for ws in disconnected:
-            self.disconnect(ws)
+        disconnected = await asyncio.gather(*(send(websocket) for websocket in tuple(self.active_connections[key])))
+        for websocket in disconnected:
+            if websocket is not None:
+                self.disconnect(websocket)
 
 
 # Global connection manager instance
@@ -309,21 +366,27 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.close(code=1008, reason="Not authenticated")
             return
 
-    await manager.connect(websocket, current_user)
+    await manager.connect(websocket, current_user, token)
 
     try:
         while True:
             # Receive messages from client
             data = await websocket.receive_json()
+            if not await manager.is_authorized(websocket):
+                break
             action = data.get("action")
             connection_id = data.get("connection_id")
             path = data.get("path", "")
 
             if action == "subscribe" and connection_id:
+                reply = {"connection_id": connection_id, "path": path}
+                if isinstance(data.get("request_id"), str):
+                    reply["request_id"] = data["request_id"]
                 if await manager.subscribe(websocket, connection_id, path):
-                    await websocket.send_json({"type": "subscribed", "connection_id": connection_id, "path": path})
+                    await websocket.send_json({"type": "subscribed", **reply})
                 else:
-                    await websocket.send_json({"type": "error", "message": "Connection not found or access denied"})
+                    code = manager.subscription_errors.pop(websocket, "connection_unavailable")
+                    await websocket.send_json({"type": "error", **reply, "code": code, "message": SUBSCRIPTION_ERROR_MESSAGES[code]})
 
             elif action == "unsubscribe" and connection_id:
                 await manager.unsubscribe(websocket, connection_id, path)
@@ -344,6 +407,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
         manager.disconnect(websocket)
+    finally:
+        manager.disconnect(websocket)
 
 
 # Helper function to trigger notifications (to be called when files change)
@@ -358,6 +423,7 @@ async def notify_transfer_progress(
     bytes_transferred: int,
     total_bytes: int | None,
     item_name: str,
+    transfer_attempt_id: str | None = None,
 ) -> None:
     """Broadcast byte-level transfer progress to subscribed clients."""
     await manager.broadcast_transfer_progress(
@@ -366,4 +432,5 @@ async def notify_transfer_progress(
         bytes_transferred,
         total_bytes,
         item_name,
+        transfer_attempt_id,
     )

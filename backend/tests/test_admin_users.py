@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from app.core.auth_methods import AuthenticationMode
 from app.core.config import settings
 from app.core.security import create_access_token, get_password_hash, verify_password
+from app.core.user_setting_definitions import UserSettingKey
 from app.models.oidc import (
     OidcFlow,
     OidcFlowPurpose,
@@ -20,12 +21,49 @@ from app.models.oidc import (
     OidcRoleAssignmentMode,
     SignInMode,
 )
+from app.models.theme import StoredTheme
 from app.models.user import User, UserRole
+from app.models.user_settings import UserSetting
 from app.services.authentication_config import set_ui_authentication_mode
 
 
 @pytest.mark.integration
 class TestAdminUsers:
+    def test_reports_conflicts_independently_of_filters_and_clears_after_resolution(
+        self, client: TestClient, session: Session, auth_headers_admin: dict, legacy_username_conflict: tuple[User, User]
+    ):
+        first, second = legacy_username_conflict
+        second.is_active = False
+        session.add(second)
+        session.commit()
+        response = client.get("/api/admin/users", headers=auth_headers_admin, params={"q": "no-matching-account", "page_size": 1})
+        assert response.status_code == 200
+        assert response.json()["items"] == []
+        assert response.json()["username_conflicts"] == [["LegacyUser", "legacyuser"]]
+        unchanged = client.patch(f"/api/admin/users/{first.id}", headers=auth_headers_admin, json={"name": "Updated Name"})
+        assert unchanged.status_code == 200
+        case_only = client.patch(f"/api/admin/users/{first.id}", headers=auth_headers_admin, json={"username": "LEGACYUSER"})
+        assert case_only.status_code == 200
+        duplicate = client.post("/api/admin/users", headers=auth_headers_admin, json={"username": "Legacyuser"})
+        assert duplicate.status_code == 400
+        renamed = client.patch(f"/api/admin/users/{second.id}", headers=auth_headers_admin, json={"username": "DistinctUser"})
+        assert renamed.status_code == 200
+        assert client.get("/api/admin/users", headers=auth_headers_admin).json()["username_conflicts"] == []
+
+    def test_rejects_case_insensitive_creation_and_rename(
+        self, client: TestClient, session: Session, auth_headers_admin: dict, regular_user: User
+    ):
+        created = client.post("/api/admin/users", headers=auth_headers_admin, json={"username": regular_user.username.upper()})
+        assert created.status_code == 400
+        other = User(username="AnotherUser", password_hash="hash")
+        session.add(other)
+        session.commit()
+        renamed = client.patch(f"/api/admin/users/{other.id}", headers=auth_headers_admin, json={"username": regular_user.username.upper()})
+        assert renamed.status_code == 400
+        own_case = client.patch(f"/api/admin/users/{other.id}", headers=auth_headers_admin, json={"username": "ANOTHERUSER"})
+        assert own_case.status_code == 200
+        assert own_case.json()["username"] == "ANOTHERUSER"
+
     def test_list_users_as_admin(self, client: TestClient, auth_headers_admin: dict, admin_user: User, regular_user: User):
         response = client.get("/api/admin/users", headers=auth_headers_admin)
 
@@ -573,6 +611,26 @@ class TestAdminUsers:
         assert response.status_code == 200
         assert response.json()["message"] == "User deleted successfully"
         assert session.get(User, regular_user.id) is None
+
+    def test_delete_user_removes_personal_themes_and_settings(
+        self, client: TestClient, auth_headers_admin: dict, regular_user: User, session: Session
+    ):
+        personal_themes = [
+            StoredTheme(id="owned-theme-1", owner_user_id=regular_user.id, definition="{}"),
+            StoredTheme(id="owned-theme-2", owner_user_id=regular_user.id, definition="{}"),
+        ]
+        site_theme = StoredTheme(id="site-theme", definition="{}")
+        session.add_all([*personal_themes, site_theme])
+        session.add(UserSetting(user_id=regular_user.id, key=UserSettingKey.APPEARANCE_THEME_ID.value, value=personal_themes[0].id))
+        session.commit()
+
+        response = client.delete(f"/api/admin/users/{regular_user.id}", headers=auth_headers_admin)
+
+        assert response.status_code == 200
+        assert session.get(User, regular_user.id) is None
+        assert all(session.get(StoredTheme, theme.id) is None for theme in personal_themes)
+        assert session.get(UserSetting, (regular_user.id, UserSettingKey.APPEARANCE_THEME_ID.value)) is None
+        assert session.get(StoredTheme, site_theme.id) is not None
 
     def test_delete_mapped_user_removes_oidc_state(
         self,

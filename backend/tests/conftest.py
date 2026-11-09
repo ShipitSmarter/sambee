@@ -77,6 +77,9 @@ def reload_config():
     app.db.database.settings = new_settings
     app.services.authentication_config.settings = new_settings
 
+    if "app.services.directory_policy_grants" in sys.modules:
+        sys.modules["app.services.directory_policy_grants"].settings = new_settings
+
     # Also patch test modules if they've been imported
     if "tests.test_security" in sys.modules:
         import tests.test_security
@@ -184,6 +187,22 @@ def session_fixture(engine, patch_db_engine) -> Generator[Session, None, None]:
     if transaction.is_active:
         transaction.rollback()
     connection.close()
+
+
+@pytest.fixture
+def legacy_username_conflict(session: Session) -> tuple[User, User]:
+    """Seed pre-upgrade duplicates, then restore the migration's write guards."""
+    from app.db.migrations import _apply_case_insensitive_usernames_migration
+
+    session.connection().exec_driver_sql('UPDATE "user" SET username = username WHERE 0')
+    session.connection().exec_driver_sql("DROP TRIGGER user_username_key_insert")
+    first = User(username="LegacyUser", password_hash=get_password_hash("FirstPassword!"))
+    second = User(username="legacyuser", password_hash=get_password_hash("SecondPassword!"))
+    session.add_all([first, second])
+    session.flush()
+    _apply_case_insensitive_usernames_migration(session.connection())
+    session.commit()
+    return first, second
 
 
 @pytest.fixture(name="client")

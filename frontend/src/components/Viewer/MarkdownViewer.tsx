@@ -1,18 +1,21 @@
-import { Alert, Box, Button, CircularProgress, Dialog, useMediaQuery, useTheme } from "@mui/material";
+import { Refresh } from "@mui/icons-material";
+import { Alert, Box, Button, CircularProgress, Dialog, GlobalStyles, useMediaQuery, useTheme } from "@mui/material";
+import type { Root as MarkdownRoot } from "mdast";
 import {
+  createRef,
   type ErrorInfo,
   type ForwardRefExoticComponent,
   memo,
   type RefAttributes,
+  type RefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 import {
   BROWSER_SHORTCUTS,
@@ -22,7 +25,10 @@ import {
   VIEWER_SHORTCUTS,
 } from "../../config/keyboardShortcuts";
 import { checkIsTransientError, getTransientErrorMessage, useApiRetry } from "../../hooks/useApiRetry";
-import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
+import { useKeyboardShortcuts, withShortcut } from "../../hooks/useKeyboardShortcuts";
+import { useRoutedViewerEditing } from "../../hooks/useRoutedViewerEditing";
+import { useViewerDocumentTitle } from "../../hooks/useViewerDocumentTitle";
+import { useViewerSharing } from "../../hooks/useViewerSharing";
 import {
   beginViewerTextEdit,
   type ContentEditSession,
@@ -32,34 +38,45 @@ import {
 } from "../../pages/FileBrowser/contentProviders";
 import { useTextEditorWordWrapPreference } from "../../pages/FileBrowser/preferences";
 import { clearDraft, type DraftSnapshot, loadDraft, registerDraftSnapshot, saveDraft } from "../../services/draftRecovery";
+import { publishMissingPhysicalFile } from "../../services/fileRecoveryEvents";
 import { error as logError, info as logInfo } from "../../services/logger";
+import { ExpiredEditLockError } from "../../services/storageContracts";
 import { useSambeeTheme } from "../../theme";
 import { getSearchHighlightColors } from "../../theme/commonStyles";
+import { getSyntaxVariables } from "../../theme/syntaxStyles";
 import {
   CODEMIRROR_EDITOR_CONTENT_PADDING,
   CODEMIRROR_EDITOR_HORIZONTAL_INSET_CSS_VARIABLE,
   getMarkdownContentStyles,
   getMarkdownTableSurfaceColors,
   getViewerColors,
+  MARKDOWN_VIEWER_PRINT_STYLES,
   VIEWER_SCROLL_END_PADDING,
 } from "../../theme/viewerStyles";
 import { isApiError } from "../../types";
-import { getApiErrorMessage } from "../../utils/apiErrors";
-import {
-  activateDomTextSearchMatch,
-  applyDomTextSearchHighlights,
-  clearDomTextSearchHighlights,
-  DOM_TEXT_SEARCH_CURRENT_MATCH_ATTRIBUTE,
-  DOM_TEXT_SEARCH_HIGHLIGHT_SELECTOR,
-  type DomTextSearchMatch,
-} from "../../utils/domTextSearch";
+import { classifyFileFailure, getApiErrorMessage } from "../../utils/apiErrors";
 import { openExternalUrl } from "../../utils/externalLinks";
 import type { ViewerComponentProps } from "../../utils/FileTypeRegistry";
 import { blurActiveToolbarControl } from "../../utils/keyboardUtils";
-import { createShareFile, shareNativeContent, shouldWarmNativeSharePayload, supportsNativeShare } from "../../utils/nativeShare";
+import { normalizeMarkdownSource } from "../../utils/markdownCodePreparation";
+import { rehypeMarkdownHeadingLinks } from "../../utils/markdownHeadingLinks";
+import { remarkPreparedMarkdownTree } from "../../utils/markdownPreparedTree";
+import {
+  recordMarkdownPreparation,
+  rehypeMeasureMarkdownPreparation,
+  remarkCollectMarkdownCodeBlocks,
+  remarkMeasureMarkdownPreparation,
+} from "../../utils/markdownSyntax";
+import { publishMarkdownSyntax } from "../../utils/markdownSyntaxPublication";
+import { prepareMarkdownSyntax } from "../../utils/markdownSyntaxWorker";
+import { createShareFile, supportsNativeShare } from "../../utils/nativeShare";
+import type { CodeBlockRequest } from "../../utils/syntaxHighlighting";
+import { createViewportDomTextSearch } from "../../utils/viewportDomTextSearch";
 import { ResponsiveDialogShell } from "../Dialog/ResponsiveDialogShell";
 import { HelpMenu } from "../FileBrowser/HelpMenu";
 import { KeyboardShortcutsHelp } from "../KeyboardShortcutsHelp";
+import { settingsUtilityButtonSx } from "../Settings/settingsButtonStyles";
+import { ViewerShareMenu } from "../Sharing/ViewerShareMenu";
 import { CodeMirrorFindReplacePopover } from "./CodeMirrorFindReplacePopover";
 import { scheduleRetriableFocusRestore } from "./focusRestoration";
 import { loadMarkdownRichEditor } from "./loadMarkdownRichEditor";
@@ -76,12 +93,23 @@ import {
 } from "./markdownEditorConstants";
 import { areMarkdownSearchStatesEqual } from "./markdownSearchState";
 import { normalizeMarkdownTableCellLineBreaks, remarkRenderMarkdownTableCellLineBreaks } from "./markdownTableCellLineBreaks";
+import { PROGRESSIVE_MARKDOWN_MIN_UNITS, ProgressiveMarkdown } from "./ProgressiveMarkdown";
 import { RecoveredDraftDialog } from "./RecoveredDraftDialog";
 import { useMarkdownEditSession } from "./useMarkdownEditSession";
-import { VIEWER_SEARCH_INPUT_ATTRIBUTE, ViewerControls, ViewerFilenameBadge } from "./ViewerControls";
+import { VIEWER_SEARCH_INPUT_ATTRIBUTE, ViewerControls, ViewerFilenameBadge, type ViewerToolbarAction } from "./ViewerControls";
+import {
+  useViewerLockNotice,
+  useViewerOperationError,
+  VIEWER_EDIT_HEARTBEAT_FAILURE_THRESHOLD,
+  VIEWER_EDIT_HEARTBEAT_MS,
+  VIEWER_LOCK_NOTICE_DURATION_MS,
+  ViewerEditAcquisitionStatus,
+  type ViewerNotice,
+  ViewerNotifications,
+  type ViewerReadOnlyReason,
+} from "./ViewerNotifications";
 import { downloadViewerBlob } from "./viewerContent";
-import { createEditToolbarAction, createSaveToolbarAction } from "./viewerToolbarActions";
-import "highlight.js/styles/github.css";
+import { createEditToolbarAction, createPrintToolbarAction, createSaveToolbarAction } from "./viewerToolbarActions";
 
 const MARKDOWN_SEARCH_ROOT_SELECTOR = '[data-markdown-search-root="true"]';
 const MARKDOWN_HASH_PREFIX = "#";
@@ -92,6 +120,90 @@ const MARKDOWN_VIEWER_EDIT_FOCUS_RETRY_DELAYS_MS = [
 ];
 
 type MarkdownRichEditorComponent = ForwardRefExoticComponent<MarkdownRichEditorProps & RefAttributes<MarkdownRichEditorHandle>>;
+
+interface MarkdownPreviewGeneration {
+  id: number;
+  source: string;
+  tree?: MarkdownRoot;
+  requests: RefObject<readonly CodeBlockRequest[] | null>;
+}
+
+const MarkdownPreview = memo(function MarkdownPreview({
+  generation,
+  onExternalLink,
+  onPending,
+  onReady,
+  onFailure,
+}: {
+  generation: MarkdownPreviewGeneration;
+  onExternalLink: () => void;
+  onPending: (generation: MarkdownPreviewGeneration) => void;
+  onReady: (generation: MarkdownPreviewGeneration) => void;
+  onFailure: (generation: MarkdownPreviewGeneration, error: unknown) => void;
+}) {
+  const content = generation.source;
+  const preparation = useMemo(() => ({ source: content, hastReady: 0, requests: [] as CodeBlockRequest[] }), [content]);
+  useLayoutEffect(() => {
+    generation.requests.current = preparation.requests;
+    if (preparation.source === content && preparation.hastReady)
+      recordMarkdownPreparation("hast-ready-to-layout-effect", preparation.hastReady);
+  }, [content, generation, preparation]);
+  return (
+    <ProgressiveMarkdown
+      onPending={() => onPending(generation)}
+      onReady={() => onReady(generation)}
+      onFailure={(error) => onFailure(generation, error)}
+      remarkPlugins={[
+        remarkGfm,
+        remarkMeasureMarkdownPreparation,
+        [remarkPreparedMarkdownTree, generation.tree],
+        [
+          remarkCollectMarkdownCodeBlocks,
+          (requests: CodeBlockRequest[]) => {
+            preparation.requests = requests;
+          },
+        ],
+        remarkRenderMarkdownTableCellLineBreaks,
+      ]}
+      rehypePlugins={[
+        rehypeMarkdownHeadingLinks,
+        [
+          rehypeMeasureMarkdownPreparation,
+          () => {
+            preparation.hastReady = performance.now();
+          },
+        ],
+      ]}
+      components={{
+        a: ({ href, node: _node, ...props }) => {
+          if (typeof href !== "string") return <a {...props} />;
+          const resolvedHref = resolveMarkdownLinkHref(href);
+          if (!resolvedHref) return <span>{props.children}</span>;
+          const opensNewTab = !resolvedHref.startsWith(MARKDOWN_HASH_PREFIX);
+          return (
+            <a
+              {...props}
+              href={resolvedHref}
+              rel={opensNewTab ? "noopener noreferrer" : undefined}
+              target={opensNewTab ? "_blank" : undefined}
+              onClick={
+                opensNewTab
+                  ? (event) => {
+                      event.preventDefault();
+                      openExternalUrl(resolvedHref);
+                      onExternalLink();
+                    }
+                  : undefined
+              }
+            />
+          );
+        },
+      }}
+    >
+      {content}
+    </ProgressiveMarkdown>
+  );
+});
 
 function resolveMarkdownLinkHref(href: string): string | null {
   const trimmedHref = href.trim();
@@ -170,7 +282,7 @@ function withOpacity(color: string, opacity: number): string {
   return color;
 }
 
-type PendingUnsavedChangesAction = "cancel-edit" | "close-viewer" | "stay-edit";
+type PendingUnsavedChangesAction = "cancel-edit" | "stay-edit" | "navigate";
 type MarkdownSearchCloseReason = "escape" | "toggle";
 type EditorModuleLoadState = "idle" | "loading" | "loaded" | "failed";
 
@@ -193,17 +305,23 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   onClose,
   isReadOnly: connectionIsReadOnly = false,
   virtualSource,
+  navigation,
+  isTransitioning = false,
 }) => {
   const isReadOnly = connectionIsReadOnly || virtualSource !== undefined;
   const contentProviders = useContentProviderRegistry();
   const { t } = useTranslation();
   const [content, setContent] = useState<string>("");
+  const [preparedPreview, setPreparedPreview] = useState<{ source: string; tree: MarkdownRoot } | null>(null);
   const [draftContent, setDraftContent] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [editError, setEditError] = useState<string | null>(null);
-  const [shareError, setShareError] = useState<string | null>(null);
+  const [contentLoadAttempt, setContentLoadAttempt] = useState(0);
+  const [editError, setEditError, editErrorOccurrence] = useViewerOperationError();
+  const [printError, setPrintError, printErrorOccurrence] = useViewerOperationError();
+  const [shareRevision, setShareRevision] = useState(0);
   const [draftStorageWarning, setDraftStorageWarning] = useState<string | null>(null);
+  const [normalizationPending, setNormalizationPending] = useState(false);
   const [recoveryDraft, setRecoveryDraft] = useState<DraftSnapshot | null>(null);
   const [isResumingRecoveryDraft, setIsResumingRecoveryDraft] = useState(false);
   const [resumedRecoveryDraft, setResumedRecoveryDraft] = useState(false);
@@ -211,8 +329,16 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   const [showEditorHelp, setShowEditorHelp] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isAcquiring, setIsAcquiring] = useState(false);
+  const [readOnlyReason, setReadOnlyReason] = useState<ViewerReadOnlyReason | null>(null);
+  const [lockNoticeOccurrence, setLockNoticeOccurrence] = useState(0);
+  const [heartbeatWarning, setHeartbeatWarning] = useState(false);
+  const [conflict, setConflict] = useState<{ serverContent: string; draftContent: string } | null>(null);
+  const acquisitionPending = useRef(false);
+  const acquisitionAbort = useRef<AbortController | null>(null);
+  const releasePromise = useRef<Promise<void> | null>(null);
+  const editActivation = useRef(0);
   const [editSession, setEditSession] = useState<ContentEditSession | null>(null);
-  const [sharing, setSharing] = useState(false);
   const [viewerSearchText, setViewerSearchText] = useState("");
   const [editorSearchCaseSensitive, setEditorSearchCaseSensitive] = useState(false);
   const [editorSearchFocusTarget, setEditorSearchFocusTarget] = useState<"find" | "replace" | null>(null);
@@ -247,9 +373,43 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   const dialogRef = useRef<HTMLDivElement>(null);
   const unsavedChangesCancelButtonRef = useRef<HTMLButtonElement | null>(null);
   const editSessionRef = useRef<ContentEditSession | null>(null);
-  const searchHighlightsRef = useRef<DomTextSearchMatch[]>([]);
-  const prefetchedShareFileRef = useRef<File | null>(null);
-  const sharePrefetchPromiseRef = useRef<Promise<File> | null>(null);
+  const previewSearchRef = useRef<ReturnType<typeof createViewportDomTextSearch> | null>(null);
+  const [previewSearchRevision, setPreviewSearchRevision] = useState(0);
+  const previewGenerationCounter = useRef(0);
+  const previewGeneration = useMemo<MarkdownPreviewGeneration>(
+    () => ({
+      id: ++previewGenerationCounter.current,
+      source: content,
+      tree: preparedPreview?.source === content ? preparedPreview.tree : undefined,
+      requests: createRef<readonly CodeBlockRequest[]>(),
+    }),
+    [content, preparedPreview]
+  );
+  const previewRevision = `${previewGeneration.id}:plain`;
+  const latestPreviewGeneration = useRef(previewGeneration);
+  latestPreviewGeneration.current = previewGeneration;
+  const [readyPreviewGeneration, setReadyPreviewGeneration] = useState<MarkdownPreviewGeneration | null>(null);
+  const previewReady = content.length < PROGRESSIVE_MARKDOWN_MIN_UNITS || readyPreviewGeneration === previewGeneration;
+  const handlePreviewPending = useCallback((generation: MarkdownPreviewGeneration) => {
+    if (latestPreviewGeneration.current === generation) setReadyPreviewGeneration(null);
+  }, []);
+  const handlePreviewReady = useCallback((generation: MarkdownPreviewGeneration) => {
+    if (latestPreviewGeneration.current === generation) setReadyPreviewGeneration(generation);
+  }, []);
+  const handlePreviewFailure = useCallback(
+    (generation: MarkdownPreviewGeneration, failure: unknown) => {
+      if (latestPreviewGeneration.current !== generation) return;
+      logError("Unable to finish rendering Markdown; close and reopen the file to retry", { error: failure });
+      setError(t("viewer.renderingFailed"));
+    },
+    [t]
+  );
+  useEffect(() => {
+    if (isEditing) setReadyPreviewGeneration(null);
+  }, [isEditing]);
+  const activeMatchRef = useRef(currentSearchMatch);
+  activeMatchRef.current = currentSearchMatch;
+  const lastPreviewSearch = useRef<{ generation: number; query: string } | null>(null);
   const editBaselineContentRef = useRef("");
   const isEditingRef = useRef(false);
   const editorLoadStateRef = useRef<EditorModuleLoadState>("idle");
@@ -259,7 +419,6 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   const muiTheme = useTheme();
   const isMobile = useMediaQuery(muiTheme.breakpoints.down("sm"));
   const shareEnabled = isMobile && supportsNativeShare();
-  const shareWarmEnabled = shareEnabled && shouldWarmNativeSharePayload();
   const { viewerBg, toolbarBg, toolbarText, viewerText, linkColor, linkHoverColor } = getViewerColors(currentTheme, "markdown");
   const markdownTableSurfaceColors = getMarkdownTableSurfaceColors(muiTheme);
   const searchHighlightColors = useMemo(() => getSearchHighlightColors(muiTheme, currentTheme), [currentTheme, muiTheme]);
@@ -300,6 +459,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
   // Extract filename from path
   const filename = path.split("/").pop() || path;
+  const printDocument = useViewerDocumentTitle(filename);
 
   const focusViewerContent = useCallback(() => {
     if (isEditing) {
@@ -308,6 +468,49 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
     contentRef.current?.focus({ preventScroll: true });
   }, [isEditing]);
+
+  useEffect(() => {
+    const viewport = contentRef.current;
+    if (isEditing || loading || error || !viewport) return;
+    let restore: (() => void) | undefined;
+    let frame: number | undefined;
+    const beforePrint = () => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
+      const scroll = [viewport, ...viewport.querySelectorAll("pre, table")].map((element) => ({
+        element,
+        top: element.scrollTop,
+        left: element.scrollLeft,
+      }));
+      const selection = window.getSelection();
+      const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index).cloneRange()) : [];
+      const focus = document.activeElement;
+      restore = () => {
+        if (focus instanceof HTMLElement && focus.isConnected) focus.focus({ preventScroll: true });
+        if (selection && ranges.every((range) => range.startContainer.isConnected && range.endContainer.isConnected)) {
+          selection.removeAllRanges();
+          for (const range of ranges) selection.addRange(range);
+        }
+        for (const { element, top, left } of scroll) {
+          element.scrollTop = top;
+          element.scrollLeft = left;
+        }
+      };
+    };
+    const afterPrint = () => {
+      frame = requestAnimationFrame(() => {
+        restore?.();
+        restore = undefined;
+        frame = undefined;
+      });
+    };
+    window.addEventListener("beforeprint", beforePrint);
+    window.addEventListener("afterprint", afterPrint);
+    return () => {
+      window.removeEventListener("beforeprint", beforePrint);
+      window.removeEventListener("afterprint", afterPrint);
+      if (frame !== undefined) cancelAnimationFrame(frame);
+    };
+  }, [error, isEditing, loading]);
 
   const restoreEditingFocus = useCallback(() => {
     if (!isEditing) {
@@ -409,6 +612,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     clearPendingBaselineSync,
     handleEditorChange,
     handleEditorUserEdit,
+    getEditGeneration,
     markEditSessionPristine,
     requestRestoreEditingFocus,
   } = useMarkdownEditSession({
@@ -421,13 +625,15 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     setEditBaselineContent,
   });
 
-  // Load markdown content only when the viewed file changes.
+  // Load content for resource changes or explicit Retry.
   // Entering edit mode is a local UI transition and must not re-trigger loading,
   // otherwise the editor subtree is briefly replaced by the loading state.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Explicit Retry must read the same resource again.
   useEffect(() => {
     const abortController = new AbortController();
 
     const loadContent = async () => {
+      let sourceLoaded = false;
       try {
         setLoading(true);
         setError(null);
@@ -439,14 +645,29 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
               { kind: "text" },
               { signal: abortController.signal, virtualSource },
               contentProviders
-            ).then((blob) => blob.text()),
+            ).then(async (blob) => {
+              const start = performance.now();
+              try {
+                return await blob.text();
+              } finally {
+                recordMarkdownPreparation("decode-elapsed", start);
+              }
+            }),
           {
             signal: abortController.signal,
             maxRetries: 1,
             retryDelay: 1000,
           }
         );
-        const normalizedData = normalizeMarkdownTableCellLineBreaks(data);
+        sourceLoaded = true;
+        const normalizationStart = performance.now();
+        let tree: MarkdownRoot | undefined;
+        const normalizedData = await normalizeMarkdownSource(data, abortController.signal, (prepared) => {
+          tree = prepared;
+        });
+        if (abortController.signal.aborted) return;
+        recordMarkdownPreparation("load-normalization-elapsed", normalizationStart);
+        setPreparedPreview(tree ? { source: normalizedData, tree } : null);
         setContent(normalizedData);
         if (!isEditingRef.current && !isReadOnly) {
           const recoveredDraft = loadDraft(connectionId, path, "markdown");
@@ -461,9 +682,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         }
 
         // Show "server busy" only for actual transient/network errors
-        const errorMessage = checkIsTransientError(err)
-          ? getTransientErrorMessage()
-          : getApiErrorMessage(err, "Failed to load markdown file", { includeOriginalMessage: true });
+        const errorMessage =
+          !sourceLoaded && checkIsTransientError(err)
+            ? getTransientErrorMessage()
+            : getApiErrorMessage(err, "Failed to load markdown file", { includeOriginalMessage: true });
 
         setError(errorMessage);
         logError("Error loading markdown:", {
@@ -473,7 +695,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
           detail: isApiError(err) ? err.response?.data?.detail : undefined,
         });
       } finally {
-        setLoading(false);
+        if (!abortController.signal.aborted) setLoading(false);
       }
     };
 
@@ -483,53 +705,58 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       abortController.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionId, contentProviders, fetchWithRetry, isReadOnly, path, setEditBaselineContent, virtualSource]);
+  }, [connectionId, contentProviders, fetchWithRetry, isReadOnly, path, setEditBaselineContent, virtualSource, contentLoadAttempt]);
 
-  useEffect(() => {
-    if (!isEditing) {
+  const snapshotDraft = useCallback(() => {
+    if (!isEditingRef.current) {
       return;
     }
 
-    if (draftContent === editBaselineContentRef.current) {
-      clearDraft(connectionId, path, "markdown");
-      setDraftStorageWarning(null);
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      const result = saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, draftContent);
-      if (result.saved || result.reason === "no-user") {
-        setDraftStorageWarning(null);
-        return;
-      }
-
-      setDraftStorageWarning(
-        result.reason === "too-large" ? t("viewer.edit.recovery.tooLargeWarning") : t("viewer.edit.recovery.storageUnavailableWarning")
-      );
-    }, DRAFT_SNAPSHOT_DEBOUNCE_MS);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [connectionId, draftContent, isEditing, path, t]);
-
-  useEffect(() => {
-    const snapshot = () => {
-      if (!isEditingRef.current) {
-        return;
-      }
-
-      if (draftContent === editBaselineContentRef.current) {
+    try {
+      const editor = editorRef.current;
+      if (!editor) throw new Error("The Markdown editor is not mounted");
+      const latestContent = editor.captureSnapshotSync().serialize();
+      if (latestContent === editBaselineContentRef.current) {
         clearDraft(connectionId, path, "markdown");
+        setDraftStorageWarning(null);
       } else {
-        saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, draftContent);
+        const result = saveDraft(connectionId, path, "markdown", editBaselineContentRef.current, latestContent);
+        if (result.saved || result.reason === "no-user") {
+          setDraftStorageWarning(null);
+        } else {
+          setDraftStorageWarning(
+            result.reason === "too-large" ? t("viewer.edit.recovery.tooLargeWarning") : t("viewer.edit.recovery.storageUnavailableWarning")
+          );
+        }
       }
-    };
-    const unregister = registerDraftSnapshot(snapshot);
-    window.addEventListener("pagehide", snapshot);
+    } catch (error) {
+      logError("Markdown recovery snapshot failed; keep the editor open and save the file", {
+        error,
+        connectionId,
+        path,
+      });
+      if (editorRef.current) setDraftStorageWarning(t("viewer.edit.recovery.storageUnavailableWarning"));
+    }
+  }, [connectionId, path, t]);
+
+  useEffect(() => {
+    if (!isEditing || normalizationPending) return;
+    if (draftContent === editBaselineContentRef.current) {
+      snapshotDraft();
+      return;
+    }
+    const timeoutId = window.setTimeout(snapshotDraft, DRAFT_SNAPSHOT_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [draftContent, isEditing, normalizationPending, snapshotDraft]);
+
+  useEffect(() => {
+    const unregister = registerDraftSnapshot(snapshotDraft);
+    window.addEventListener("pagehide", snapshotDraft);
     return () => {
       unregister();
-      window.removeEventListener("pagehide", snapshot);
+      window.removeEventListener("pagehide", snapshotDraft);
     };
-  }, [connectionId, draftContent, path]);
+  }, [snapshotDraft]);
 
   // Auto-focus the content when loaded so keyboard scrolling works
   useEffect(() => {
@@ -539,6 +766,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
     // Small delay to ensure dialog transition is complete.
     const timeoutId = window.setTimeout(() => {
+      if (isViewerSearchInputFocused()) return;
       focusViewerContent();
     }, MARKDOWN_VIEWER_CONTENT_AUTOFOCUS_DELAY_MS);
 
@@ -579,7 +807,14 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     }
   }, [isEditing]);
 
-  const hasUnsavedChanges = isEditing && draftContent !== editBaselineContent;
+  const handleNormalizationStateChange = useCallback(
+    (pending: boolean, error?: Error) => {
+      setNormalizationPending(pending);
+      if (error) setEditError(error.message);
+    },
+    [setEditError]
+  );
+  const hasUnsavedChanges = isEditing && (normalizationPending || draftContent !== editBaselineContent);
   const unsavedChangesIndicator = hasUnsavedChanges ? (
     <Box
       component="span"
@@ -599,54 +834,83 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     />
   ) : null;
 
-  const readOnlyIndicator = isReadOnly ? (
-    <ViewerFilenameBadge label={t("settings.connectionDialog.accessMode.readOnlyLabel")} toolbarText={toolbarText} />
-  ) : null;
-
-  const filenameAdornment =
-    unsavedChangesIndicator || readOnlyIndicator ? (
-      <Box sx={{ display: "flex", alignItems: "center", gap: isMobile ? 0.75 : 1 }}>
-        {unsavedChangesIndicator}
-        {readOnlyIndicator}
-      </Box>
+  const readOnlyIndicator =
+    isReadOnly || readOnlyReason !== null ? (
+      <ViewerFilenameBadge label={t("settings.connectionDialog.accessMode.readOnlyLabel")} toolbarText={toolbarText} />
     ) : null;
 
-  const releaseEditSession = useCallback(async () => {
-    if (!editSession) {
-      return;
-    }
+  const filenameAdornment = (
+    <Box sx={{ display: "flex", alignItems: "center", gap: isMobile ? 0.75 : 1 }}>
+      {unsavedChangesIndicator}
+      {readOnlyIndicator}
+      <ViewerEditAcquisitionStatus acquiring={isAcquiring && !isTransitioning} />
+    </Box>
+  );
 
-    try {
-      await editSession.release();
-    } catch (err) {
-      logError("Failed to release markdown edit lock", { error: err, path, connectionId });
-    } finally {
-      setEditSession(null);
+  const releaseEditSession = useCallback((): Promise<void> => {
+    if (releasePromise.current) return releasePromise.current;
+    const session = editSessionRef.current;
+    if (!session) {
+      return Promise.resolve();
     }
-  }, [connectionId, editSession, path]);
-
-  useEffect(() => {
-    editSessionRef.current = editSession;
-  }, [editSession]);
+    editSessionRef.current = null;
+    const pending = session
+      .release()
+      .catch((err) => {
+        logError("Failed to release markdown edit lock", { error: err, path, connectionId });
+      })
+      .finally(() => {
+        setEditSession((current) => (current === session ? null : current));
+        releasePromise.current = null;
+      });
+    releasePromise.current = pending;
+    return pending;
+  }, [connectionId, path]);
 
   useEffect(() => {
     if (!isEditing || !editSession) {
       return;
     }
 
+    let active = true;
+    let pending = false;
+    let consecutiveFailures = 0;
     const intervalId = window.setInterval(() => {
-      void editSession.heartbeat().catch((err) => {
-        logError("Failed to refresh markdown edit lock", { error: err, path, connectionId });
-      });
-    }, 30_000);
+      if (!active || pending) return;
+      pending = true;
+      void editSession
+        .heartbeat()
+        .then(() => {
+          consecutiveFailures = 0;
+          if (active) setHeartbeatWarning(false);
+        })
+        .catch((err) => {
+          if (!active) return;
+          if (err instanceof ExpiredEditLockError || (isApiError(err) && err.response?.status === 403)) {
+            snapshotDraft();
+            setReadOnlyReason(err instanceof ExpiredEditLockError ? "lost" : "permission-denied");
+            void releaseEditSession();
+          } else {
+            consecutiveFailures += 1;
+            setHeartbeatWarning(consecutiveFailures >= VIEWER_EDIT_HEARTBEAT_FAILURE_THRESHOLD);
+          }
+          logError("Failed to refresh markdown edit lock", { error: err, path, connectionId });
+        })
+        .finally(() => {
+          pending = false;
+        });
+    }, VIEWER_EDIT_HEARTBEAT_MS);
 
     return () => {
+      active = false;
       window.clearInterval(intervalId);
     };
-  }, [connectionId, editSession, isEditing, path]);
+  }, [connectionId, editSession, isEditing, path, releaseEditSession, snapshotDraft]);
 
   useEffect(() => {
     return () => {
+      editActivation.current += 1;
+      acquisitionAbort.current?.abort();
       if (editSessionRef.current) {
         void editSessionRef.current.release().catch((err) => {
           logError("Failed to release markdown edit lock during cleanup", { error: err, path, connectionId });
@@ -672,100 +936,93 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   );
 
   const loadShareFile = useCallback(
-    async (signal?: AbortSignal) => {
-      if (prefetchedShareFileRef.current) {
-        return prefetchedShareFileRef.current;
-      }
-
-      if (sharePrefetchPromiseRef.current) {
-        return sharePrefetchPromiseRef.current;
-      }
-
-      const shareFilePromise = readViewerContent(connectionId, path, { kind: "raw" }, { signal, virtualSource }, contentProviders).then(
-        (blob) => createShareFile(blob, filename)
-      );
-      sharePrefetchPromiseRef.current = shareFilePromise;
-
-      try {
-        return await shareFilePromise;
-      } finally {
-        if (sharePrefetchPromiseRef.current === shareFilePromise) {
-          sharePrefetchPromiseRef.current = null;
-        }
-      }
-    },
+    (signal: AbortSignal) =>
+      readViewerContent(connectionId, path, { kind: "raw" }, { signal, virtualSource }, contentProviders).then((blob) =>
+        createShareFile(blob, filename)
+      ),
     [connectionId, contentProviders, filename, path, virtualSource]
   );
+  const nativeSharing = useViewerSharing({
+    entryPoint: "markdown",
+    identity: `${connectionId}:${path}:${fileModifiedAt}:${shareRevision}`,
+    enabled: shareEnabled && !loading && !isSaving && !error,
+    loadFile: loadShareFile,
+  });
 
   useEffect(() => {
-    void loadShareFile;
-    prefetchedShareFileRef.current = null;
-    sharePrefetchPromiseRef.current = null;
-  }, [loadShareFile]);
-
-  const handleShareIntent = useCallback(() => {
-    if (!shareWarmEnabled) {
-      return;
-    }
-
-    void loadShareFile();
-  }, [shareWarmEnabled, loadShareFile]);
-
-  const handleShare = useCallback(async () => {
-    setShareError(null);
-    setSharing(true);
-
-    try {
-      const shareFile = await loadShareFile();
-      const result = await shareNativeContent({
-        file: shareFile,
-        title: filename,
-        text: content,
+    const requests = previewGeneration.requests.current;
+    if (isEditing || loading || !previewReady || error || !requests?.length) return;
+    const controller = new AbortController();
+    let dispose: (() => void) | undefined;
+    void prepareMarkdownSyntax(requests, controller.signal)
+      .then((results) => {
+        if (controller.signal.aborted || latestPreviewGeneration.current !== previewGeneration) return;
+        const viewport = contentRef.current;
+        const root = viewport?.querySelector<HTMLElement>(MARKDOWN_SEARCH_ROOT_SELECTOR);
+        if (viewport && root) {
+          dispose = publishMarkdownSyntax(root, viewport, { requests, results }, controller.signal);
+        }
+      })
+      .catch((failure: unknown) => {
+        if (!controller.signal.aborted)
+          logError(
+            "Markdown syntax preparation failed; retaining plain text",
+            { operation: "prepare" },
+            "MarkdownViewer",
+            failure instanceof Error ? failure : undefined
+          );
       });
-
-      if (result === "unsupported") {
-        setShareError(t("viewer.share.unsupported"));
-      }
-    } catch (err) {
-      logError("Failed to share markdown", { error: err, path, connectionId });
-      setShareError(t("viewer.share.failed"));
-    } finally {
-      setSharing(false);
-    }
-  }, [connectionId, content, filename, loadShareFile, path, t]);
-
-  useEffect(() => {
-    const markdownRoot = contentRef.current?.querySelector(MARKDOWN_SEARCH_ROOT_SELECTOR);
-    clearDomTextSearchHighlights(markdownRoot instanceof HTMLElement ? markdownRoot : null);
-    searchHighlightsRef.current = [];
-
-    if (isEditing || !activeViewerSearchText.trim() || loading || error) {
-      setSearchMatches(0);
-      setCurrentSearchMatch(0);
-      return;
-    }
-
-    if (!(markdownRoot instanceof HTMLElement)) {
-      setSearchMatches(0);
-      setCurrentSearchMatch(0);
-      return;
-    }
-
-    const highlights = applyDomTextSearchHighlights(markdownRoot, activeViewerSearchText);
-    searchHighlightsRef.current = highlights;
-    const initialMatch = highlights.length > 0 ? 1 : 0;
-    setSearchMatches(highlights.length);
-    setCurrentSearchMatch(initialMatch);
-    activateDomTextSearchMatch(highlights, initialMatch);
-
     return () => {
-      clearDomTextSearchHighlights(markdownRoot);
-      searchHighlightsRef.current = [];
+      controller.abort();
+      dispose?.();
     };
-  }, [activeViewerSearchText, error, isEditing, loading]);
+  }, [error, isEditing, loading, previewGeneration, previewReady]);
+
+  useLayoutEffect(() => {
+    const viewport = contentRef.current;
+    const markdownRoot = viewport?.querySelector(MARKDOWN_SEARCH_ROOT_SELECTOR);
+    if (isEditing || loading || !previewReady || error || !viewport || !(markdownRoot instanceof HTMLElement)) return;
+    if (markdownRoot?.getAttribute("data-markdown-preview-revision") !== previewRevision) return;
+    const search = createViewportDomTextSearch(markdownRoot, viewport, () => setPreviewSearchRevision((revision) => revision + 1));
+    previewSearchRef.current = search;
+    if (!search.supported) {
+      logInfo(
+        "Preview search highlighting is unavailable in this browser; counts and navigation remain available. Use a browser supporting CSS Highlights for visible matches."
+      );
+    }
+    return () => {
+      search.dispose();
+      if (previewSearchRef.current === search) previewSearchRef.current = null;
+    };
+  }, [error, isEditing, loading, previewRevision, previewReady]);
+
+  useLayoutEffect(() => {
+    const search = previewSearchRef.current;
+    if (isEditing || !activeViewerSearchText.trim() || loading || !previewReady || error) {
+      search?.setQuery("", previewSearchRevision);
+      setSearchMatches(0);
+      setCurrentSearchMatch(0);
+      return;
+    }
+
+    if (!search) {
+      setSearchMatches(0);
+      setCurrentSearchMatch(0);
+      return;
+    }
+
+    const count = search.setQuery(activeViewerSearchText, previewSearchRevision);
+    const unchangedSearch =
+      lastPreviewSearch.current?.generation === previewGeneration.id && lastPreviewSearch.current.query === activeViewerSearchText;
+    const initialMatch = count > 0 ? (unchangedSearch ? Math.max(1, Math.min(activeMatchRef.current, count)) : 1) : 0;
+    lastPreviewSearch.current = { generation: previewGeneration.id, query: activeViewerSearchText };
+    setSearchMatches(count);
+    setCurrentSearchMatch(initialMatch);
+    search.activate(initialMatch, !unchangedSearch);
+  }, [activeViewerSearchText, error, isEditing, loading, previewGeneration.id, previewReady, previewSearchRevision]);
 
   useEffect(() => {
-    activateDomTextSearchMatch(searchHighlightsRef.current, currentSearchMatch);
+    previewSearchRef.current?.activate(currentSearchMatch);
   }, [currentSearchMatch]);
 
   useEffect(() => {
@@ -804,6 +1061,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       setEditBaselineContent(nextContent);
       markEditSessionPristine();
       setEditError(null);
+      setReadOnlyReason(null);
+      setHeartbeatWarning(false);
+      setConflict(null);
+      setDraftStorageWarning(null);
       setEditorLoadError(null);
       setEditorFailed(false);
       setEditorBoundaryKey((previousKey) => previousKey + 1);
@@ -819,6 +1080,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       releaseEditSession,
       searchPanelOpen,
       setEditBaselineContent,
+      setEditError,
     ]
   );
 
@@ -831,20 +1093,68 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   }, [clearBaselineSyncWindow, clearPendingBaselineSync, onClose, releaseEditSession]);
 
   const handleEnterEditMode = useCallback(
-    async (initialDraft = content): Promise<boolean> => {
-      if (isReadOnly || loading || error) {
+    async (initialDraft?: string): Promise<boolean> => {
+      if (editSessionRef.current || acquisitionPending.current) return Boolean(editSessionRef.current);
+      if (isReadOnly || loading || (!isEditing && !previewReady) || error || isTransitioning) {
         return false;
       }
 
       setEditError(null);
       setEditorLoadError(null);
+      const activation = ++editActivation.current;
+      acquisitionPending.current = true;
+      setIsAcquiring(true);
+      const abortController = new AbortController();
+      acquisitionAbort.current = abortController;
+      let acquiredSession: ContentEditSession | null = null;
 
       try {
+        await releasePromise.current;
+        if (activation !== editActivation.current) return false;
         const editResult = await beginViewerTextEdit(connectionId, path, contentProviders);
-        if (editResult.kind !== "acquired") throw new Error(`Editing is ${editResult.kind}`);
+        if (activation !== editActivation.current) {
+          if (editResult.kind === "acquired") await editResult.session.release();
+          return false;
+        }
+        if (editResult.kind !== "acquired") {
+          setReadOnlyReason(editResult.kind);
+          setLockNoticeOccurrence((previous) => previous + 1);
+          if (initialDraft !== undefined) setEditError(t(`viewer.text.readOnlyReasons.${editResult.kind}`));
+          return false;
+        }
+        acquiredSession = editResult.session;
+        let freshContent = content;
+        if (isEditing) {
+          const savedContent = await readViewerContent(
+            connectionId,
+            path,
+            { kind: "text" },
+            { signal: abortController.signal },
+            contentProviders
+          ).then((blob) => blob.text());
+          freshContent = await normalizeMarkdownSource(savedContent, abortController.signal);
+        }
+        if (activation !== editActivation.current) {
+          await editResult.session.release();
+          acquiredSession = null;
+          return false;
+        }
+        editSessionRef.current = editResult.session;
         setEditSession(editResult.session);
 
-        setDraftContent(normalizeMarkdownTableCellLineBreaks(initialDraft));
+        const retainedDraft = isEditing
+          ? (editorRef.current?.captureSnapshotSync().serialize() ?? draftContent)
+          : (initialDraft ?? content);
+        const needsConflictDecision = isEditing && freshContent !== content && retainedDraft !== freshContent;
+        setReadOnlyReason(needsConflictDecision ? "conflict" : null);
+        setHeartbeatWarning(false);
+        setConflict(needsConflictDecision ? { serverContent: freshContent, draftContent: retainedDraft } : null);
+        if (isEditing) {
+          setContent(freshContent);
+          if (!needsConflictDecision) setEditBaselineContent(freshContent);
+          return true;
+        }
+        setDraftContent(normalizeMarkdownTableCellLineBreaks(retainedDraft));
         setEditBaselineContent(content);
         setEditorSearchText(searchPanelOpen ? viewerSearchText : "");
         setEditorSearchAutoNavigate(true);
@@ -861,12 +1171,28 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         setEditorFailed(false);
         setEditorBoundaryKey((previousKey) => previousKey + 1);
         setIsEditing(true);
+        navigation?.onModeChange("edit");
         return true;
       } catch (err) {
-        const message = getApiErrorMessage(err, t("viewer.edit.lockFailedReason"), { includeOriginalMessage: true });
-        setEditError(t("viewer.edit.lockFailed", { message }));
+        if (acquiredSession) {
+          if (editSessionRef.current === acquiredSession) {
+            editSessionRef.current = null;
+            setEditSession(null);
+          }
+          await acquiredSession
+            .release()
+            .catch((releaseError) => logError("Failed to release unused markdown edit lock", { error: releaseError, connectionId, path }));
+        }
+        if (activation !== editActivation.current) return false;
+        setReadOnlyReason(isApiError(err) && err.response?.status === 403 ? "permission-denied" : "unavailable");
+        const message = getApiErrorMessage(err, t("viewer.text.lockFailedReason"), { includeOriginalMessage: true });
+        setEditError(t("viewer.text.lockFailed", { message }));
         logError("Failed to enter markdown edit mode", { error: err, path, connectionId });
         return false;
+      } finally {
+        if (acquisitionAbort.current === abortController) acquisitionAbort.current = null;
+        acquisitionPending.current = false;
+        setIsAcquiring(false);
       }
     },
     [
@@ -875,16 +1201,22 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       connectionId,
       contentProviders,
       content,
+      draftContent,
+      isEditing,
+      isTransitioning,
       EditorComponent,
       error,
       isReadOnly,
       loading,
+      previewReady,
       markEditSessionPristine,
       path,
       searchPanelOpen,
       setEditBaselineContent,
       t,
       viewerSearchText,
+      navigation,
+      setEditError,
     ]
   );
 
@@ -905,15 +1237,38 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       .finally(() => setIsResumingRecoveryDraft(false));
   }, [handleEnterEditMode, isResumingRecoveryDraft, recoveryDraft]);
 
+  const routedEditing = useRoutedViewerEditing({
+    navigation,
+    isEditing,
+    isSaving,
+    isAcquiring,
+    loading: loading || (!isEditing && !previewReady),
+    dirty: hasUnsavedChanges,
+    enterEdit: handleEnterEditMode,
+    exitEdit: exitEditMode,
+    cancelAcquisition: () => {
+      editActivation.current += 1;
+      acquisitionAbort.current?.abort();
+    },
+    requestUnsavedChanges: () => {
+      preserveMarkdownEditorSelection(editorRef);
+      setPendingUnsavedChangesAction("navigate");
+    },
+  });
+
   const handleDiscardRecoveryDraft = useCallback(() => {
     clearDraft(connectionId, path, "markdown");
     setDraftContent(content);
     setEditBaselineContent(content);
     setEditError(null);
     setRecoveryDraft(null);
-  }, [connectionId, content, path, setEditBaselineContent]);
+  }, [connectionId, content, path, setEditBaselineContent, setEditError]);
 
   const handleCancelEdit = useCallback(async () => {
+    if (navigation) {
+      navigation.onModeChange("view");
+      return;
+    }
     if (hasUnsavedChanges) {
       preserveMarkdownEditorSelection(editorRef);
       setPendingUnsavedChangesAction("cancel-edit");
@@ -921,7 +1276,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     }
 
     await exitEditMode();
-  }, [exitEditMode, hasUnsavedChanges]);
+  }, [exitEditMode, hasUnsavedChanges, navigation]);
 
   const persistDraft = useCallback(
     async (afterSave: PendingUnsavedChangesAction = "stay-edit") => {
@@ -937,7 +1292,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         return false;
       }
 
-      if (isReadOnly) {
+      if (isReadOnly || readOnlyReason !== null || isAcquiring) {
         emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:skipped", { reason: "read-only" });
         return false;
       }
@@ -949,50 +1304,77 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
       setEditError(null);
       setIsSaving(true);
+      let writingTarget = false;
 
       try {
-        let savedContent = draftContent;
-
-        if (editorRef.current) {
-          // While a nested table cell is focused, the wrapper draft can be
-          // behind the live nested editor. Save must flush pending publication
-          // and then persist the editor's canonical export, not the stale draft.
-          emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:flush-start");
-          await editorRef.current.flushPendingEdits();
-          emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:flush-resolved");
-          savedContent = editorRef.current.getCanonicalMarkdown();
-          emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:getCanonicalMarkdown", {
-            savedContentLength: savedContent.length,
-          });
-        }
-
-        savedContent = normalizeMarkdownTableCellLineBreaks(savedContent);
+        const editor = editorRef.current;
+        if (!editor) throw new Error("Markdown editor is no longer available for saving");
+        const saveGeneration = getEditGeneration();
+        emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:flush-start");
+        const snapshot = await editor.captureSnapshot();
+        emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:flush-resolved");
+        const savedContent = snapshot.serialize();
+        emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:getCanonicalMarkdown", {
+          savedContentLength: savedContent.length,
+          revision: snapshot.revision,
+        });
 
         if (!editSession) throw new Error("Edit session is no longer active");
-        await editSession.writeText(savedContent, { mimeType: "text/markdown;charset=utf-8" });
+        writingTarget = true;
+        await editSession.writeText(savedContent, { mimeType: "text/markdown;charset=utf-8", reacquireExpiredLock: false });
         emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:save-resolved", {
           savedContentLength: savedContent.length,
         });
+        let hasNewerEdits = getEditGeneration() !== saveGeneration;
+        if (hasNewerEdits) {
+          try {
+            hasNewerEdits = editor.captureSnapshotSync().serialize() !== savedContent;
+          } catch (error) {
+            logInfo(
+              "Markdown Save completed; newer edits remain dirty because their snapshot is not ready",
+              { error, path, connectionId },
+              "MarkdownViewer"
+            );
+          }
+        }
         clearPendingBaselineSync();
-        beginBaselineSyncWindow();
+        if (hasNewerEdits) clearBaselineSyncWindow();
+        else beginBaselineSyncWindow();
+        setPreparedPreview((prepared) => (prepared?.source === savedContent ? prepared : null));
         setContent(savedContent);
-        setDraftContent(savedContent);
+        setShareRevision((revision) => revision + 1);
         setEditBaselineContent(savedContent);
-        markEditSessionPristine();
-        clearDraft(connectionId, path, "markdown");
+        if (!hasNewerEdits) {
+          setDraftContent(savedContent);
+          markEditSessionPristine();
+          clearDraft(connectionId, path, "markdown");
+        }
 
-        if (afterSave === "close-viewer") {
-          await closeViewer();
-        } else if (afterSave === "cancel-edit") {
+        if (afterSave === "cancel-edit" && !hasNewerEdits) {
           await exitEditMode(savedContent);
         }
 
-        return true;
+        return !hasNewerEdits;
       } catch (err) {
         emitMarkdownDebugTrace("MarkdownViewer", "persistDraft:error", {
           message: err instanceof Error ? err.message : String(err),
         });
-        setEditError(getApiErrorMessage(err, t("viewer.edit.saveFailed"), { includeOriginalMessage: true }));
+        const failure = classifyFileFailure(err, path);
+        snapshotDraft();
+        if (failure.kind === "missing") {
+          publishMissingPhysicalFile({ connectionId, path });
+          setReadOnlyReason("unavailable");
+          await releaseEditSession();
+        }
+        if (err instanceof ExpiredEditLockError || (isApiError(err) && [403, 409].includes(err.response?.status ?? 0))) {
+          setReadOnlyReason(err instanceof ExpiredEditLockError ? "lost" : err.response?.status === 403 ? "permission-denied" : "locked");
+          await releaseEditSession();
+        }
+        setEditError(
+          writingTarget
+            ? `${t("viewer.edit.saveFailed")} ${failure.message}`
+            : getApiErrorMessage(err, t("viewer.edit.saveFailed"), { includeOriginalMessage: true })
+        );
         logError("Failed to save markdown", { error: err, path, connectionId });
         return false;
       } finally {
@@ -1010,12 +1392,13 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     },
     [
       beginBaselineSyncWindow,
+      clearBaselineSyncWindow,
       clearPendingBaselineSync,
-      closeViewer,
       connectionId,
       draftContent,
       editSession,
       exitEditMode,
+      getEditGeneration,
       isEditing,
       isReadOnly,
       markEditSessionPristine,
@@ -1024,6 +1407,11 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       restoreEditingFocus,
       setEditBaselineContent,
       t,
+      readOnlyReason,
+      releaseEditSession,
+      snapshotDraft,
+      setEditError,
+      isAcquiring,
     ]
   );
 
@@ -1032,18 +1420,18 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   }, [persistDraft]);
 
   const handleRequestClose = useCallback(async () => {
-    if (isEditing && hasUnsavedChanges) {
-      preserveMarkdownEditorSelection(editorRef);
-      setPendingUnsavedChangesAction("close-viewer");
+    if (isEditing) {
+      await handleCancelEdit();
       return;
     }
 
     await closeViewer();
-  }, [closeViewer, hasUnsavedChanges, isEditing]);
+  }, [closeViewer, handleCancelEdit, isEditing]);
 
   const handleUnsavedChangesDialogClose = useCallback(() => {
+    routedEditing.cancelNavigation();
     setPendingUnsavedChangesAction(null);
-  }, []);
+  }, [routedEditing]);
 
   useEffect(() => {
     if (!unsavedChangesDialogOpen) {
@@ -1095,21 +1483,19 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       clearDraft(connectionId, path, "markdown");
     }
 
-    if (pendingUnsavedChangesAction === "close-viewer") {
-      await closeViewer();
-      return;
-    }
-
-    await exitEditMode();
-  }, [closeViewer, connectionId, exitEditMode, path, pendingUnsavedChangesAction, resumedRecoveryDraft]);
+    if (pendingUnsavedChangesAction === "navigate") await routedEditing.completeNavigation();
+    else await exitEditMode();
+  }, [connectionId, exitEditMode, path, resumedRecoveryDraft, pendingUnsavedChangesAction, routedEditing]);
 
   const handleUnsavedChangesSave = useCallback(async () => {
     if (!pendingUnsavedChangesAction) {
       return;
     }
 
-    await persistDraft(pendingUnsavedChangesAction);
-  }, [pendingUnsavedChangesAction, persistDraft]);
+    if (pendingUnsavedChangesAction === "navigate") {
+      if (await persistDraft("stay-edit")) await routedEditing.completeNavigation();
+    } else await persistDraft(pendingUnsavedChangesAction);
+  }, [pendingUnsavedChangesAction, persistDraft, routedEditing]);
 
   // Toggle fullscreen mode
   const handleToggleFullscreen = useCallback(() => {
@@ -1166,11 +1552,6 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     [isEditing]
   );
 
-  // Context-aware Escape handler (window-level via useKeyboardShortcuts)
-  // Blur-first logic lives on the Dialog Paper's onKeyDown instead,
-  // because it must fire before the parent FileBrowser's window listener.
-  // - If in fullscreen: exit fullscreen
-  // - Otherwise: close the viewer
   const handleEscape = useCallback(
     (_event?: KeyboardEvent) => {
       if (searchPanelOpen || isViewerSearchInputFocused()) {
@@ -1188,7 +1569,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
   const handleOpenSearch = useCallback(
     (_event?: KeyboardEvent) => {
-      if (loading || error || (isEditing && !editorSearchState.isSearchable)) {
+      if (loading || error || (!isEditing && !previewReady) || (isEditing && !editorSearchState.isSearchable)) {
         return;
       }
 
@@ -1204,7 +1585,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
       setSearchPanelOpen(true);
     },
-    [editorSearchState.isSearchable, error, isEditing, loading]
+    [editorSearchState.isSearchable, error, isEditing, loading, previewReady]
   );
 
   const handleOpenReplace = useCallback(() => {
@@ -1236,10 +1617,11 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   );
 
   const activeEditorSearchText = isEditing && searchPanelOpen ? editorSearchText : "";
-  const editorShouldBeReadOnly = Boolean(isSaving && pendingUnsavedChangesAction);
+  const editorShouldBeReadOnly = readOnlyReason !== null || isAcquiring || Boolean(isSaving && pendingUnsavedChangesAction);
 
   const handleSearchPanelToggle = useCallback(
     (open: boolean) => {
+      if (open && !isEditing && !previewReady) return;
       if (open) {
         if (isEditing) {
           setEditorSearchText("");
@@ -1252,7 +1634,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
       closeSearchPanel({ preserveQuery: isEditing, restoreEditorFocus: false });
     },
-    [closeSearchPanel, isEditing]
+    [closeSearchPanel, isEditing, previewReady]
   );
 
   const handleSearchClose = useCallback(
@@ -1264,7 +1646,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
   const runEditorCommand = useCallback(
     (commandLabel: string, command: () => void) => {
-      if (!isEditing || editorFailed || editorLoadState !== "loaded" || editorLoadError || !EditorComponent) {
+      if (!isEditing || editorShouldBeReadOnly || editorFailed || editorLoadState !== "loaded" || editorLoadError || !EditorComponent) {
         return;
       }
 
@@ -1278,7 +1660,18 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         logError("Markdown editor command failed", { error: err, path, connectionId, command: commandLabel });
       }
     },
-    [EditorComponent, connectionId, editorFailed, editorLoadError, editorLoadState, isEditing, path, t]
+    [
+      EditorComponent,
+      connectionId,
+      editorFailed,
+      editorLoadError,
+      editorLoadState,
+      editorShouldBeReadOnly,
+      isEditing,
+      path,
+      t,
+      setEditError,
+    ]
   );
 
   const handleReplaceCurrent = useCallback(() => {
@@ -1316,7 +1709,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
     }
 
     setEditorBoundaryKey((previousKey) => previousKey + 1);
-  }, [editorLoadState]);
+  }, [editorLoadState, setEditError]);
 
   const handleToggleInlineCode = useCallback(() => {
     runEditorCommand(t("viewer.shortcuts.inlineCode"), () => {
@@ -1399,10 +1792,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
   );
 
   /**
-   * Paper-level keydown handler — single authority for all Escape logic.
-   * MUI Dialogs render in a portal at document.body (outside the React root),
-   * so native events may not reliably reach window listeners. Handling
-   * everything here and calling preventDefault() makes close robust.
+   * Handles Escape not already consumed by a capture-phase shortcut or child.
    * 1. If a toolbar button/input has focus → blur it (hide focus ring)
    * 2. If in fullscreen → exit fullscreen
    * 3. Otherwise → close the viewer
@@ -1413,7 +1803,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         return;
       }
 
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       event.stopPropagation();
       if (isMarkdownEditorTextInputFocused()) {
@@ -1522,12 +1912,12 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       {
         ...COMMON_SHORTCUTS.NEXT_MATCH,
         handler: handleSearchNext,
-        enabled: isEditing && searchMatches > 0,
+        enabled: isEditing && (searchMatches > 0 || Boolean(editorSearchState.pending || editorSearchState.error)),
       },
       {
         ...COMMON_SHORTCUTS.PREVIOUS_MATCH,
         handler: handleSearchPrevious,
-        enabled: isEditing && searchMatches > 0,
+        enabled: isEditing && (searchMatches > 0 || Boolean(editorSearchState.pending || editorSearchState.error)),
       },
       {
         ...COMMON_SHORTCUTS.SAVE,
@@ -1642,6 +2032,8 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
       isSaving,
       loading,
       editorSearchMode,
+      editorSearchState.pending,
+      editorSearchState.error,
       searchPanelOpen,
       searchMatches,
       setWordWrapEnabled,
@@ -1652,15 +2044,27 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
   const isSearchable = isEditing
     ? !editorFailed && editorLoadState === "loaded" && !editorLoadError && editorSearchState.isSearchable
-    : !loading && !error && content.trim().length > 0;
+    : !loading && previewReady && !error && content.trim().length > 0;
 
   useKeyboardShortcuts({
     active: !showViewerHelp && !showEditorHelp,
-    shortcuts: [...markdownViewerShortcuts, ...markdownEditorShortcuts],
+    shortcuts: [
+      ...markdownViewerShortcuts,
+      ...markdownEditorShortcuts,
+      {
+        ...COMMON_SHORTCUTS.RETRY_EDITING,
+        handler: () => void handleEnterEditMode(),
+        allowInInput: true,
+        enabled:
+          (readOnlyReason === "locked" || readOnlyReason === "unavailable" || readOnlyReason === "lost") &&
+          !isAcquiring &&
+          !isTransitioning,
+      },
+    ],
     inputSelector: "input, textarea",
   });
 
-  const toolbarActions = useMemo(
+  const toolbarActions = useMemo<ViewerToolbarAction[]>(
     () =>
       isEditing
         ? [
@@ -1670,11 +2074,25 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
                 void handleSave();
               },
               isMobile,
-              disabled: isSaving || editorLoadState !== "loaded" || !!editorLoadError,
+              disabled: editorShouldBeReadOnly || isSaving || editorLoadState !== "loaded" || !!editorLoadError,
             }),
           ]
         : [
-            ...(isReadOnly
+            createPrintToolbarAction({
+              id: "print-markdown",
+              isMobile,
+              disabled: loading || !previewReady || !!error,
+              onClick: () => {
+                setPrintError(null);
+                try {
+                  printDocument();
+                } catch (error) {
+                  logError("Unable to open Markdown print dialog", { error });
+                  setPrintError(t("viewer.printError"));
+                }
+              },
+            }),
+            ...(isReadOnly || readOnlyReason !== null
               ? []
               : [
                   createEditToolbarAction({
@@ -1683,12 +2101,51 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
                       void handleEnterEditMode();
                     },
                     isMobile,
-                    disabled: loading || !!error,
+                    disabled: isAcquiring || loading || !previewReady || !!error,
                   }),
                 ]),
           ],
-    [editorLoadError, editorLoadState, error, handleEnterEditMode, handleSave, isEditing, isMobile, isReadOnly, isSaving, loading]
+    [
+      editorLoadError,
+      editorLoadState,
+      editorShouldBeReadOnly,
+      error,
+      handleEnterEditMode,
+      handleSave,
+      isEditing,
+      isAcquiring,
+      isMobile,
+      isReadOnly,
+      isSaving,
+      loading,
+      previewReady,
+      printDocument,
+      readOnlyReason,
+      setPrintError,
+      t,
+    ]
   );
+
+  const actions = [...toolbarActions];
+  if (readOnlyReason === "locked" || readOnlyReason === "unavailable" || readOnlyReason === "lost") {
+    actions.push({
+      id: "retry-editing",
+      kind: "icon",
+      icon: <Refresh fontSize={isMobile ? "small" : "medium"} />,
+      label: t("viewer.text.retryEditing"),
+      title: withShortcut(COMMON_SHORTCUTS.RETRY_EDITING),
+      disabled: isAcquiring || isTransitioning,
+      onClick: () => void handleEnterEditMode(),
+    });
+  }
+  const lockNotice = useViewerLockNotice(readOnlyReason, editError, editErrorOccurrence + lockNoticeOccurrence);
+  const notices: ViewerNotice[] = [];
+  if (lockNotice) notices.push(lockNotice);
+  else if (editError) notices.push({ id: "edit-error", message: editError, severity: "error", occurrence: editErrorOccurrence });
+  if (printError) notices.push({ id: "print-error", message: printError, severity: "error", occurrence: printErrorOccurrence });
+  if (heartbeatWarning && readOnlyReason === null)
+    notices.push({ id: "heartbeat", message: t("viewer.text.heartbeatFailed"), severity: "warning" });
+  if (draftStorageWarning) notices.push({ id: "draft-storage", message: draftStorageWarning, severity: "warning" });
 
   // Log when markdown viewer opens
   useEffect(() => {
@@ -1719,8 +2176,11 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
 
   return (
     <>
+      {!isEditing && !loading && !error && <GlobalStyles styles={MARKDOWN_VIEWER_PRINT_STYLES} />}
       <Dialog
-        open={true}
+        data-markdown-print-viewer={!isEditing && !loading && !error ? "true" : undefined}
+        aria-busy={isTransitioning}
+        open
         onClose={handleDialogClose}
         maxWidth={false}
         fullScreen
@@ -1737,10 +2197,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
             onKeyDown: handlePaperKeyDown,
             sx: {
               margin: 0,
-              width: "100dvw",
-              maxWidth: "100dvw",
-              height: "100dvh",
-              maxHeight: "100dvh",
+              width: "100%",
+              maxWidth: "100%",
+              height: "100%",
+              maxHeight: "100%",
               display: "flex",
               flexDirection: "column",
               backgroundColor: viewerBg,
@@ -1749,6 +2209,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         }}
       >
         <Box
+          data-markdown-print-frame="true"
           sx={{
             position: "relative",
             width: "100%",
@@ -1761,6 +2222,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         >
           {/* Markdown Controls Overlay */}
           <Box
+            data-markdown-print-controls="true"
             sx={{
               flexShrink: 0,
               zIndex: 1,
@@ -1771,7 +2233,7 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
               filenameAdornment={filenameAdornment}
               toolbarBackground={toolbarBg}
               toolbarText={toolbarText}
-              actions={toolbarActions}
+              actions={actions}
               toolbarAccessory={
                 isEditing ? (
                   <HelpMenu
@@ -1805,9 +2267,23 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
                 hideSearchPanel: isEditing,
               }}
               onDownload={handleDownload}
-              onShare={handleShare}
-              onShareIntent={handleShareIntent}
-              shareDisabled={sharing}
+              shareControl={
+                <ViewerShareMenu
+                  onFile={nativeSharing.shareFile}
+                  onText={() =>
+                    nativeSharing.shareText(() => {
+                      if (!isEditing) return content;
+                      const editor = editorRef.current;
+                      if (!editor) throw new Error("The Markdown editor is not mounted for sharing");
+                      return editor.captureSnapshotSync().serialize();
+                    })
+                  }
+                  fileDisabled={!nativeSharing.ready || isSaving}
+                  filePreparing={nativeSharing.preparing}
+                  textDisabled={loading || Boolean(error) || (isEditing && normalizationPending)}
+                  disabled={nativeSharing.sharing}
+                />
+              }
             />
           </Box>
 
@@ -1817,8 +2293,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
               currentMatch={currentSearchMatch}
               disabled={isSaving || editorLoadState !== "loaded" || Boolean(editorLoadError) || editorFailed}
               focusTarget={editorSearchFocusTarget}
-              isReplaceMode={editorSearchMode === "replace"}
+              isReplaceMode={editorSearchMode === "replace" && !editorShouldBeReadOnly}
               isSearchValid={editorSearchState.isValid}
+              searchPending={editorSearchState.pending}
+              searchError={editorSearchState.error}
               onCaseSensitiveChange={setEditorSearchCaseSensitive}
               onClose={() => closeSearchPanel({ preserveQuery: true, restoreEditorFocus: true })}
               onFindNext={handleSearchNext}
@@ -1839,23 +2317,14 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
             />
           )}
 
-          {editError && (
-            <Alert severity="error" sx={{ m: 2, flexShrink: 0 }}>
-              {editError}
-            </Alert>
-          )}
-
-          {shareError && (
-            <Alert severity="error" sx={{ m: 2, flexShrink: 0 }}>
-              {shareError}
-            </Alert>
-          )}
-
-          {draftStorageWarning && (
-            <Alert severity="warning" sx={{ m: 2, flexShrink: 0 }}>
-              {draftStorageWarning}
-            </Alert>
-          )}
+          <ViewerNotifications
+            key={JSON.stringify([connectionId, path])}
+            notices={notices.map((notice) => ({ ...notice, duration: VIEWER_LOCK_NOTICE_DURATION_MS }))}
+            toolbarBackground={toolbarBg}
+            toolbarText={toolbarText}
+            suppressed={Boolean(unsavedChangesDialogOpen || recoveryDraft || conflict)}
+          />
+          {nativeSharing.failureDialog}
 
           {/* Markdown content area - flex grows to fill remaining space */}
           <Box
@@ -1890,7 +2359,22 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
               </Box>
             ) : error ? (
               <Box sx={{ p: 2 }}>
-                <Alert severity="error">{error}</Alert>
+                <Alert
+                  severity="error"
+                  sx={{ overflowWrap: "anywhere" }}
+                  action={
+                    <Button
+                      color="inherit"
+                      size="small"
+                      startIcon={<Refresh />}
+                      onClick={() => setContentLoadAttempt((attempt) => attempt + 1)}
+                    >
+                      {t("common.actions.retry")}
+                    </Button>
+                  }
+                >
+                  {error}
+                </Alert>
               </Box>
             ) : isEditing ? (
               <Box
@@ -1969,9 +2453,10 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
                       lineWrapping={wordWrapEnabled}
                       onChange={handleEditorChange}
                       onUserEdit={handleEditorUserEdit}
+                      onNormalizationStateChange={handleNormalizationStateChange}
                       ariaLabel={t("viewer.edit.editorLabel")}
                       autoFocus={true}
-                      readOnly={editorShouldBeReadOnly}
+                      readOnly={editorShouldBeReadOnly || routedEditing.isExiting}
                       searchText={activeEditorSearchText}
                       searchOpen={searchPanelOpen}
                       searchAutoNavigate={editorSearchAutoNavigate}
@@ -1986,65 +2471,32 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
               </Box>
             ) : (
               <Box
+                key={previewRevision}
                 data-markdown-search-root="true"
+                data-markdown-preview-revision={previewRevision}
+                onClickCapture={(event) => {
+                  if (!previewReady && event.target instanceof Element && event.target.closest('a[href^="#"]')) event.preventDefault();
+                }}
+                style={getSyntaxVariables(muiTheme, linkColor)}
                 sx={{
                   ...getMarkdownContentStyles(viewerText, linkColor, linkHoverColor),
-                  [`& ${DOM_TEXT_SEARCH_HIGHLIGHT_SELECTOR}`]: {
-                    backgroundColor: searchHighlightColors.otherMatches,
-                    borderRadius: 0.5,
-                    padding: 0,
-                  },
-                  [`& ${DOM_TEXT_SEARCH_HIGHLIGHT_SELECTOR}[${DOM_TEXT_SEARCH_CURRENT_MATCH_ATTRIBUTE}="true"]`]: {
-                    backgroundColor: searchHighlightColors.currentMatch,
-                  },
+                  ...(!previewReady ? { "@media print": { display: "none !important" } } : {}),
+                  "--sambee-search-other": searchHighlightColors.otherMatches,
+                  "--sambee-search-current": searchHighlightColors.currentMatch,
+                  "--sambee-search-foreground": viewerText,
                 }}
               >
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkRenderMarkdownTableCellLineBreaks]}
-                  rehypePlugins={[rehypeHighlight]}
-                  components={{
-                    // Destructure `node` (injected by react-markdown's passNode)
-                    // so it is not spread onto the native <a> DOM element.
-                    a: ({ href, node: _node, ...props }) => {
-                      if (typeof href !== "string") {
-                        return <a {...props} />;
-                      }
-
-                      const resolvedHref = resolveMarkdownLinkHref(href);
-
-                      if (!resolvedHref) {
-                        return <span>{props.children}</span>;
-                      }
-
-                      const opensNewTab = !resolvedHref.startsWith(MARKDOWN_HASH_PREFIX);
-
-                      const handleLinkClick = opensNewTab
-                        ? (event: React.MouseEvent) => {
-                            event.preventDefault();
-                            openExternalUrl(resolvedHref);
-
-                            // External links leave focus on the clicked anchor.
-                            // Restore focus to the viewer surface so single-key
-                            // shortcuts keep working when the user returns.
-                            focusViewerContent();
-                          }
-                        : undefined;
-
-                      return (
-                        <a
-                          {...props}
-                          href={resolvedHref}
-                          rel={opensNewTab ? "noopener noreferrer" : undefined}
-                          target={opensNewTab ? "_blank" : undefined}
-                          onClick={handleLinkClick}
-                        />
-                      );
-                    },
-                  }}
-                >
-                  {content}
-                </ReactMarkdown>
+                <MarkdownPreview
+                  generation={previewGeneration}
+                  onExternalLink={focusViewerContent}
+                  onPending={handlePreviewPending}
+                  onReady={handlePreviewReady}
+                  onFailure={handlePreviewFailure}
+                />
               </Box>
+            )}
+            {!isEditing && !loading && !error && !previewReady && (
+              <Box sx={{ display: "none", "@media print": { display: "block" } }}>{t("viewer.renderingPrintPending")}</Box>
             )}
           </Box>
         </Box>
@@ -2071,10 +2523,13 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
           }
         }}
         title={t("viewer.edit.unsavedChangesTitle")}
-        description={
-          pendingUnsavedChangesAction === "close-viewer"
-            ? t("viewer.edit.unsavedChangesCloseMessage")
-            : t("viewer.edit.unsavedChangesExitMessage")
+        description={t("viewer.edit.unsavedChangesExitMessage")}
+        actionNotice={
+          editError || lockNotice ? (
+            <Alert severity={editError ? "error" : "info"} role={editError ? "alert" : "status"}>
+              {editError || lockNotice?.message}
+            </Alert>
+          ) : null
         }
         maxWidth="xs"
         disableAutoFocus
@@ -2084,16 +2539,69 @@ export const MarkdownViewer: React.FC<ViewerComponentProps> = ({
         onTransitionExited={handleUnsavedChangesDialogExited}
         actions={
           <>
-            <Button ref={unsavedChangesCancelButtonRef} onClick={handleUnsavedChangesDialogClose} disabled={isSaving} autoFocus>
+            <Button
+              ref={unsavedChangesCancelButtonRef}
+              onClick={handleUnsavedChangesDialogClose}
+              disabled={isSaving}
+              autoFocus
+              variant="outlined"
+              sx={settingsUtilityButtonSx}
+            >
               {t("common.actions.cancel")}
             </Button>
-            <Button onClick={() => void handleUnsavedChangesDiscard()} disabled={isSaving} color="warning">
+            <Button onClick={() => void handleUnsavedChangesDiscard()} disabled={isSaving} color="error" variant="contained">
               {t("common.actions.discard")}
             </Button>
-            <Button onClick={() => void handleUnsavedChangesSave()} disabled={isSaving} variant="contained">
+            <Button
+              onClick={() => void handleUnsavedChangesSave()}
+              disabled={isSaving || readOnlyReason !== null || isAcquiring}
+              variant="contained"
+            >
               {t("common.actions.save")}
             </Button>
           </>
+        }
+      >
+        {null}
+      </ResponsiveDialogShell>
+
+      <ResponsiveDialogShell
+        open={conflict !== null}
+        onClose={() => {}}
+        disableClose
+        title={t("viewer.text.conflictTitle")}
+        description={t("viewer.text.conflictDescription")}
+        maxWidth="xs"
+        actions={
+          conflict ? (
+            <>
+              <Button
+                variant="outlined"
+                autoFocus
+                onClick={() => {
+                  setDraftContent(conflict.serverContent);
+                  setEditBaselineContent(conflict.serverContent);
+                  clearDraft(connectionId, path, "markdown");
+                  markEditSessionPristine();
+                  setConflict(null);
+                  setReadOnlyReason((reason) => (reason === "conflict" ? null : reason));
+                }}
+              >
+                {t("viewer.text.useSavedFile")}
+              </Button>
+              <Button
+                variant="contained"
+                onClick={() => {
+                  setDraftContent(conflict.draftContent);
+                  setEditBaselineContent(conflict.serverContent);
+                  setConflict(null);
+                  setReadOnlyReason((reason) => (reason === "conflict" ? null : reason));
+                }}
+              >
+                {t("viewer.text.keepDraft")}
+              </Button>
+            </>
+          ) : null
         }
       >
         {null}

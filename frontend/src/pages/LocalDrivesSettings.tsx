@@ -4,10 +4,15 @@ import DownloadIcon from "@mui/icons-material/Download";
 import LinkOffIcon from "@mui/icons-material/LinkOff";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import UsbIcon from "@mui/icons-material/Usb";
-import { alpha, Box, Button, Chip, Stack, Typography } from "@mui/material";
+import { alpha, Box, Button, Stack, Typography } from "@mui/material";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { CompactBadge as Chip } from "../components/CompactBadge";
 import CompanionPairingDialog from "../components/FileBrowser/CompanionPairingDialog";
+import { FormRow, FormSurface } from "../components/Form/FormLayout";
+import { CompanionDirectoryStatus } from "../components/Settings/CompanionPolicyDelivery";
 import { LOCAL_DRIVES_PAGE_COPY } from "../components/Settings/localDrivesCopy";
 import { SettingsInlineAlert, SettingsNotificationSnackbar, type SettingsNotificationState } from "../components/Settings/SettingsFeedback";
 import { SettingsGroup } from "../components/Settings/SettingsGroup";
@@ -16,18 +21,18 @@ import { SettingsSectionList } from "../components/Settings/SettingsSectionList"
 import { SettingsLoadingState } from "../components/Settings/SettingsState";
 import {
   settingsDestructiveButtonSx,
+  settingsFormSurfaceUtilityButtonSx,
   settingsMetadataChipSx,
   settingsPrimaryButtonSx,
-  settingsUtilityButtonSx,
 } from "../components/Settings/settingsButtonStyles";
 import {
   type LocalDrivesSettingsData,
   loadLocalDrivesSettingsData,
   SETTINGS_DATA_CACHE_KEYS,
 } from "../components/Settings/settingsDataSources";
-import { getSettingsPageSurfaceColor } from "../components/Settings/settingsSurface";
 import { useCachedAsyncData } from "../hooks/useCachedAsyncData";
-import companionService, { clearStoredSecret, hasStoredSecret } from "../services/companion";
+import companionService, { clearStoredSecret, hasStoredSecret, isCompanionAuthSignatureMismatch } from "../services/companion";
+import { canSignCompanionRequests } from "../services/companionSession";
 import { logger } from "../services/logger";
 import type { CompanionDownloadPlatform } from "../types";
 
@@ -48,7 +53,7 @@ const ANDROID_USER_AGENT_TOKEN = "android";
 
 function getLocalDrivesStatusPollInterval(
   companionAvailable: boolean,
-  pairStatus: LocalDrivesSettingsData["currentPairStatus"]["status"] | null
+  pairStatus: NonNullable<LocalDrivesSettingsData["currentPairStatus"]>["status"] | null
 ): number {
   if (pairStatus === "pending_local_approval") {
     return LOCAL_DRIVES_PENDING_STATUS_POLL_INTERVAL_MS;
@@ -88,20 +93,33 @@ function isUnsupportedMobileCompanionPlatform(): boolean {
 }
 
 interface LocalDrivesSettingsProps {
+  isAdmin?: boolean;
   onConnectionsChanged?: () => void;
   sectionTitle?: string;
   sectionDescription?: ReactNode;
 }
 
-type LocalDrivesViewState = "unavailable" | "unpaired" | "pending_local_approval" | "needs_repair" | "paired";
+type LocalDrivesViewState =
+  | "secure_context_required"
+  | "unavailable"
+  | "unpaired"
+  | "pending_local_approval"
+  | "needs_repair"
+  | "verification_unavailable"
+  | "update_required"
+  | "browser_update_required"
+  | "paired";
 type PairingTestResult = {
   severity: "success" | "error";
   message: string;
+  authMismatch?: boolean;
 };
 
 const EMPTY_LOCAL_DRIVES_STATE: LocalDrivesSettingsData = {
   companionAvailable: false,
   currentPairStatus: null,
+  authProtocolStatus: null,
+  pairingVerified: null,
   downloadMetadata: null,
   downloadError: null,
 };
@@ -112,8 +130,9 @@ const EMPTY_LOCAL_DRIVES_STATE: LocalDrivesSettingsData = {
  * Browser-side management UI for the Sambee Companion pairing that exposes
  * local drives inside the file browser.
  */
-export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectionDescription }: LocalDrivesSettingsProps) {
+export function LocalDrivesSettings({ isAdmin = false, onConnectionsChanged, sectionTitle, sectionDescription }: LocalDrivesSettingsProps) {
   const companionUnsupportedOnCurrentDevice = useMemo(() => isUnsupportedMobileCompanionPlatform(), []);
+  const companionSigningAvailable = canSignCompanionRequests();
   const [testing, setTesting] = useState(false);
   const [pairingTestResult, setPairingTestResult] = useState<PairingTestResult | null>(null);
   const [pairingDialogOpen, setPairingDialogOpen] = useState(false);
@@ -195,6 +214,7 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
   const handleConfirmPairing = useCallback(
     async (pairingId: string) => {
       await companionService.confirmPairing(pairingId);
+      setPairingTestResult(null);
       await refresh();
       onConnectionsChanged?.();
       showNotification(LOCAL_DRIVES_PAGE_COPY.pairingCreated, "success");
@@ -223,7 +243,12 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
       setPairingTestResult({ severity: "success", message: LOCAL_DRIVES_PAGE_COPY.pairingTestSucceeded });
     } catch (error) {
       logger.error("Companion pairing test failed", { error }, "companion");
-      setPairingTestResult({ severity: "error", message: LOCAL_DRIVES_PAGE_COPY.pairingTestFailed });
+      const authMismatch = isCompanionAuthSignatureMismatch(error);
+      setPairingTestResult({
+        severity: "error",
+        message: authMismatch ? LOCAL_DRIVES_PAGE_COPY.pairingTestFailed : LOCAL_DRIVES_PAGE_COPY.pairingTestUnavailable,
+        authMismatch,
+      });
     } finally {
       setTesting(false);
     }
@@ -247,8 +272,21 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
   }, [currentOrigin, onConnectionsChanged, refresh, showNotification]);
 
   const viewState: LocalDrivesViewState = useMemo(() => {
+    if (!companionSigningAvailable) return "secure_context_required";
     if (!state.companionAvailable) {
       return "unavailable";
+    }
+
+    if (state.authProtocolStatus === "companion_update_required") {
+      return "update_required";
+    }
+
+    if (state.authProtocolStatus === "browser_update_required") {
+      return "browser_update_required";
+    }
+
+    if (state.currentPairStatus === null) {
+      return "verification_unavailable";
     }
 
     if (state.currentPairStatus?.status === "pending_local_approval") {
@@ -256,11 +294,21 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
     }
 
     if (state.currentPairStatus?.status === "paired") {
-      return browserHasStoredSecret ? "paired" : "needs_repair";
+      if (!browserHasStoredSecret || state.pairingVerified === false || pairingTestResult?.authMismatch) return "needs_repair";
+      if (state.pairingVerified !== true || pairingTestResult?.severity === "error") return "verification_unavailable";
+      return "paired";
     }
 
     return "unpaired";
-  }, [browserHasStoredSecret, state.companionAvailable, state.currentPairStatus?.status]);
+  }, [
+    companionSigningAvailable,
+    browserHasStoredSecret,
+    pairingTestResult,
+    state.authProtocolStatus,
+    state.companionAvailable,
+    state.currentPairStatus,
+    state.pairingVerified,
+  ]);
   const downloadEntries = useMemo(
     () =>
       COMPANION_PLATFORM_ORDER.flatMap((platformKey) => {
@@ -284,12 +332,14 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
   );
   const showUnpairAction = viewState === "paired";
   const showStatusContent = hasResolved || cachedState !== null;
-  const cardActionRowSx = {
+  const actionControlSx = {
     display: "flex",
     flexWrap: "wrap",
     gap: 1,
     alignItems: "center",
     alignSelf: "flex-start",
+    justifyContent: { md: "flex-end" },
+    mt: { xs: 2, md: 0 },
   };
 
   const downloadSourceLabel =
@@ -311,6 +361,13 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
   );
   const summaryState = useMemo(() => {
     switch (viewState) {
+      case "secure_context_required":
+        return {
+          badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelActionRequired,
+          badgeVariant: "warning" as const,
+          title: LOCAL_DRIVES_PAGE_COPY.secureContextTitle,
+          message: LOCAL_DRIVES_PAGE_COPY.secureContextMessage,
+        };
       case "unavailable":
         return {
           badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelUnavailable,
@@ -339,6 +396,27 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
           title: LOCAL_DRIVES_PAGE_COPY.summaryRepairTitle,
           message: LOCAL_DRIVES_PAGE_COPY.statusRecoverable,
         };
+      case "verification_unavailable":
+        return {
+          badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelActionRequired,
+          badgeVariant: "themed" as const,
+          title: LOCAL_DRIVES_PAGE_COPY.summaryVerificationUnavailableTitle,
+          message: LOCAL_DRIVES_PAGE_COPY.statusVerificationUnavailable,
+        };
+      case "update_required":
+        return {
+          badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelActionRequired,
+          badgeVariant: "themed" as const,
+          title: LOCAL_DRIVES_PAGE_COPY.summaryUpdateRequiredTitle,
+          message: LOCAL_DRIVES_PAGE_COPY.statusUpdateRequired,
+        };
+      case "browser_update_required":
+        return {
+          badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelActionRequired,
+          badgeVariant: "themed" as const,
+          title: LOCAL_DRIVES_PAGE_COPY.summaryBrowserUpdateRequiredTitle,
+          message: LOCAL_DRIVES_PAGE_COPY.statusBrowserUpdateRequired,
+        };
       case "unpaired":
         return {
           badgeLabel: LOCAL_DRIVES_PAGE_COPY.statusLabelActionRequired,
@@ -348,14 +426,6 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
         };
     }
   }, [viewState]);
-  const sectionCardSx = {
-    border: 1,
-    borderColor: "divider",
-    borderRadius: 2,
-    px: { xs: 2, sm: 2.5 },
-    py: 2,
-    bgcolor: getSettingsPageSurfaceColor,
-  };
   const summaryBadgeSx =
     summaryState.badgeVariant === "themed"
       ? settingsMetadataChipSx
@@ -368,10 +438,12 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
               ? alpha(theme.palette.success.main, theme.palette.mode === "dark" ? 0.16 : 0.08)
               : alpha(theme.palette.warning.main, theme.palette.mode === "dark" ? 0.16 : 0.08),
         };
-  const shouldShowInstallSection = showStatusContent && !loading && viewState === "unavailable";
+  const shouldShowInstallSection =
+    showStatusContent && !loading && ["secure_context_required", "unavailable", "update_required"].includes(viewState);
   const shouldShowPairingSection =
     showStatusContent && !loading && ["unpaired", "pending_local_approval", "needs_repair"].includes(viewState);
-  const shouldShowVerificationSection = showStatusContent && !loading && viewState === "paired";
+  const shouldShowVerificationSection =
+    showStatusContent && !loading && browserHasStoredSecret && ["paired", "needs_repair", "verification_unavailable"].includes(viewState);
 
   return (
     <SettingsPage
@@ -388,58 +460,91 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
       ) : (
         <SettingsSectionList>
           <SettingsGroup title={LOCAL_DRIVES_PAGE_COPY.summaryTitle}>
-            <Box sx={{ ...sectionCardSx, px: { xs: 2, sm: 3 }, py: 3 }}>
+            <FormSurface testId="local-drives-summary-surface">
               {showStatusContent ? (
                 <Stack spacing={2.5}>
-                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }}>
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ alignItems: { xs: "flex-start", sm: "center" } }}>
                     <Chip label={summaryState.badgeLabel} size="small" variant="outlined" sx={summaryBadgeSx} />
                   </Stack>
 
                   <Box>
-                    <Typography variant="h6" fontWeight="medium">
+                    <Typography variant="subtitle1" sx={{ fontWeight: 500 }}>
                       {summaryState.title}
                     </Typography>
-                    <Typography variant="body2" sx={{ mt: 0.75, maxWidth: 720, color: "text.secondary" }}>
-                      {summaryState.message}
-                    </Typography>
+                    {viewState === "secure_context_required" ? (
+                      <SettingsInlineAlert severity="warning" sx={{ mt: 1 }}>
+                        {summaryState.message}
+                      </SettingsInlineAlert>
+                    ) : (
+                      <Typography variant="body2" sx={{ mt: 0.75, maxWidth: 720, color: "text.secondary" }}>
+                        {summaryState.message}
+                      </Typography>
+                    )}
                   </Box>
 
-                  <Stack spacing={1}>
-                    {statusChecklist.map((item) => (
-                      <Stack key={item.label} direction="row" spacing={1.25} alignItems="center">
-                        {item.complete ? (
-                          <CheckCircleOutlineIcon color="success" fontSize="small" />
-                        ) : (
-                          <RadioButtonUncheckedIcon sx={{ color: "text.disabled" }} fontSize="small" />
-                        )}
-                        <Typography variant="body2" sx={{ color: item.complete ? "text.primary" : "text.secondary" }}>
-                          {item.label}
-                        </Typography>
-                      </Stack>
-                    ))}
-                  </Stack>
+                  {viewState !== "secure_context_required" && (
+                    <Stack spacing={1}>
+                      {statusChecklist.map((item) => (
+                        <Stack key={item.label} direction="row" spacing={1.25} sx={{ alignItems: "center" }}>
+                          {item.complete ? (
+                            <CheckCircleOutlineIcon color="success" fontSize="small" />
+                          ) : (
+                            <RadioButtonUncheckedIcon sx={{ color: "text.disabled" }} fontSize="small" />
+                          )}
+                          <Typography variant="body2" sx={{ color: item.complete ? "text.primary" : "text.secondary" }}>
+                            {item.label}
+                          </Typography>
+                        </Stack>
+                      ))}
+                    </Stack>
+                  )}
+                  {viewState === "verification_unavailable" && !browserHasStoredSecret && (
+                    <Button
+                      variant="outlined"
+                      startIcon={<RefreshIcon />}
+                      onClick={() => void refresh()}
+                      disabled={loading}
+                      sx={settingsFormSurfaceUtilityButtonSx}
+                    >
+                      {LOCAL_DRIVES_PAGE_COPY.retryButton}
+                    </Button>
+                  )}
+                  {viewState === "browser_update_required" && (
+                    <Button
+                      variant="outlined"
+                      startIcon={<RestartAltIcon />}
+                      onClick={() => window.location.reload()}
+                      sx={settingsFormSurfaceUtilityButtonSx}
+                    >
+                      {LOCAL_DRIVES_PAGE_COPY.reloadButton}
+                    </Button>
+                  )}
                 </Stack>
               ) : (
                 <SettingsLoadingState compact />
               )}
-            </Box>
+            </FormSurface>
           </SettingsGroup>
+
+          <CompanionDirectoryStatus isAdmin={isAdmin} />
 
           {shouldShowInstallSection && (
             <SettingsGroup title={LOCAL_DRIVES_PAGE_COPY.downloadSectionTitle}>
-              <Box sx={sectionCardSx}>
-                <Stack spacing={2}>
-                  {state.downloadMetadata ? (
-                    <Stack spacing={1.5}>
-                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                        {LOCAL_DRIVES_PAGE_COPY.downloadVersionLabel}: {state.downloadMetadata.version}
-                      </Typography>
-                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                        {LOCAL_DRIVES_PAGE_COPY.downloadSectionSourcePrefix}: {downloadSourceLabel}
-                      </Typography>
+              <FormSurface testId="local-drives-download-surface">
+                {state.downloadMetadata ? (
+                  <>
+                    <FormRow sx={{ py: 0 }}>
+                      <Stack spacing={1}>
+                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                          {LOCAL_DRIVES_PAGE_COPY.downloadVersionLabel}: {state.downloadMetadata.version}
+                        </Typography>
+                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                          {LOCAL_DRIVES_PAGE_COPY.downloadSectionSourcePrefix}: {downloadSourceLabel}
+                        </Typography>
+                      </Stack>
 
                       {primaryDownload && (
-                        <Stack spacing={1} alignItems="flex-start">
+                        <Stack spacing={1} sx={{ alignItems: { md: "flex-end" }, mt: { xs: 2, md: 0 }, minWidth: 0 }}>
                           <Chip
                             label={LOCAL_DRIVES_PAGE_COPY.downloadRecommendedLabel}
                             size="small"
@@ -453,55 +558,55 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
                             rel="noopener noreferrer"
                             variant="contained"
                             startIcon={<DownloadIcon />}
-                            sx={settingsPrimaryButtonSx}
+                            sx={[settingsPrimaryButtonSx, { whiteSpace: "normal", textAlign: "center" }]}
                           >
                             {LOCAL_DRIVES_PAGE_COPY.downloadPrimaryButton} ({COMPANION_PLATFORM_LABELS[primaryDownload[0]]})
                           </Button>
                         </Stack>
                       )}
+                    </FormRow>
 
-                      {alternateDownloads.length > 0 && (
-                        <Stack spacing={1}>
-                          <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                            {LOCAL_DRIVES_PAGE_COPY.downloadOtherPlatformsLabel}
-                          </Typography>
-                          <Box sx={cardActionRowSx}>
-                            {alternateDownloads.map(([platformKey, assetUrl]) => (
-                              <Button
-                                key={platformKey}
-                                component="a"
-                                href={assetUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                variant="outlined"
-                                startIcon={<OpenInNewIcon />}
-                                sx={settingsUtilityButtonSx}
-                              >
-                                {COMPANION_PLATFORM_LABELS[platformKey]}
-                              </Button>
-                            ))}
-                          </Box>
-                        </Stack>
-                      )}
-                    </Stack>
-                  ) : state.downloadError ? (
-                    <SettingsInlineAlert severity="warning" sx={{ mb: 0 }}>
-                      {state.downloadError}
-                    </SettingsInlineAlert>
-                  ) : (
-                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                      {LOCAL_DRIVES_PAGE_COPY.downloadUnavailable}
-                    </Typography>
-                  )}
-                </Stack>
-              </Box>
+                    {alternateDownloads.length > 0 && (
+                      <FormRow sx={{ py: 0, mt: 2 }}>
+                        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                          {LOCAL_DRIVES_PAGE_COPY.downloadOtherPlatformsLabel}
+                        </Typography>
+                        <Box sx={actionControlSx}>
+                          {alternateDownloads.map(([platformKey, assetUrl]) => (
+                            <Button
+                              key={platformKey}
+                              component="a"
+                              href={assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              variant="outlined"
+                              startIcon={<OpenInNewIcon />}
+                              sx={settingsFormSurfaceUtilityButtonSx}
+                            >
+                              {COMPANION_PLATFORM_LABELS[platformKey]}
+                            </Button>
+                          ))}
+                        </Box>
+                      </FormRow>
+                    )}
+                  </>
+                ) : state.downloadError ? (
+                  <SettingsInlineAlert severity="warning" sx={{ mb: 0 }}>
+                    {state.downloadError}
+                  </SettingsInlineAlert>
+                ) : (
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    {LOCAL_DRIVES_PAGE_COPY.downloadUnavailable}
+                  </Typography>
+                )}
+              </FormSurface>
             </SettingsGroup>
           )}
 
           {shouldShowPairingSection && (
             <SettingsGroup title={LOCAL_DRIVES_PAGE_COPY.pairingSectionTitle}>
-              <Box sx={sectionCardSx}>
-                <Stack spacing={2}>
+              <FormSurface testId="local-drives-pairing-surface">
+                <FormRow sx={{ py: 0 }}>
                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
                     {viewState === "pending_local_approval"
                       ? LOCAL_DRIVES_PAGE_COPY.pairingSectionPendingApproval
@@ -509,7 +614,17 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
                         ? LOCAL_DRIVES_PAGE_COPY.pairingSectionRepair
                         : LOCAL_DRIVES_PAGE_COPY.pairingSectionRequired}
                   </Typography>
-                  <Box sx={cardActionRowSx}>
+                  <Box sx={actionControlSx}>
+                    {viewState === "needs_repair" && browserHasStoredSecret && (
+                      <Button
+                        variant="outlined"
+                        startIcon={<RestartAltIcon />}
+                        onClick={() => window.location.reload()}
+                        sx={settingsFormSurfaceUtilityButtonSx}
+                      >
+                        {LOCAL_DRIVES_PAGE_COPY.reloadButton}
+                      </Button>
+                    )}
                     <Button
                       variant="contained"
                       startIcon={<UsbIcon />}
@@ -522,58 +637,53 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
                         : LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton}
                     </Button>
                   </Box>
-                </Stack>
-              </Box>
+                </FormRow>
+              </FormSurface>
             </SettingsGroup>
           )}
 
           {shouldShowVerificationSection && (
             <SettingsGroup title={LOCAL_DRIVES_PAGE_COPY.verificationSectionTitle}>
-              <Box sx={sectionCardSx}>
+              <FormSurface testId="local-drives-verification-surface">
                 <Stack spacing={2}>
-                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                    {LOCAL_DRIVES_PAGE_COPY.verificationSectionReady}
-                  </Typography>
-                  <Box sx={cardActionRowSx}>
-                    <Button
-                      variant="contained"
-                      startIcon={<ComputerIcon />}
-                      onClick={() => void handleTestPairing()}
-                      disabled={testing}
-                      sx={settingsPrimaryButtonSx}
-                    >
-                      {testing ? LOCAL_DRIVES_PAGE_COPY.testingButton : LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton}
-                    </Button>
-                  </Box>
+                  <FormRow sx={{ py: 0 }}>
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      {LOCAL_DRIVES_PAGE_COPY.verificationSectionReady}
+                    </Typography>
+                    <Box sx={actionControlSx}>
+                      <Button
+                        variant="outlined"
+                        startIcon={<ComputerIcon />}
+                        onClick={() => void handleTestPairing()}
+                        disabled={testing}
+                        sx={settingsFormSurfaceUtilityButtonSx}
+                      >
+                        {testing ? LOCAL_DRIVES_PAGE_COPY.testingButton : LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton}
+                      </Button>
+                    </Box>
+                  </FormRow>
                   {pairingTestResult && (
                     <SettingsInlineAlert
                       role={pairingTestResult.severity === "success" ? "status" : "alert"}
                       severity={pairingTestResult.severity}
                       sx={{ mb: 0 }}
-                      action={
-                        pairingTestResult.severity === "error" ? (
-                          <Button color="inherit" size="small" onClick={() => setPairingDialogOpen(true)}>
-                            {LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton}
-                          </Button>
-                        ) : undefined
-                      }
                     >
                       {pairingTestResult.message}
                     </SettingsInlineAlert>
                   )}
                 </Stack>
-              </Box>
+              </FormSurface>
             </SettingsGroup>
           )}
 
           {showUnpairAction && (
             <SettingsGroup title={LOCAL_DRIVES_PAGE_COPY.troubleshootingSectionTitle}>
-              <Box sx={sectionCardSx}>
-                <Stack spacing={2}>
+              <FormSurface testId="local-drives-troubleshooting-surface">
+                <FormRow sx={{ py: 0 }}>
                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
                     {LOCAL_DRIVES_PAGE_COPY.troubleshootingSectionReady}
                   </Typography>
-                  <Box sx={cardActionRowSx}>
+                  <Box sx={actionControlSx}>
                     <Button
                       color="error"
                       variant="outlined"
@@ -585,13 +695,13 @@ export function LocalDrivesSettings({ onConnectionsChanged, sectionTitle, sectio
                       {unpairing ? LOCAL_DRIVES_PAGE_COPY.unpairingButton : LOCAL_DRIVES_PAGE_COPY.unpairThisBrowserButton}
                     </Button>
                   </Box>
-                </Stack>
-              </Box>
+                </FormRow>
+              </FormSurface>
             </SettingsGroup>
           )}
         </SettingsSectionList>
       )}
-      {!companionUnsupportedOnCurrentDevice && (
+      {!companionUnsupportedOnCurrentDevice && companionSigningAvailable && (
         <CompanionPairingDialog
           open={pairingDialogOpen}
           onClose={() => setPairingDialogOpen(false)}

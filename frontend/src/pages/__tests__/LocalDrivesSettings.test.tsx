@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCAL_DRIVES_PAGE_COPY } from "../../components/Settings/localDrivesCopy";
 import { clearCachedAsyncData } from "../../hooks/useCachedAsyncData";
 import { SambeeThemeProvider } from "../../theme";
@@ -31,6 +31,8 @@ vi.mock("../../services/logger", () => ({
 vi.mock("../../services/api", () => ({
   __esModule: true,
   default: {
+    getThemes: () => Promise.resolve({ themes: [], site_default_id: "sambee-light" }),
+    getCurrentUser: () => Promise.resolve({ role: "editor" }),
     getCompanionDownloads: mockGetCompanionDownloads,
   },
 }));
@@ -45,9 +47,18 @@ vi.mock("../../services/companion", () => ({
     unpairCurrentOrigin: mockUnpairCurrentOrigin,
     cancelPairing: vi.fn(),
     initiatePairing: vi.fn(),
+    getSettingsStatus: vi.fn().mockResolvedValue({ version: 1, status: "defaults_active", sections: {} }),
   },
   clearStoredSecret: vi.fn(),
   hasStoredSecret: mockHasStoredSecret,
+  getCompanionAuthProtocolStatus: (health: { auth_protocol_version?: number }) =>
+    (health.auth_protocol_version ?? 0) < 2
+      ? "companion_update_required"
+      : health.auth_protocol_version === 2
+        ? "compatible"
+        : "browser_update_required",
+  isCompanionAuthSignatureMismatch: (error: { response?: { status?: number; data?: { detail?: string } } }) =>
+    error.response?.status === 403 && error.response.data?.detail === "Invalid authentication",
 }));
 
 function mockNavigatorDevice({
@@ -74,13 +85,18 @@ function mockNavigatorDevice({
 }
 
 describe("LocalDrivesSettings", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   beforeEach(() => {
+    vi.stubGlobal("isSecureContext", true);
+    vi.stubGlobal("crypto", { subtle: {} });
     vi.clearAllMocks();
     clearCachedAsyncData();
     mockNavigatorDevice({
       userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
     });
-    mockCheckHealth.mockResolvedValue({ status: "ok", paired: true });
+    mockCheckHealth.mockResolvedValue({ status: "ok", paired: true, auth_protocol_version: 2 });
+    mockTestPairing.mockResolvedValue({ status: "success" });
     mockGetCompanionDownloads.mockResolvedValue({
       source: "feed",
       version: "0.5.0",
@@ -102,14 +118,41 @@ describe("LocalDrivesSettings", () => {
     );
   };
 
-  it("does not flash the unavailable warning before the first load resolves", () => {
+  it("does not flash the unavailable warning before the first load resolves", async () => {
     mockCheckHealth.mockReturnValue(new Promise(() => undefined));
     mockHasStoredSecret.mockReturnValue(false);
 
-    renderSettings();
+    await act(async () => {
+      renderSettings();
+    });
 
     expect(screen.queryByText(LOCAL_DRIVES_PAGE_COPY.statusUnavailable)).not.toBeInTheDocument();
     expect(screen.getByRole("progressbar")).toBeInTheDocument();
+  });
+
+  it("requires HTTPS for companion actions on an insecure origin", async () => {
+    vi.stubGlobal("isSecureContext", false);
+    mockHasStoredSecret.mockReturnValue(true);
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.secureContextMessage)).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-download-surface")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.unpairThisBrowserButton })).not.toBeInTheDocument();
+    expect(mockCheckHealth).not.toHaveBeenCalled();
+    expect(mockGetPairStatus).not.toHaveBeenCalled();
+  });
+
+  it("explains missing Web Crypto on a secure origin", async () => {
+    vi.stubGlobal("crypto", { getRandomValues: vi.fn() });
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.secureContextMessage)).toHaveTextContent("Web Crypto support");
+    expect(screen.getByText(LOCAL_DRIVES_PAGE_COPY.secureContextTitle)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
   });
 
   it("shows Unpair This Browser instead of Pair This Browser when this browser is fully paired", async () => {
@@ -128,7 +171,14 @@ describe("LocalDrivesSettings", () => {
 
     expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.unpairThisBrowserButton })).toBeEnabled();
-    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton })).toBeEnabled();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton })).toHaveClass("MuiButton-outlined");
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.unpairThisBrowserButton })).toHaveClass("MuiButton-colorError");
+    expect(screen.getByTestId("local-drives-summary-surface")).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-verification-surface")).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-troubleshooting-surface")).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-summary-surface").firstElementChild).toHaveClass("MuiStack-root");
+    expect(screen.getByTestId("local-drives-verification-surface").firstElementChild?.firstElementChild?.children).toHaveLength(2);
+    expect(screen.getByTestId("local-drives-troubleshooting-surface").firstElementChild?.children).toHaveLength(2);
     expect(screen.getByText(LOCAL_DRIVES_PAGE_COPY.verificationSectionTitle)).toBeInTheDocument();
     expect(screen.queryByText(LOCAL_DRIVES_PAGE_COPY.downloadSectionTitle)).not.toBeInTheDocument();
     expect(screen.queryByText(LOCAL_DRIVES_PAGE_COPY.pairingSectionTitle)).not.toBeInTheDocument();
@@ -149,7 +199,8 @@ describe("LocalDrivesSettings", () => {
 
     await user.click(await screen.findByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton }));
 
-    const successStatus = await screen.findByRole("status");
+    const successStatus = await screen.findByText(LOCAL_DRIVES_PAGE_COPY.pairingTestSucceeded);
+    expect(successStatus.closest('[role="status"]')).toBeInTheDocument();
     expect(successStatus).toHaveTextContent(LOCAL_DRIVES_PAGE_COPY.pairingTestSucceeded);
     expect(screen.queryByText("Pairing with http://localhost:3000 is working.")).not.toBeInTheDocument();
   });
@@ -162,7 +213,9 @@ describe("LocalDrivesSettings", () => {
       status: "paired",
     });
     mockHasStoredSecret.mockReturnValue(true);
-    mockTestPairing.mockRejectedValue(new Error("Pairing test failed"));
+    mockTestPairing.mockResolvedValueOnce({ status: "success" }).mockRejectedValue({
+      response: { status: 403, data: { detail: "Invalid authentication" } },
+    });
 
     renderSettings();
 
@@ -170,6 +223,72 @@ describe("LocalDrivesSettings", () => {
 
     const errorAlert = await screen.findByRole("alert");
     expect(errorAlert).toHaveTextContent(LOCAL_DRIVES_PAGE_COPY.pairingTestFailed);
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.reloadButton })).toBeInTheDocument();
+  });
+
+  it("does not claim readiness when the stored pairing fails verification on load", async () => {
+    mockGetPairStatus.mockResolvedValue({ current_origin: window.location.origin, current_origin_paired: true, status: "paired" });
+    mockHasStoredSecret.mockReturnValue(true);
+    mockTestPairing.mockRejectedValue({ response: { status: 403, data: { detail: "Invalid authentication" } } });
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusRecoverable)).toBeInTheDocument();
+    expect(screen.queryByText(LOCAL_DRIVES_PAGE_COPY.statusPaired)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.reloadButton })).toBeInTheDocument();
+  });
+
+  it("recommends updating an older Companion instead of re-pairing", async () => {
+    mockCheckHealth.mockResolvedValue({ status: "ok", paired: true });
+    mockGetPairStatus.mockResolvedValue({ current_origin: window.location.origin, current_origin_paired: true, status: "paired" });
+    mockHasStoredSecret.mockReturnValue(true);
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusUpdateRequired)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Download for this computer/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
+    expect(mockTestPairing).not.toHaveBeenCalled();
+  });
+
+  it("recommends updating Sambee instead of Companion for a newer protocol", async () => {
+    mockCheckHealth.mockResolvedValue({ status: "ok", paired: true, auth_protocol_version: 3 });
+    mockHasStoredSecret.mockReturnValue(true);
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusBrowserUpdateRequired)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.reloadButton })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Download for this computer/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
+    expect(mockGetPairStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not suggest re-pairing after a temporary verification failure", async () => {
+    mockGetPairStatus.mockResolvedValue({ current_origin: window.location.origin, current_origin_paired: true, status: "paired" });
+    mockHasStoredSecret.mockReturnValue(true);
+    mockTestPairing.mockRejectedValue(new Error("Connection interrupted"));
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusVerificationUnavailable)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
+  });
+
+  it("offers retry instead of re-pairing when the pairing status request fails", async () => {
+    const user = userEvent.setup();
+    mockGetPairStatus.mockRejectedValue(new Error("Connection interrupted"));
+    mockHasStoredSecret.mockReturnValue(false);
+
+    renderSettings();
+
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusVerificationUnavailable)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).not.toBeInTheDocument();
+    mockGetPairStatus.mockResolvedValue({ current_origin: window.location.origin, current_origin_paired: false, status: "unpaired" });
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.statusUnpaired)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).toBeInTheDocument();
   });
 
@@ -187,7 +306,9 @@ describe("LocalDrivesSettings", () => {
       expect(mockGetPairStatus).toHaveBeenCalled();
     });
 
-    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).toBeEnabled();
+    expect(screen.getByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.pairThisBrowserButton })).toHaveClass("MuiButton-contained");
+    expect(screen.getByTestId("local-drives-pairing-surface")).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-pairing-surface").firstElementChild?.children).toHaveLength(2);
     expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.unpairThisBrowserButton })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: LOCAL_DRIVES_PAGE_COPY.testCurrentPairingButton })).not.toBeInTheDocument();
     expect(screen.getByText(LOCAL_DRIVES_PAGE_COPY.pairingSectionTitle)).toBeInTheDocument();
@@ -252,6 +373,9 @@ describe("LocalDrivesSettings", () => {
     expect(await screen.findByText(LOCAL_DRIVES_PAGE_COPY.downloadSectionTitle)).toBeInTheDocument();
     const downloadLink = screen.getByRole("link", { name: /Download for this computer/i });
     expect(downloadLink).toHaveAttribute("href", "https://downloads.example.test/Sambee-Companion.exe");
+    expect(downloadLink).toHaveClass("MuiButton-contained");
+    expect(screen.getByTestId("local-drives-download-surface")).toBeInTheDocument();
+    expect(screen.getByTestId("local-drives-download-surface").firstElementChild?.children).toHaveLength(2);
   });
 
   it("shows an actionable metadata error when companion downloads cannot be resolved", async () => {

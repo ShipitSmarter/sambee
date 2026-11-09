@@ -37,6 +37,7 @@ on:
       - 'backend/**'
       - 'frontend/**'
       - 'scripts/install-system-deps'
+      - 'scripts/bootstrap-build-pip.py'
   pull_request:
     branches: [ main ]
     paths:
@@ -70,6 +71,7 @@ on:
       - 'backend/**'
       - 'frontend/**'
       - 'scripts/install-system-deps'
+      - 'scripts/bootstrap-build-pip.py'
   workflow_dispatch:
 
 concurrency:
@@ -81,7 +83,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       created: ${{ steps.metadata.outputs.created }}
       os_packages_refresh_key: ${{ steps.metadata.outputs.os_packages_refresh_key }}
@@ -103,10 +105,10 @@ jobs:
         include:
           - docker_platform: linux/amd64
             platform_id: amd64
-            runner_label: ubuntu-24.04
+            runner_label: ubuntu-latest
           - docker_platform: linux/arm64
             platform_id: arm64
-            runner_label: ubuntu-24.04-arm
+            runner_label: ubuntu-26.04-arm
     steps:
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -217,12 +219,34 @@ jobs:
           test -x /app/scripts/reset-archive-v2-cutover-state
         '
 
+    - name: Verify production packaging tools are absent
+      shell: bash
+      run: |
+        docker exec sambee-smoke-${{ matrix.platform_id }} python -c '
+        import importlib.util
+        import pathlib
+        import sys
+        import sysconfig
+
+        modules = ("pip", "ensurepip")
+        remaining = [name for name in modules if importlib.util.find_spec(name) is not None]
+        remaining.extend(str(path) for path in pathlib.Path(sysconfig.get_path("scripts")).glob("pip*"))
+        remaining.extend(str(path) for path in pathlib.Path(sysconfig.get_path("purelib")).glob("pip-*.dist-info"))
+        bootstrap = pathlib.Path(sysconfig.get_path("stdlib")) / "ensurepip"
+        if bootstrap.exists():
+            remaining.append(str(bootstrap))
+        if remaining:
+            sys.exit("Production packaging tools remain: " + ", ".join(remaining))
+        print("Production pip, launchers, metadata, and ensurepip are absent.")
+        '
+
     - name: Report production runtime contract
       shell: bash
       run: |
         docker exec sambee-smoke-${{ matrix.platform_id }} sh -c '
           python --version
           python -c "import sqlite3; print(\"sqlite3 module: \" + sqlite3.sqlite_version)"
+          python -c "from app.services.directory_index import validate_sqlite_runtime; validate_sqlite_runtime(); print(\"Directory-index SQLite features verified\")"
           dpkg-query -W -f="\${Package} \${Version}\\n" libsqlite3-0
         '
 

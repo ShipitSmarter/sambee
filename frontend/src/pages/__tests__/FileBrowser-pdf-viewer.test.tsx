@@ -1,9 +1,12 @@
+import { createMockConnection } from "../../test/fixtures/connections";
+import { createMockAuthToken } from "../../test/fixtures/users";
+import { requireTestValue } from "../../test/helpers/assertions";
 /**
  * Browser Component - PDF Viewer Integration Tests
  * Tests for PDF file viewing workflows
  */
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, useRef } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -14,6 +17,8 @@ import { authSession } from "../../services/authSession";
 import { SambeeThemeProvider } from "../../theme/ThemeContext";
 import { FileType } from "../../types";
 import FileBrowser from "../FileBrowser";
+
+const FILE_LIST_READY_TIMEOUT_MS = 5000;
 
 // Mock the API service
 vi.mock("../../services/api");
@@ -86,13 +91,16 @@ vi.mock("react-pdf", () => ({
  * Handles the case where filename appears in both file list and status bar
  */
 async function getFileButton(filename: string): Promise<HTMLElement> {
-  await waitFor(() => {
-    const elements = screen.getAllByText(filename);
-    expect(elements.length).toBeGreaterThan(0);
-  });
+  await waitFor(
+    () => {
+      const elements = screen.getAllByText(filename);
+      expect(elements.length).toBeGreaterThan(0);
+    },
+    { timeout: FILE_LIST_READY_TIMEOUT_MS }
+  );
   // Get the button that contains the filename (file list, not status bar)
   const buttons = screen.getAllByRole("button", { name: new RegExp(filename, "i") });
-  return buttons[0];
+  return requireTestValue(buttons[0]);
 }
 
 // Mock ResizeObserver
@@ -136,18 +144,22 @@ global.URL.createObjectURL = vi.fn(() => "blob:mock-pdf-url");
 global.URL.revokeObjectURL = vi.fn();
 
 describe("Browser - PDF Viewer Integration", () => {
-  const renderBrowser = (initialPath = "/browse/smb/test-server-1") => {
-    return render(
-      <SambeeThemeProvider>
-        <MemoryRouter initialEntries={[initialPath]}>
-          <Routes>
-            <Route path="/browse/:targetType/:targetId/*" element={<FileBrowser />} />
-            <Route path="/browse" element={<FileBrowser />} />
-            <Route path="/login" element={<div>Login Page</div>} />
-          </Routes>
-        </MemoryRouter>
-      </SambeeThemeProvider>
-    );
+  const renderBrowser = async (initialPath = "/browse/smb/test-server-1") => {
+    let result: ReturnType<typeof render> | undefined;
+    await act(async () => {
+      result = render(
+        <SambeeThemeProvider>
+          <MemoryRouter initialEntries={[initialPath]}>
+            <Routes>
+              <Route path="/browse/:targetType/:targetId/*" element={<FileBrowser />} />
+              <Route path="/browse" element={<FileBrowser />} />
+              <Route path="/login" element={<div>Login Page</div>} />
+            </Routes>
+          </MemoryRouter>
+        </SambeeThemeProvider>
+      );
+    });
+    return requireTestValue(result);
   };
 
   const waitForPageNavigationReady = async () => {
@@ -160,11 +172,11 @@ describe("Browser - PDF Viewer Integration", () => {
     vi.clearAllMocks();
 
     // Set up authentication
-    authSession.setAuthenticated({ access_token: "fake-token", token_type: "bearer" }, false);
+    authSession.setAuthenticated(createMockAuthToken({ access_token: "fake-token", token_type: "bearer" }), false);
 
     // Mock successful API responses
     mockedApi.getConnections.mockResolvedValue([
-      {
+      createMockConnection({
         id: "conn-1",
         name: "Test Server",
         slug: "test-server-1",
@@ -175,7 +187,7 @@ describe("Browser - PDF Viewer Integration", () => {
         username: "user",
         created_at: "2024-01-01T00:00:00Z",
         updated_at: "2024-01-01T00:00:00Z",
-      },
+      }),
     ]);
 
     // Mock PDF blob response
@@ -204,7 +216,7 @@ describe("Browser - PDF Viewer Integration", () => {
         total: 1,
       });
 
-      renderBrowser();
+      await renderBrowser();
 
       // Wait for file to load and get the button
       const pdfFile = await getFileButton("document.pdf");
@@ -237,7 +249,7 @@ describe("Browser - PDF Viewer Integration", () => {
         total: 1,
       });
 
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("report.pdf");
       fireEvent.click(pdfFile);
@@ -266,7 +278,7 @@ describe("Browser - PDF Viewer Integration", () => {
         total: 1,
       });
 
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -299,7 +311,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("navigates to next page using button", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -318,7 +330,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("navigates to previous page using button", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -347,7 +359,7 @@ describe("Browser - PDF Viewer Integration", () => {
 
     it("jumps to specific page via input", async () => {
       const user = userEvent.setup();
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -368,7 +380,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("navigates using keyboard (ArrowLeft/Right)", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -397,7 +409,7 @@ describe("Browser - PDF Viewer Integration", () => {
 
     it("goes to first page (Home key)", async () => {
       const user = userEvent.setup();
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -431,7 +443,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("goes to last page (End key)", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -474,7 +486,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("closes on close button click", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -492,7 +504,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("closes on Escape key", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -509,7 +521,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("returns to file browser after closing", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -530,7 +542,7 @@ describe("Browser - PDF Viewer Integration", () => {
     });
 
     it("keeps the PDF viewer open when Escape closes the shortcuts help", async () => {
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -545,7 +557,9 @@ describe("Browser - PDF Viewer Integration", () => {
         expect(screen.getByText("PDF viewer shortcuts")).toBeInTheDocument();
       });
 
-      fireEvent.keyDown(document, { key: "Escape" });
+      const searchInput = screen.getByRole("searchbox");
+      await waitFor(() => expect(searchInput).toHaveFocus());
+      fireEvent.keyDown(searchInput, { key: "Escape" });
 
       await waitFor(() => {
         expect(screen.queryByText("PDF viewer shortcuts")).not.toBeInTheDocument();
@@ -576,7 +590,7 @@ describe("Browser - PDF Viewer Integration", () => {
 
       mockedApi.getPdfBlob.mockRejectedValue(new Error("Network error"));
 
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
@@ -612,13 +626,13 @@ describe("Browser - PDF Viewer Integration", () => {
         response: { data: { detail: "Access denied" }, status: 403 },
       });
 
-      renderBrowser();
+      await renderBrowser();
 
       const pdfFile = await getFileButton("document.pdf");
       fireEvent.click(pdfFile);
 
       await waitFor(() => {
-        expect(screen.getByText("Access denied")).toBeInTheDocument();
+        expect(screen.getByText("Access to this file was denied. Check your permissions and retry.")).toBeInTheDocument();
       });
     });
   });
@@ -654,7 +668,7 @@ describe("Browser - PDF Viewer Integration", () => {
 
       const revokeObjectURLSpy = vi.spyOn(URL, "revokeObjectURL");
 
-      renderBrowser();
+      await renderBrowser();
 
       // Open first PDF
       const pdf1 = await getFileButton("document1.pdf");

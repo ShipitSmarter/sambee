@@ -1,3 +1,4 @@
+import { createMockAuthToken } from "../../test/fixtures/users";
 /**
  * Browse → View Flow Integration Tests (Phase 3)
  *
@@ -94,7 +95,7 @@ describe("Browse → View Flow", () => {
   beforeEach(() => {
     // Clear any previous state
     localStorage.clear();
-    authSession.setAuthenticated({ access_token: "mock-token", token_type: "bearer" }, false);
+    authSession.setAuthenticated(createMockAuthToken({ access_token: "mock-token", token_type: "bearer" }), false);
   });
 
   const renderMarkdownViewer = (props: { connectionId: string; path: string; onClose: () => void }) => {
@@ -121,7 +122,7 @@ describe("Browse → View Flow", () => {
       // Wait for error message (longer timeout in case of retry)
       await waitFor(
         () => {
-          expect(screen.getByText(/internal server error/i)).toBeInTheDocument();
+          expect(screen.getByText("The file could not be opened. Check the connection and retry.")).toBeInTheDocument();
         },
         { timeout: 2000 }
       );
@@ -145,7 +146,7 @@ describe("Browse → View Flow", () => {
       // Wait for error message (longer timeout in case of retry)
       await waitFor(
         () => {
-          expect(screen.getByText(/unauthorized/i)).toBeInTheDocument();
+          expect(screen.getByText("The file could not be opened. Check the connection and retry.")).toBeInTheDocument();
         },
         { timeout: 2000 }
       );
